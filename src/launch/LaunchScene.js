@@ -1,0 +1,11263 @@
+// Launch site + flight simulation scene
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { PARTS, G0, R as CORE_R, isUfoPart, isRoyalUfoPart, ufoEngineScale, unlockUfoByAlienTier } from '../parts.js';
+import { buildRocket, segments, segmentInfo, layout, applyNozzleUfoMode } from '../rocket.js';
+import { createSkyMaterial, atmosphereJS, sunTransmittance, PLANET_R } from '../fx/atmosphere.js';
+import { createEarth, createStars, NOISE_GLSL } from '../fx/earth.js';
+import { ParticleSystem } from '../fx/particles.js';
+import { createPlume } from '../fx/plume.js';
+import { latticeTower } from '../env.js';
+import * as TX from '../textures.js';
+import { audio } from '../audio.js';
+import { Vessel } from './vessel.js';
+import { RailOrbit, moonAngle, moonPos, moonVel, bodyPos, bodyAngle, wrapPi, angOf, predict, bodyRotation, bodyState, coastStep, rk4, refBody, bodyInfo } from '../sim/orbit.js';
+import { R_E, R_M, ISS_R, MOON_PHASE0, OMEGA_E, LZ_X, COAST_X, G0 as G_E, MU_E, MU_M, ATM_TOP, BODIES, NON_EARTH_BODIES, SUN_SOI, ASTEROID_BELT_INNER, ASTEROID_BELT_OUTER, KUIPER_BELT_INNER, KUIPER_BELT_OUTER, OORT_CLOUD_INNER, OORT_CLOUD_OUTER } from '../sim/constants.js';
+import { AscentProgram, BoosterRecovery, RendezvousProgram, MoonProgram, PlaneLoopProgram, PlaneAirportHopProgram, BoatCruiseProgram, BoatHarborHopProgram, vesselElements, progradeBeta } from '../sim/guidance.js';
+import { MapView } from '../ui/MapView.js';
+import { MISSIONS, missionById, isMissionCompleted, markMissionCompleted } from '../missions.js';
+import { createISS } from '../env/iss.js';
+import { createLandingZone, createDroneShip, createFlag } from '../env/sites.js';
+import { createMoon, createSunSphere, createPlanetSphere, createMoonSurface, moonHeight, createOlympusMonsLandmarks, createCeresAsteroidBelt, createKuiperBeltCanopy, createBeltSpaceField, createOortCloudCanopy, resetBeltRocksInGroup, createRockShardGeometry, OLYMPUS_PSI } from '../fx/moon.js';
+import { createAlienMesh, createBeamVisual, createSupernovaMesh } from '../fx/aliens.js';
+import { tr } from '../i18n.js';
+
+const $ = (id) => document.getElementById(id);
+const PAD_TOP = 9.0;       // rocket base height on the launch mount
+const PAD_RADIUS = 45;
+const BEND = 1 / (2 * R_E);
+const AIRPORT_SCATTER_OFFSETS = [
+  { dx: 28000, dz: -38000,  planetDx: 0,        planetDz: 0 },      // Sân bay 0: Mainland Peninsula #0 (spawn airport, separated by deep ocean bay from Launchpad/Harbor 0)
+  { dx: 52000, dz: -280000, planetDx: -250000,  planetDz: -9000 },  // Sân bay 1: Mainland Peninsula #1 (fastest route crosses ~243 km of open ocean bay)
+  { dx: 46000, dz: 110000,  planetDx: -520000,  planetDz: 9000 },   // Sân bay 2: Mainland Peninsula #2 (fastest route crosses open ocean bays)
+  { dx: 58000, dz: -485000, planetDx: -820000,  planetDz: -11000 }, // Sân bay 3: Mainland Peninsula #3 (fastest route crosses ~205 km of open ocean bay)
+  { dx: 54000, dz: 310000,  planetDx: -1150000, planetDz: 11000 },  // Sân bay 4: Mainland Peninsula #4 (fastest route crosses ~200 km of open ocean bay)
+  { dx: 60000, dz: -690000, planetDx: -1360000, planetDz: -12000 }, // Sân bay 5: Mainland Peninsula #5 (fastest route crosses ~205 km of open ocean bay)
+];
+const HARBOR_SCATTER_Z = [0, -180000, -380000, 200000, 420000, -580000];
+const SUN_ECI = new THREE.Vector3(0.62, 0.24, 0.75).normalize();
+const fmt = (v, d = 0) => v.toLocaleString('vi-VN', { maximumFractionDigits: d, minimumFractionDigits: d });
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const WARPS = [1, 2, 4, 10, 50, 100, 1000, 10000, 100000, 1000000, 10000000];
+const SAS_MODES_VI = ['Giữ', 'Prograde', 'Retrograde', 'Hướng ra', 'Hướng vào', 'Mục tiêu', 'Ngược MT'];
+const SAS_MODES_EN = ['Hold', 'Prograde', 'Retrograde', 'Rad Out', 'Rad In', 'Target', 'Anti-Tgt'];
+const CAM_MODES_VI = ['Bám', 'Tháp', 'Thân', 'Cine'];
+const CAM_MODES_EN = ['Chase', 'Tower', 'Hull', 'Cine'];
+
+export class LaunchScene {
+  constructor(app) {
+    this.app = app;
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.5, 3e5);
+    this.camera.layers.enable(1);
+    this.pipCamera = new THREE.PerspectiveCamera(45, 1.6, 0.5, 3e5);
+    this.pipCamera.layers.enable(1);
+    this.controls = new OrbitControls(this.camera, app.canvas);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+    this.controls.minDistance = 6;
+    this.controls.maxDistance = 6000;
+    this.controls.enabled = false;
+    this.controls.enablePan = false;
+    this.sunDir = SUN_ECI.clone();
+    this.envSun = new THREE.Vector3(0, 1, 0);
+    this.post = { bloom: 0.7, bloomRadius: 0.55, threshold: 1.0, exposure: 1.0, ao: false, vignette: 0.35, aberration: 0.004, grain: 0.03 };
+    this.world = new THREE.Group();
+    this.scene.add(this.world);
+    this.time = 0;
+    this.keys = {};
+    this.shake = new THREE.Vector3();
+    this.camMode = 0;
+    this.camModes = ['Bám theo', 'Tháp quan sát', 'Gắn trên thân', 'Điện ảnh'];
+    this.envBand = -1;
+    this.debris = [];
+    this.vessels = [];
+    this.focus = null;
+    this.mission = missionById('free');
+    this.simT = 0;
+    this.launchCounter = 0;
+    this.stageCounter = 0;
+    try {
+      this.spaceObjects = JSON.parse(localStorage.getItem('rf-space-objects') || '[]') || [];
+    } catch {
+      this.spaceObjects = [];
+    }
+    try {
+      this.aliensDisabled = localStorage.getItem('rf-no-aliens') === '1';
+    } catch {
+      this.aliensDisabled = false;
+    }
+    this.sanitizeSpaceObjectsForSingleUfoKing();
+    this.map = new MapView($('map'), $('map-legend'));
+    this.map.onDeleteObject = (id) => this.deleteSpaceObject(id);
+    this.map.onTeleport = (target) => this.teleportToBody(target, this.teleportMode);
+    this.teleportMode = 'surface';
+    this.sasMode = 0;
+    this.warp = 1; this.autoWarp = 1;
+    this.astronautsAboard = 0;
+    this.maxAstronauts = 10;
+    this.deployedAstronauts = [];
+    this.padAstronautMeshes = [];
+    this.compassAirportTarget = 'auto';
+    this.compassHarborTarget = 'auto';
+
+    this.initSky();
+    this.initGround();
+    this.initPad();
+    this.initAirport();
+    this.initHarbor();
+    this.initSites();
+    this.initFX();
+    this.initUI();
+  }
+
+  refreshLanguage() {
+    this.camModes = tr(CAM_MODES_VI, CAM_MODES_EN);
+    this.setTeleportMode(this.teleportMode || 'surface');
+    this.syncAlienToggleUI();
+    if (this.harborSignMats) {
+      for (const item of this.harborSignMats) {
+        const nextTex = this.makeHarborSignTexture(item.hIdx);
+        if (item.mat.map) item.mat.map.dispose();
+        item.mat.map = nextTex;
+        item.mat.emissiveMap = nextTex;
+        item.mat.needsUpdate = true;
+      }
+    }
+    if (this.airportSignMats) {
+      for (const item of this.airportSignMats) {
+        const nextTex = this.makeAirportSignTexture(item.aIdx);
+        if (item.mat.map) item.mat.map.dispose();
+        item.mat.map = nextTex;
+        item.mat.emissiveMap = nextTex;
+        item.mat.needsUpdate = true;
+      }
+    }
+
+    if (this.player) {
+      if (this.program && this.mission) {
+        this.program.label = `${this.mission.icon} ${this.mission.name}`;
+      }
+      if (this.phase === 'ready') {
+        const isSpecial = this.player.isBoat || this.player.isRover || this.player.isPlane;
+        if (!isSpecial) {
+          $('events').innerHTML = '';
+          this.event(tr('Tên lửa đã lên bệ phóng. Sẵn sàng!', 'Rocket is on the launchpad. Ready for launch!'));
+          if (this.mission && this.mission.id !== 'free') {
+            if (this.mission.noAutopilot) {
+              const targetCount = this.mission.id === 'alien5000' ? 5000 : this.mission.id === 'alien1500' ? 1500 : this.mission.id === 'alien500' ? 500 : 100;
+              this.event(tr(`Nhiệm vụ: ${this.mission.name} – Không có Lái tự động, hãy tự điều khiển tàu và nhấn V / click chuột để tiêu diệt ${targetCount} Alien${this.mission.id === 'alien5000' ? ' cùng Hoàng Hậu & Vua' : ''}!`, `Mission: ${this.mission.name} – No Autopilot, fly manually and press V / click to destroy ${targetCount} Aliens${this.mission.id === 'alien5000' ? ' plus the Queen & King' : ''}!`));
+            } else {
+              this.event(tr('Nhiệm vụ: ' + this.mission.name + ' – nhấn G để bật lái tự động.', 'Mission: ' + this.mission.name + ' – press G to enable Autopilot.'));
+            }
+          }
+        }
+      }
+      this.renderMissionPanel(true);
+      this.hudTimer = 0;
+      this.updateHUD(0);
+    }
+  }
+
+  // =================================================================== SKY & LIGHT
+  initSky() {
+    this.skyMat = createSkyMaterial(this.sunDir);
+    this.sky = new THREE.Mesh(new THREE.SphereGeometry(1000, 64, 32), this.skyMat);
+    this.sky.frustumCulled = false;
+    this.sky.renderOrder = -1;
+    this.sky.layers.set(1);
+    this.scene.add(this.sky);
+
+    this.envScene = new THREE.Scene();
+    this.envSky = new THREE.Mesh(new THREE.SphereGeometry(50, 32, 16), this.skyMat);
+    this.envScene.add(this.envSky);
+    this.pmrem = new THREE.PMREMGenerator(this.app.renderer);
+
+    this.stars = createStars();
+    this.stars.layers.set(1);
+    this.scene.add(this.stars);
+
+    this.earth = createEarth(this.sunDir);
+    this.earth.layers.set(1);
+    this.scene.add(this.earth);
+
+    this.sunSphere = createSunSphere();
+    this.scene.add(this.sunSphere);
+
+    this.moon = createMoon();
+    this.moon.layers.set(1);
+    this.scene.add(this.moon);
+    this.planets = {};
+    for (const name of NON_EARTH_BODIES) {
+      const pm = createPlanetSphere(name);
+      pm.layers.set(1);
+      this.scene.add(pm);
+      this.planets[name] = pm;
+    }
+    this.moonPatch = createMoonSurface();
+    this.moonPatch.visible = false;
+    this.moonPatchPsi = null;
+    this.scene.add(this.moonPatch);
+
+    this.sun = new THREE.DirectionalLight(0xffffff, 6);
+    this.sun.castShadow = true;
+    const sc = this.sun.shadow.camera;
+    sc.left = -60; sc.right = 60; sc.top = 60; sc.bottom = -60; sc.near = 1; sc.far = 700;
+    this.sun.shadow.mapSize.set(4096, 4096);
+    this.sun.shadow.bias = -0.0002;
+    this.sun.shadow.normalBias = 0.04;
+    this.scene.add(this.sun, this.sun.target);
+    this.hemi = new THREE.HemisphereLight(0x8899bb, 0x2a2418, 0.6);
+    this.scene.add(this.hemi);
+    this.nightDirLight = new THREE.DirectionalLight(0xeef4ff, 0);
+    this.nightDirLight.position.set(140, 350, 128);
+    this.scene.add(this.nightDirLight, this.nightDirLight.target);
+    this.siteNightLights = [];
+    for (let i = 0; i < 4; i++) {
+      const pl = new THREE.PointLight(0xfff2dc, 0, 2200, 1.0);
+      pl.visible = false;
+      this.scene.add(pl);
+      this.siteNightLights.push(pl);
+    }
+    this.siteOverheadLight = new THREE.PointLight(0xdcebff, 0, 4600, 1.0);
+    this.siteOverheadLight.visible = false;
+    this.scene.add(this.siteOverheadLight);
+    this.scene.fog = new THREE.FogExp2(0x9aa6b8, 5e-5);
+  }
+
+  updateNightSiteLighting(F = this.focus || this.player) {
+    if (!F || !this.nightDirLight || !this.siteNightLights) return;
+    const sunElev = this.sunDir ? this.sunDir.y : 1;
+    const nightAmt = THREE.MathUtils.clamp((0.22 - sunElev) / 0.30, 0, 1);
+    if (nightAmt <= 0.001) {
+      this.nightDirLight.intensity = 0;
+      for (const pl of this.siteNightLights) {
+        pl.intensity = 0;
+        pl.visible = false;
+      }
+      if (this.siteOverheadLight) {
+        this.siteOverheadLight.intensity = 0;
+        this.siteOverheadLight.visible = false;
+      }
+      return;
+    }
+
+    const fsx = F.sx || 0;
+    const fal = F.alt || 0;
+    const fsz = F.s?.z || 0;
+    const isEarth = F.ref === 'earth';
+    const padShown = isEarth && !!(this.pad && this.pad.visible);
+    const padDist = isEarth ? Math.hypot(fsx, fsz) : Infinity;
+    const nearPad = padShown && padDist < 4800 && fal < 4000
+      ? (1 - THREE.MathUtils.smoothstep(padDist, 1800, 4800)) * (1 - THREE.MathUtils.smoothstep(fal, 1600, 4000))
+      : 0;
+
+    const hasAp = this.hasSurfaceAirports(F.ref);
+    const apAnchor = hasAp ? this.getNearestAirportAnchor(F.ref, fsx, fsz) : null;
+    const apDx = apAnchor ? this.bodyDeltaX(F.ref, fsx, apAnchor.sx + 1040) : Infinity;
+    const apDz = apAnchor ? (fsz - (apAnchor.sz || 0)) : Infinity;
+    const apDist = apAnchor ? Math.hypot(apDx, apDz) : Infinity;
+    const apRelAlt = apAnchor ? Math.abs(fal - (apAnchor.h || 0)) : Infinity;
+    const nearAirport = apAnchor && apDist < 7500 && apRelAlt < 4500
+      ? (1 - THREE.MathUtils.smoothstep(apDist, 3200, 7500)) * (1 - THREE.MathUtils.smoothstep(apRelAlt, 1800, 4500))
+      : 0;
+
+    const siteBoost = Math.max(nearPad, nearAirport);
+    this.nightDirLight.intensity = nightAmt * (0.38 + 2.35 * siteBoost);
+    if (siteBoost > 0.01) {
+      const boost = nightAmt * siteBoost;
+      this.hemi.color.r = Math.max(this.hemi.color.r, 0.44 * boost);
+      this.hemi.color.g = Math.max(this.hemi.color.g, 0.48 * boost);
+      this.hemi.color.b = Math.max(this.hemi.color.b, 0.58 * boost);
+      this.hemi.groundColor.r = Math.max(this.hemi.groundColor.r, 0.24 * boost);
+      this.hemi.groundColor.g = Math.max(this.hemi.groundColor.g, 0.22 * boost);
+      this.hemi.groundColor.b = Math.max(this.hemi.groundColor.b, 0.19 * boost);
+      this.hemi.intensity = Math.max(this.hemi.intensity, 0.9 + 0.65 * boost);
+    }
+
+    if (nearPad >= nearAirport && nearPad > 0.01) {
+      const pInt = 185 * nightAmt * nearPad;
+      for (let i = 0; i < 4; i++) {
+        const a = i * Math.PI / 2 + 0.4;
+        const pl = this.siteNightLights[i];
+        pl.position.set(Math.cos(a) * 95 - fsx, 42 - fal, Math.sin(a) * 95 - fsz);
+        pl.distance = 1800;
+        pl.intensity = pInt;
+        pl.visible = true;
+      }
+      if (this.siteOverheadLight) {
+        this.siteOverheadLight.position.set(-fsx, 240 - fal, -fsz);
+        this.siteOverheadLight.distance = 3800;
+        this.siteOverheadLight.intensity = 420 * nightAmt * nearPad;
+        this.siteOverheadLight.visible = true;
+      }
+    } else if (nearAirport > 0.01 && apAnchor) {
+      const wx = isEarth ? apAnchor.sx : (fsx + this.bodyDeltaX(F.ref, apAnchor.sx, fsx));
+      const wy = apAnchor.h || 0;
+      const wz = apAnchor.sz || 0;
+      const spots = [
+        [75, 36, -68],
+        [420, 38, 34],
+        [1140, 38, 34],
+        [1880, 38, 34],
+      ];
+      const aInt = 210 * nightAmt * nearAirport;
+      for (let i = 0; i < 4; i++) {
+        const pl = this.siteNightLights[i];
+        const [lx, ly, lz] = spots[i];
+        pl.position.set(wx + lx - fsx, wy + ly - fal, wz + lz - fsz);
+        pl.distance = 2400;
+        pl.intensity = aInt;
+        pl.visible = true;
+      }
+      if (this.siteOverheadLight) {
+        this.siteOverheadLight.position.set(wx + 1040 - fsx, wy + 280 - fal, wz - fsz);
+        this.siteOverheadLight.distance = 5200;
+        this.siteOverheadLight.intensity = 480 * nightAmt * nearAirport;
+        this.siteOverheadLight.visible = true;
+      }
+    } else {
+      for (const pl of this.siteNightLights) {
+        pl.intensity = 0;
+        pl.visible = false;
+      }
+      if (this.siteOverheadLight) {
+        this.siteOverheadLight.intensity = 0;
+        this.siteOverheadLight.visible = false;
+      }
+    }
+  }
+
+  updateAtmosphere(alt) {
+    const sun = this.sunDir.toArray();
+    // sun light colour
+    const T = sunTransmittance(Math.max(alt, 0), sun);
+    const k = 7.0;
+    this.sun.color.setRGB(T[0], T[1], T[2]);
+    this.sun.intensity = k;
+    // fog colour: horizon toward view-ish direction (average of two azimuths)
+    const a1 = atmosphereJS([0.72, 0.03, -0.69], Math.max(alt, 1), sun);
+    const a2 = atmosphereJS([-0.9, 0.03, 0.42], Math.max(alt, 1), sun);
+    const fog = this.scene.fog;
+    fog.color.setRGB((a1[0] + a2[0]) * 0.5, (a1[1] + a2[1]) * 0.5, (a1[2] + a2[2]) * 0.5);
+    fog.density = 4.2e-5 * Math.exp(-Math.max(alt, 0) / 7000);
+    const up = atmosphereJS([0, 1, 0], Math.max(alt, 1), sun);
+    this.hemi.color.setRGB(up[0] * 1.6 + 0.02, up[1] * 1.6 + 0.02, up[2] * 1.6 + 0.03);
+    this.hemi.groundColor.setRGB(0.12 * T[0], 0.1 * T[1], 0.07 * T[2]);
+    this.hemi.intensity = 0.9;
+    // smoke lighting
+    const sm = this.smoke.material.uniforms;
+    sm.uSunColor.value.setRGB(T[0] * 1.15, T[1] * 1.1, T[2] * 1.05);
+    sm.uAmbient.value.setRGB(up[0] * 0.9 + 0.05, up[1] * 0.9 + 0.05, up[2] * 0.9 + 0.06);
+    sm.uFogColor.value.copy(fog.color);
+    sm.uFogDensity.value = fog.density;
+    this.fire.material.uniforms.uFogDensity.value = fog.density * 0.5;
+    this.cloudMat.uniforms.uSunCol.value.setRGB(T[0] * 1.3, T[1] * 1.25, T[2] * 1.2);
+    this.cloudMat.uniforms.uFogColor.value.copy(fog.color);
+    // environment map refresh by altitude band
+    const bands = [0, 2500, 6000, 12000, 20000, 32000, 50000, 75000, 110000];
+    let band = 0;
+    while (band < bands.length - 1 && alt > bands[band + 1]) band++;
+    if (band !== this.envBand || (this.sunDir.angleTo(this.envSun) > 0.1 && this.time - (this.envT || 0) > 0.5)) {
+      this.envBand = band; this.envT = this.time; this.envSun.copy(this.sunDir);
+      this.skyMat.uniforms.uAlt.value = Math.max(bands[band], 1);
+      this.skyMat.uniforms.uSun.value.copy(this.sunDir);
+      const rt = this.pmrem.fromScene(this.envScene, 0, 0.1, 200);
+      if (this.envRT) this.envRT.dispose();
+      this.envRT = rt;
+      this.scene.environment = rt.texture;
+    }
+  }
+
+  // =================================================================== GROUND
+  fbm3JS(px, py, pz, oct = 5) {
+    const fract = (v) => v - Math.floor(v);
+    const hash33 = (ix, iy, iz) => {
+      let x = fract(ix * 443.8975);
+      let y = fract(iy * 397.2973);
+      let z = fract(iz * 491.1871);
+      const d = z * (y + 19.19) + x * (x + 19.19) + y * (z + 19.19);
+      x += d; y += d; z += d;
+      return [fract(x * y) * 2 - 1, fract(z * x) * 2 - 1, fract(y * z) * 2 - 1];
+    };
+    const dot3 = (h, fx, fy, fz) => h[0] * fx + h[1] * fy + h[2] * fz;
+    const mix = (a, b, t) => a + (b - a) * t;
+    const gnoise = (x, y, z) => {
+      const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+      const fx = x - ix, fy = y - iy, fz = z - iz;
+      const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+      const uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+      const uz = fz * fz * fz * (fz * (fz * 6 - 15) + 10);
+      const n000 = dot3(hash33(ix, iy, iz), fx, fy, fz);
+      const n100 = dot3(hash33(ix + 1, iy, iz), fx - 1, fy, fz);
+      const n010 = dot3(hash33(ix, iy + 1, iz), fx, fy - 1, fz);
+      const n110 = dot3(hash33(ix + 1, iy + 1, iz), fx - 1, fy - 1, fz);
+      const n001 = dot3(hash33(ix, iy, iz + 1), fx, fy, fz - 1);
+      const n101 = dot3(hash33(ix + 1, iy, iz + 1), fx - 1, fy, fz - 1);
+      const n011 = dot3(hash33(ix, iy + 1, iz + 1), fx, fy - 1, fz - 1);
+      const n111 = dot3(hash33(ix + 1, iy + 1, iz + 1), fx - 1, fy - 1, fz - 1);
+      return mix(
+        mix(mix(n000, n100, ux), mix(n010, n110, ux), uy),
+        mix(mix(n001, n101, ux), mix(n011, n111, ux), uy),
+        uz
+      ) * 0.5 + 0.5;
+    };
+    let s = 0, a = 0.5, x = px, y = py, z = pz;
+    for (let i = 0; i < oct; i++) {
+      s += a * gnoise(x, y, z);
+      x = x * 2.03 + 1.7;
+      y = y * 2.03 + 9.2;
+      z = z * 2.03 + 3.1;
+      a *= 0.5;
+    }
+    return s / (1 - Math.pow(0.5, oct));
+  }
+
+  earthAirportBoxDist(sx, sz) {
+    let best = Infinity;
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const off = AIRPORT_SCATTER_OFFSETS[i];
+      const lx = sx - off.dx;
+      const lz = sz - off.dz;
+      const d = Math.max(-260.0 - lx, lx - 2500.0, -190.0 - lz, lz - 130.0);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  trigFbmJS(px, py, seed, oct = 3) {
+    const fract = (v) => v - Math.floor(v);
+    const TAU = 6.283185307179586;
+    let x = px, y = py, s = 0, a = 0.5, norm = 0;
+    let ph = seed * 0.173;
+    for (let i = 0; i < oct; i++) {
+      const u1 = fract(x * 0.15915494 + y * 0.09188815 + ph);
+      const u2 = fract(x * -0.11253954 + y * 0.13783222 + ph * 1.618 + 0.37);
+      const u3 = fract((x + y) * 0.1031 + ph * 0.73 + 0.61);
+      const n = (Math.sin(TAU * u1) + Math.cos(TAU * u2) + 0.6 * Math.sin(TAU * u3)) * (1.0 / 2.6);
+      s += a * (n * 0.5 + 0.5);
+      norm += a;
+      const nx = x * 1.62 - y * 1.18 + 0.71;
+      const ny = x * 1.18 + y * 1.62 + 1.39;
+      x = nx; y = ny;
+      ph = ph * 1.37 + 0.29;
+      a *= 0.52;
+    }
+    return s / norm;
+  }
+
+  lagoonNoiseJS(sx, sz) {
+    return this.trigFbmJS(sx * 0.0022, -sz * 0.0022, 11.0, 4);
+  }
+
+  earthRoadDist(sx, sz) {
+    const px = sx, py = -sz;
+    const segD = (ax, ay, bx, by) => {
+      const pax = px - ax, pay = py - ay;
+      const bax = bx - ax, bay = by - ay;
+      const denom = bax * bax + bay * bay;
+      const h = denom > 0 ? THREE.MathUtils.clamp((pax * bax + pay * bay) / denom, 0, 1) : 0;
+      return Math.hypot(pax - bax * h, pay - bay * h);
+    };
+    let d = Math.min(
+      segD(0.0, 0.0, -1500.0, 2500.0),
+      segD(-1500.0, 2500.0, -10500.0, 2600.0),
+      segD(-10500.0, 2600.0, -10500.0, 6200.0),
+      segD(-200.0, -900.0, -200.0, 6000.0)
+    );
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const off = AIRPORT_SCATTER_OFFSETS[i];
+      const rx = off.dx - 110.0;
+      const ry = -off.dz + 64.0;
+      d = Math.min(d, segD(rx, ry, -65000.0, ry));
+    }
+    return d;
+  }
+
+  earthSnowAmount(sx, sz) {
+    const smooth = (e0, e1, x) => {
+      const t = THREE.MathUtils.clamp((x - e0) / (e1 - e0), 0, 1);
+      return t * t * (3 - 2 * t);
+    };
+    const nSnow = (this.trigFbmJS(sx * 0.00045, sz * 0.00045, 73.0, 3) - 0.5) * 900.0;
+    const nearNorth = (1.0 - smooth(-4300.0, -3300.0, sz - nSnow)) * (1.0 - smooth(4500.0, 8500.0, sx));
+    const arcticNorth = 1.0 - smooth(-145000.0, -110000.0, sz - nSnow * 8.0);
+    return Math.max(nearNorth, arcticNorth);
+  }
+
+  isLagoonWater(sx, sz) {
+    const cX = this.earthCoastX(sz);
+    if (this.earthAirportBoxDist(sx, sz) < 120.0) return false;
+    if (Math.hypot(sx + 10500.0, sz + 6200.0) < 185.0) return false;
+    const roadD = this.earthRoadDist(sx, sz);
+    if (roadD <= 26.0) return false;
+    const py = -sz;
+    if (Math.abs(py) <= 7520.0) {
+      if (Math.abs(sx - (-3900.0 + Math.sin(py * 0.00035) * 450.0)) < 752.0) return true;
+      if (Math.abs(sx - (-7800.0 + Math.cos(py * 0.00028) * 520.0)) < 952.0) return true;
+    }
+    if (sx > Math.min(2200.0, cX - 900.0) || sx < -1470000.0) return false;
+    return this.lagoonNoiseJS(sx, sz) >= 0.674;
+  }
+
+  earthGroundWave(sx, sz, showPad = 1.0, showAirport = 0.0) {
+    if (showAirport > 0.5) return 0.0;
+    const fract = (v) => v - Math.floor(v);
+    const TAU = 6.283185307179586;
+    const INV_TAU = 0.15915494309189535;
+    const sinT = (rad) => Math.sin(TAU * fract(rad * INV_TAU));
+    const cosT = (rad) => Math.cos(TAU * fract(rad * INV_TAU));
+    const smooth = (e0, e1, x) => {
+      const t = THREE.MathUtils.clamp((x - e0) / (e1 - e0), 0, 1);
+      return t * t * (3 - 2 * t);
+    };
+    const seed = this.groundWaveSeed || 0.0;
+    const cX = this.earthCoastX(sz);
+    const landMask = smooth(cX - 20.0, cX - 260.0, sx) * smooth(-1495000.0, -1470000.0, sx);
+    const padFlat = 1.0 - showPad * smooth(150.0, 95.0, Math.hypot(sx, sz));
+    const lzFlat = smooth(38.0, 75.0, Math.hypot(sx + 1600.0, sz));
+    const snowClearFlat = smooth(55.0, 115.0, Math.hypot(sx + 10500.0, sz + 6200.0));
+    const snowAmt = this.earthSnowAmount(sx, sz);
+    const snowBoost = 1.0 + 1.25 * snowAmt;
+    const boxDist = this.earthAirportBoxDist(sx, sz);
+    const rwyFlat = smooth(0.0, 70.0, boxDist);
+    const snowHubDry = smooth(85.0, 185.0, Math.hypot(sx + 10500.0, sz + 6200.0));
+    const lagoonFlat = sx <= Math.min(2200.0, cX - 900.0) ? (1.0 - smooth(0.66, 0.70, this.lagoonNoiseJS(sx, sz)) * snowHubDry) : 1.0;
+    const nAmp1 = this.trigFbmJS(sx * 0.014, sz * 0.014, seed + 3.7, 3);
+    const nAmp2 = this.trigFbmJS(sx * 0.032, sz * 0.032, seed + 17.3, 2);
+    const nHill = this.trigFbmJS(sx * 0.020, sz * 0.020, seed + 31.9, 3);
+    const warp = (this.trigFbmJS(sx * 0.009, sz * 0.009, seed + 47.1, 2) - 0.5) * 4.2;
+    const amp1 = 0.12 + 3.4 * Math.pow(Math.max(nAmp1, 0), 1.7);
+    const amp2 = 0.08 + 2.8 * Math.pow(Math.max(nAmp2, 0), 1.6);
+    const hillAmp = 0.15 + 4.2 * Math.pow(Math.max(nAmp1, 0), 1.5);
+    const w = sinT(sx * 0.028 + sz * 0.022 + warp) * 0.65 * amp1
+      + cosT(sx * 0.016 - sz * 0.031 + 1.1 - warp * 0.7) * 0.48 * amp2
+      + sinT(sx * 0.055 + sz * 0.048 + 2.3 + warp * 1.3) * 0.25 * (amp1 + amp2) * 0.5
+      + (nHill - 0.5) * hillAmp;
+    return w * snowBoost * landMask * padFlat * lzFlat * snowClearFlat * rwyFlat * lagoonFlat * (1.0 - showAirport);
+  }
+
+  initGround() {
+    this.groundWaveSeed = Math.random() * 6.283185;
+    this.groundUniforms = {
+      uTime: { value: 0 },
+      uOff: { value: new THREE.Vector2() },
+      uBend: { value: BEND },
+      uShowPad: { value: 1.0 },
+      uShowAirport: { value: 0.0 },
+      uAirport0Off: { value: 0.0 },
+      uWaveSeed: { value: this.groundWaveSeed },
+    };
+    const waveGLSL = /* glsl */`
+      float sinTau(float rad) {
+        return sin(6.2831853 * fract(rad * 0.15915494));
+      }
+      float cosTau(float rad) {
+        return cos(6.2831853 * fract(rad * 0.15915494));
+      }
+      float trigFbm(float px, float py, float seed, int oct) {
+        float x = px, y = py, s = 0.0, a = 0.5, norm = 0.0;
+        float ph = seed * 0.173;
+        for (int i = 0; i < 6; i++) {
+          if (i >= oct) break;
+          float u1 = fract(x * 0.15915494 + y * 0.09188815 + ph);
+          float u2 = fract(x * -0.11253954 + y * 0.13783222 + ph * 1.618 + 0.37);
+          float u3 = fract((x + y) * 0.1031 + ph * 0.73 + 0.61);
+          float n = (sin(6.2831853 * u1) + cos(6.2831853 * u2) + 0.6 * sin(6.2831853 * u3)) * 0.38461538;
+          s += a * (n * 0.5 + 0.5);
+          norm += a;
+          float nx = x * 1.62 - y * 1.18 + 0.71;
+          float ny = x * 1.18 + y * 1.62 + 1.39;
+          x = nx; y = ny;
+          ph = ph * 1.37 + 0.29;
+          a *= 0.52;
+        }
+        return s / norm;
+      }
+      float lagoonNoiseGLSL(float sx, float sz) {
+        return trigFbm(sx * 0.0022, -sz * 0.0022, 11.0, 4);
+      }
+      float coastXGLSL(float py) {
+        float sz = -py;
+        float capeJut = 1450.0 * exp(-pow((py + 2200.0) / 3800.0, 2.0)) * smoothstep(650.0, 1500.0, abs(py));
+        float coastWave = 1100.0 * sin(py * 0.00016) * smoothstep(2000.0, 5000.0, abs(py));
+        float u0 = sz / 10500.0;
+        float pen = 50600.0 * exp(-u0 * u0 * u0 * u0);
+${AIRPORT_SCATTER_OFFSETS.map((off, i) => {
+  const amp = (off.dx + 52200.0).toFixed(1);
+  const dz = off.dz.toFixed(1);
+  return `        float uAp${i} = (sz - (${dz})) / 6800.0;\n        pen = max(pen, ${amp} * exp(-uAp${i} * uAp${i}));`;
+}).join('\n')}
+        return -48000.0 + pen + capeJut + coastWave;
+      }
+      float airportBoxDistGLSL(float sx, float sz) {
+${AIRPORT_SCATTER_OFFSETS.map((off, i) => {
+  const ox = (-off.dx).toFixed(1);
+  const oz = (-off.dz).toFixed(1);
+  return `        float d${i} = max(max(-260.0 - (sx + (${ox})), (sx + (${ox})) - 2500.0), max(-190.0 - (sz + (${oz})), (sz + (${oz})) - 130.0));`;
+}).join('\n')}
+        return ${AIRPORT_SCATTER_OFFSETS.map((_, i) => `d${i}`).reduce((acc, v) => `min(${acc}, ${v})`)};
+      }
+      float singleAirportPavedDist(float lx, float lz) {
+        float dRwy = max(max(-170.0 - lx, lx - 2250.0), abs(lz) - 24.0);
+        float dApr = max(max(-120.0 - lx, lx - 260.0), max(-107.0 - lz, lz + 21.0));
+        float dTax = max(max(-120.0 - lx, lx - 800.0), max(-43.0 - lz, lz + 25.0));
+        return min(dRwy, min(dApr, dTax));
+      }
+      float airportPavedDistGLSL(float sx, float sz, float ap0Off) {
+${AIRPORT_SCATTER_OFFSETS.map((off, i) => {
+  const oz = (-off.dz).toFixed(1);
+  if (i === 0) return `        float p0 = singleAirportPavedDist(sx - ap0Off, sz + (${oz}));`;
+  const ox = (-off.dx).toFixed(1);
+  return `        float p${i} = singleAirportPavedDist(sx + (${ox}), sz + (${oz}));`;
+}).join('\n')}
+        return ${AIRPORT_SCATTER_OFFSETS.map((_, i) => `p${i}`).reduce((acc, v) => `min(${acc}, ${v})`)};
+      }
+      float snowBiomeGLSL(float sx, float sz) {
+        float nSnow = (trigFbm(sx * 0.00045, sz * 0.00045, 73.0, 3) - 0.5) * 900.0;
+        float nearNorth = (1.0 - smoothstep(-4300.0, -3300.0, sz - nSnow)) * (1.0 - smoothstep(4500.0, 8500.0, sx));
+        float arcticNorth = 1.0 - smoothstep(-145000.0, -110000.0, sz - nSnow * 8.0);
+        return max(nearNorth, arcticNorth);
+      }
+      float groundWaveHeight(vec2 p, float showPad, float showAirport) {
+        if (showAirport > 0.5) return 0.0;
+        float sx = p.x;
+        float sz = -p.y;
+        float cX = coastXGLSL(p.y);
+        float landMask = smoothstep(cX - 20.0, cX - 260.0, sx) * smoothstep(-1495000.0, -1470000.0, sx);
+        float padFlat = 1.0 - showPad * smoothstep(150.0, 95.0, length(vec2(sx, sz)));
+        float lzFlat = smoothstep(38.0, 75.0, length(vec2(sx + 1600.0, sz)));
+        float snowClearFlat = smoothstep(55.0, 115.0, length(vec2(sx + 10500.0, sz + 6200.0)));
+        float snowAmt = snowBiomeGLSL(sx, sz);
+        float snowBoost = 1.0 + 1.25 * snowAmt;
+        float boxDist = airportBoxDistGLSL(sx, sz);
+        float rwyFlat = smoothstep(0.0, 70.0, boxDist);
+        float snowHubDry = smoothstep(85.0, 185.0, length(vec2(sx + 10500.0, sz + 6200.0)));
+        float lagoonFlat = 1.0 - smoothstep(0.66, 0.70, lagoonNoiseGLSL(sx, sz)) * snowHubDry * step(p.x, min(2200.0, cX - 900.0));
+        float nAmp1 = trigFbm(sx * 0.014, sz * 0.014, uWaveSeed + 3.7, 3);
+        float nAmp2 = trigFbm(sx * 0.032, sz * 0.032, uWaveSeed + 17.3, 2);
+        float nHill = trigFbm(sx * 0.020, sz * 0.020, uWaveSeed + 31.9, 3);
+        float warp = (trigFbm(sx * 0.009, sz * 0.009, uWaveSeed + 47.1, 2) - 0.5) * 4.2;
+        float amp1 = 0.12 + 3.4 * pow(max(nAmp1, 0.0), 1.7);
+        float amp2 = 0.08 + 2.8 * pow(max(nAmp2, 0.0), 1.6);
+        float hillAmp = 0.15 + 4.2 * pow(max(nAmp1, 0.0), 1.5);
+        float w = sinTau(sx * 0.028 + sz * 0.022 + warp) * 0.65 * amp1
+                + cosTau(sx * 0.016 - sz * 0.031 + 1.1 - warp * 0.7) * 0.48 * amp2
+                + sinTau(sx * 0.055 + sz * 0.048 + 2.3 + warp * 1.3) * 0.25 * (amp1 + amp2) * 0.5
+                + (nHill - 0.5) * hillAmp;
+        return w * snowBoost * landMask * padFlat * lzFlat * snowClearFlat * rwyFlat * lagoonFlat * (1.0 - showAirport);
+      }
+    `;
+    const gmat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.92,
+      metalness: 0,
+      transparent: false,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: 4,
+      polygonOffsetUnits: 8,
+    });
+    gmat.onBeforeCompile = (sh) => {
+      sh.uniforms.uTime = this.groundUniforms.uTime;
+      sh.uniforms.uOff = this.groundUniforms.uOff;
+      sh.uniforms.uBend = this.groundUniforms.uBend;
+      sh.uniforms.uShowPad = this.groundUniforms.uShowPad;
+      sh.uniforms.uShowAirport = this.groundUniforms.uShowAirport;
+      sh.uniforms.uAirport0Off = this.groundUniforms.uAirport0Off;
+      sh.uniforms.uWaveSeed = this.groundUniforms.uWaveSeed;
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', `#include <common>\nvarying vec2 vLocal;\nuniform vec2 uOff;\nuniform float uBend;\nuniform float uShowPad;\nuniform float uShowAirport;\nuniform float uAirport0Off;\nuniform float uWaveSeed;\n${NOISE_GLSL}\n${waveGLSL}`)
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLocal = position.xy + uOff;')
+        .replace('#include <project_vertex>', `
+          vec4 mvPosition = vec4( transformed, 1.0 );
+          vec4 wpB = modelMatrix * mvPosition;
+          wpB.y += groundWaveHeight(vLocal, uShowPad, uShowAirport);
+          wpB.y -= dot(wpB.xz, wpB.xz) * uBend;
+          mvPosition = viewMatrix * wpB;
+          gl_Position = projectionMatrix * mvPosition;`);
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', `#include <common>\nvarying vec2 vLocal;\nuniform float uTime;\nuniform float uShowPad;\nuniform float uShowAirport;\nuniform float uAirport0Off;\nuniform float uWaveSeed;\n${NOISE_GLSL}\n${waveGLSL}\n
+          float segDist(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h); }`)
+        .replace('vec4 diffuseColor = vec4( diffuse, opacity );', /* glsl */`
+          vec2 p = vLocal;
+          // Mainland coastline with 5 jutting airport peninsulas separated by deep ocean bays (NO islands!)
+          float coast = coastXGLSL(p.y);
+          float land = smoothstep(coast + 30.0, coast - 30.0, p.x) * smoothstep(-1495000.0, -1470000.0, p.x);
+          float inlandDist = min(coast - p.x, p.x + 1482500.0);
+          float n1 = fbm3(vec3(p * 0.0011, 2.0), 6);
+          float n2 = fbm3(vec3(p * 0.011, 3.0), 4);
+          float n3 = fbm3(vec3(p * 0.09, 5.0), 3);
+          float snowAmt = snowBiomeGLSL(p.x, -p.y);
+          vec3 grass = mix(vec3(0.065, 0.125, 0.045), vec3(0.16, 0.21, 0.08), n1);
+          grass = mix(grass, vec3(0.20, 0.18, 0.11), smoothstep(0.55, 0.72, n2) * 0.65);
+          grass = mix(grass, vec3(0.04, 0.095, 0.035), smoothstep(0.6, 0.8, fbm3(vec3(p * 0.004, 8.0), 4)) * 0.8);
+          vec3 sand = vec3(0.68, 0.61, 0.47);
+          float beach = smoothstep(15.0, 180.0, inlandDist);
+          vec3 landCol = mix(sand, grass, beach);
+          vec3 snowGround = mix(vec3(0.68, 0.78, 0.90), vec3(0.91, 0.94, 0.99), n1);
+          snowGround = mix(snowGround, vec3(0.97, 0.99, 1.0), smoothstep(0.48, 0.72, n2) * 0.75);
+          snowGround = mix(snowGround, vec3(0.36, 0.39, 0.45), smoothstep(0.74, 0.88, fbm3(vec3(p * 0.006, 12.0), 4)) * 0.45);
+          vec3 snowBeach = vec3(0.76, 0.83, 0.90);
+          landCol = mix(landCol, mix(snowBeach, snowGround, beach), snowAmt);
+          // Mainland highways connecting Launchpad, Snow Zone & all Peninsular Airports Westward into the continent
+          float road = min(segDist(p, vec2(0.0), vec2(-1500.0, 2500.0)), segDist(p, vec2(-1500.0, 2500.0), vec2(-10500.0, 2600.0)));
+          road = min(road, segDist(p, vec2(-10500.0, 2600.0), vec2(-10500.0, 6200.0)));
+          road = min(road, segDist(p, vec2(-200.0, -900.0), vec2(-200.0, 6000.0)));
+${AIRPORT_SCATTER_OFFSETS.map((off) => {
+  const rx = (off.dx - 110.0).toFixed(1);
+  const ry = (-off.dz + 64.0).toFixed(1);
+  return `          road = min(road, segDist(p, vec2(${rx}, ${ry}), vec2(-65000.0, ${ry})));`;
+}).join('\n')}
+          float apDry = smoothstep(20.0, 120.0, airportBoxDistGLSL(p.x, -p.y));
+          float snowHubDry = smoothstep(85.0, 185.0, length(p - vec2(-10500.0, 6200.0)));
+          float causewayBridge = smoothstep(38.0, 18.0, road);
+          float bananaRiver = smoothstep(750.0, 480.0, abs(p.x - (-3900.0 + sin(p.y * 0.00035) * 450.0))) * step(abs(p.y), 7500.0);
+          float indianRiver = smoothstep(950.0, 620.0, abs(p.x - (-7800.0 + cos(p.y * 0.00028) * 520.0))) * step(abs(p.y), 7500.0);
+          float lagoon = max(
+            smoothstep(0.68, 0.70, lagoonNoiseGLSL(p.x, -p.y)) * snowHubDry * step(p.x, min(2200.0, coast - 900.0)) * step(-1470000.0, p.x),
+            max(bananaRiver, indianRiver) * (1.0 - causewayBridge)
+          ) * apDry;
+          vec3 roadCol = mix(vec3(0.33, 0.31, 0.28), vec3(0.24, 0.27, 0.32), snowAmt);
+          landCol = mix(landCol, roadCol, smoothstep(16.0, 12.0, road));
+          float snowPadRing = (1.0 - smoothstep(32.0, 36.0, length(p - vec2(-10500.0, 6200.0)))) * smoothstep(26.0, 29.0, length(p - vec2(-10500.0, 6200.0)));
+          landCol = mix(landCol, vec3(0.38, 0.78, 0.96), snowPadRing * 0.65);
+          float apPaved = smoothstep(1.5, -1.5, airportPavedDistGLSL(p.x, -p.y, uAirport0Off));
+          landCol = mix(landCol, vec3(0.065, 0.07, 0.082) * (0.9 + 0.2 * n2), apPaved);
+          float pad = uShowPad * smoothstep(${(PAD_RADIUS + 70).toFixed(1)}, ${(PAD_RADIUS + 55).toFixed(1)}, length(p));
+          landCol = mix(landCol, vec3(0.4, 0.39, 0.37) * (0.85 + 0.3 * n2), pad);
+          float ghShade = groundWaveHeight(p, uShowPad, uShowAirport);
+          float texMod = mix(0.78 + 0.44 * n3, 0.90 + 0.18 * n3, snowAmt);
+          landCol *= texMod * (1.0 + ghShade * 0.06);
+          float seaDist = max(0.0, -inlandDist);
+          float distOff = clamp(seaDist / 3200.0, 0.0, 1.0);
+          vec3 ocean = mix(vec3(0.032, 0.145, 0.175), vec3(0.008, 0.035, 0.075), distOff);
+          ocean = mix(ocean, vec3(0.18, 0.38, 0.52), snowAmt * (1.0 - distOff) * 0.55);
+          float oceanMask = max(1.0 - land, lagoon);
+          vec3 col = mix(landCol, ocean, oceanMask);
+          // surf line & arctic sea-ice frost rim
+          float shoreSigned = -inlandDist;
+          float surf = smoothstep(28.0, 0.0, abs(shoreSigned - 20.0 - sin((p.x * 0.6 + p.y) * 0.01 + uTime) * 6.0)) * smoothstep(58.0, 4.0, shoreSigned);
+          col = mix(col, mix(vec3(0.80), vec3(0.92, 0.97, 1.0), snowAmt), surf * mix(0.55, 0.80, snowAmt));
+          vec4 diffuseColor = vec4(col, opacity);
+        `)
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.55, snowAmt * (1.0 - oceanMask));\nroughnessFactor = mix(roughnessFactor, 0.06, oceanMask);')
+        .replace('#include <normal_fragment_maps>', /* glsl */`#include <normal_fragment_maps>
+          if (oceanMask > 0.01) {
+            vec3 q = vec3(p * 0.045, uTime * 0.35);
+            float e = 0.6;
+            float h0 = fbm3(q, 4);
+            float hx = fbm3(q + vec3(e * 0.045, 0.0, 0.0), 4);
+            float hy = fbm3(q + vec3(0.0, e * 0.045, 0.0), 4);
+            vec3 wn = vec3(-(hx - h0) * 9.0, 0.0, (hy - h0) * 9.0);
+            normal = normalize(normal + mat3(viewMatrix) * wn * oceanMask);
+          } else {
+            float eps = 1.5;
+            float hc = groundWaveHeight(p, uShowPad, uShowAirport);
+            float hx = groundWaveHeight(p + vec2(eps, 0.0), uShowPad, uShowAirport);
+            float hy = groundWaveHeight(p + vec2(0.0, -eps), uShowPad, uShowAirport);
+            vec3 ln = vec3(-(hx - hc) / eps * 2.2, 0.0, -(hy - hc) / eps * 2.2);
+            normal = normalize(normal + mat3(viewMatrix) * ln * (1.0 - oceanMask));
+          }`);
+    };
+    this.groundMat = gmat;
+    const groundGeo = new THREE.RingGeometry(0.01, 42000, 180, 220);
+    const gPos = groundGeo.attributes.position;
+    for (let i = 0; i < gPos.count; i++) {
+      const x = gPos.getX(i), y = gPos.getY(i);
+      const r = Math.hypot(x, y);
+      if (r > 1e-4) {
+        const t = r / 42000;
+        const rNew = 42000 * Math.pow(t, 2.25);
+        const s = rNew / r;
+        gPos.setXY(i, x * s, y * s);
+      }
+    }
+    gPos.needsUpdate = true;
+    const ground = new THREE.Mesh(groundGeo, gmat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    ground.renderOrder = 0;
+    this.ground = ground;
+    this.world.add(ground);
+
+    // trees (instanced pines + snow-covered arctic pines)
+    const trunk = new THREE.CylinderGeometry(0.15, 0.2, 2, 5).translate(0, 1, 0);
+    const crown1 = new THREE.ConeGeometry(1.6, 4, 7).translate(0, 3.6, 0);
+    const crown2 = new THREE.ConeGeometry(1.2, 3, 7).translate(0, 5.4, 0);
+    for (const g of [trunk, crown1, crown2]) g.deleteAttribute('uv');
+    const colorize = (g, c) => { const n = g.attributes.position.count; const a = new Float32Array(n * 3); for (let i = 0; i < n; i++) a.set(c, i * 3); g.setAttribute('color', new THREE.BufferAttribute(a, 3)); return g; };
+    const sTrunk = new THREE.CylinderGeometry(0.15, 0.2, 2, 5).translate(0, 1, 0);
+    const sCrown1 = new THREE.ConeGeometry(1.6, 3.7, 7).translate(0, 3.45, 0);
+    const sSnow1 = new THREE.ConeGeometry(1.66, 2.3, 7).translate(0, 4.25, 0);
+    const sCrown2 = new THREE.ConeGeometry(1.2, 2.8, 7).translate(0, 5.3, 0);
+    const sSnow2 = new THREE.ConeGeometry(1.25, 2.0, 7).translate(0, 5.8, 0);
+    for (const g of [sTrunk, sCrown1, sSnow1, sCrown2, sSnow2]) g.deleteAttribute('uv');
+    const treeGeo = mergeGeometries([colorize(trunk, [0.25, 0.17, 0.1]), colorize(crown1, [0.06, 0.13, 0.05]), colorize(crown2, [0.07, 0.15, 0.06])]);
+    const snowTreeGeo = mergeGeometries([
+      colorize(sTrunk, [0.22, 0.16, 0.12]),
+      colorize(sCrown1, [0.05, 0.12, 0.08]),
+      colorize(sSnow1, [0.89, 0.94, 0.99]),
+      colorize(sCrown2, [0.06, 0.14, 0.09]),
+      colorize(sSnow2, [0.94, 0.97, 1.0]),
+    ]);
+    const N = 10500;
+    const NSnowMax = 7500;
+    const trees = new THREE.InstancedMesh(treeGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9 }), N);
+    const snowTrees = new THREE.InstancedMesh(snowTreeGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72 }), NSnowMax);
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), v = new THREE.Vector3();
+    this.treeWaveY = [];
+    this.treeSpots = [];
+    this.snowTreeWaveY = [];
+    this.snowTreeSpots = [];
+    this.treeGrid = new Map();
+    const TREE_CELL = 32;
+    let n = 0;
+    let nSnow = 0;
+    const placeTreeAt = (x, z, forceSnow = false) => {
+      const isSnow = forceSnow || this.earthSnowAmount(x, z) > 0.35;
+      if (isSnow && nSnow >= NSnowMax) return false;
+      if (!isSnow && n >= N) return false;
+      const sc = 0.7 + Math.random() * 0.95;
+      const sy = sc * (0.82 + Math.random() * 0.5);
+      const ty = this.earthGroundWave(x, z, 0, 0);
+      const gKey = `${Math.floor(x / TREE_CELL)},${Math.floor(z / TREE_CELL)}`;
+      let bucket = this.treeGrid.get(gKey);
+      if (!bucket) {
+        bucket = [];
+        this.treeGrid.set(gKey, bucket);
+      }
+      const bucketItem = { x, z, ty, r: 1.55 * sc, h: 6.9 * sy };
+      bucket.push(bucketItem);
+      v.set(x, ty, z); s.set(sc, sy, sc);
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.random() * 6.28);
+      m.compose(v, q, s);
+      if (isSnow) {
+        this.snowTreeWaveY.push(ty);
+        this.snowTreeSpots.push({ x, z, bucketItem });
+        snowTrees.setMatrixAt(nSnow++, m);
+      } else {
+        this.treeWaveY.push(ty);
+        this.treeSpots.push({ x, z, bucketItem });
+        trees.setMatrixAt(n++, m);
+      }
+      return true;
+    };
+    for (let tries = 0; (n < N || nSnow < NSnowMax * 0.65) && tries < N * 5; tries++) {
+      let x, z;
+      let penAp = null;
+      const isPeninsulaTree = tries % 5 !== 0;
+      if (isPeninsulaTree) {
+        penAp = AIRPORT_SCATTER_OFFSETS[Math.floor(tries / 5) % AIRPORT_SCATTER_OFFSETS.length];
+        x = penAp.dx - 16500 + Math.random() * 20200;
+        z = penAp.dz + (Math.random() - 0.5) * 12400;
+        if (x > this.earthCoastX(z) - 210.0) continue; // keep trees on mainland peninsula above sandy beach
+        if (x < penAp.dx - 80 && Math.abs(z - (penAp.dz - 64)) < 24) continue; // keep mainland peninsula highway clear
+      } else {
+        const ang = Math.random() * Math.PI * 2, dist = 160 + Math.pow(Math.random(), 0.7) * 2800;
+        x = Math.cos(ang) * dist; z = Math.sin(ang) * dist;
+        if (x > this.earthCoastX(z) - 210.0 || x > 1800) continue; // near mainland coast/ocean
+      }
+      if (this.earthAirportBoxDist(x, z) < 40.0) continue; // keep all 5 mainland airport runways & aprons clear
+      if (!penAp && x <= 0 && Math.abs(z) < 22) continue; // keep clear inland Rover corridor heading west
+      if (!penAp && Math.abs(z + x * 2500 / 1500 * (x < 0 ? 1 : 0)) < 25 && x < 0 && x > -1500) continue;
+      if (this.earthRoadDist(x, z) < 22.0) continue;
+      if (this.isLagoonWater(x, z)) continue; // keep inland lagoons clear of trees
+      const cluster = TX.fbm(x / 300 + 50, z / 300 + 50, 1000, 3, 7);
+      if (cluster < 0.48) continue;
+      placeTreeAt(x, z);
+    }
+    // Dedicated Alpine Snow Forest in the nearby Northern Snow Zone (-3500 >= sz >= -13500)
+    for (let tries = 0; nSnow < NSnowMax && tries < 22000; tries++) {
+      const x = -15500 + Math.random() * 14500;
+      const z = -3550 - Math.random() * 9800;
+      if (x > this.earthCoastX(z) - 260.0) continue;
+      if (Math.hypot(x + 10500.0, z + 6200.0) < 66.0) continue; // keep Snow Zone landing clearing open
+      if (this.earthRoadDist(x, z) < 24.0) continue;
+      if (this.isLagoonWater(x, z)) continue;
+      if (this.earthSnowAmount(x, z) < 0.45) continue;
+      const cluster = TX.fbm(x / 280 + 19, z / 280 + 83, 1000, 3, 7);
+      if (cluster < 0.44) continue;
+      placeTreeAt(x, z, true);
+    }
+    trees.count = n;
+    trees.castShadow = true; trees.receiveShadow = true;
+    this.trees = trees;
+    this.world.add(trees);
+    snowTrees.count = nSnow;
+    snowTrees.castShadow = true; snowTrees.receiveShadow = true;
+    this.snowTrees = snowTrees;
+    this.world.add(snowTrees);
+
+    // 3D Snow Zone landmarks (Snowmen & glowing glacial ice crystal spires strictly on dry snow land around (-10500, -6200))
+    this.waveObjects = this.waveObjects || [];
+    const snowBodyMat = new THREE.MeshStandardMaterial({ color: 0xf8fbff, roughness: 0.55 });
+    const coalMat = new THREE.MeshStandardMaterial({ color: 0x181c24, roughness: 0.7 });
+    const carrotMat = new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.5 });
+    const scarfMat = new THREE.MeshStandardMaterial({ color: 0xef4444, roughness: 0.6 });
+    const iceMat = new THREE.MeshStandardMaterial({ color: 0x7dd3fc, emissive: 0x0284c7, emissiveIntensity: 0.45, roughness: 0.15, metalness: 0.25 });
+    const isDrySnowSpot = (px, pz) => {
+      if (px > this.earthCoastX(pz) - 320.0 || px < -1470000.0) return false;
+      if (this.isLagoonWater(px, pz)) return false;
+      return this.earthSnowAmount(px, pz) > 0.65;
+    };
+    const snowmanSpots = [
+      [-10542, -6168, 0.55, 1.35],
+      [-10458, -6174, -0.65, 1.15],
+      [-10536, -6236, 1.10, 1.25],
+    ];
+    for (const [smX, smZ, rotY, smScale] of snowmanSpots) {
+      if (!isDrySnowSpot(smX, smZ)) continue;
+      const sm = new THREE.Group();
+      const b1 = new THREE.Mesh(new THREE.SphereGeometry(1.15, 16, 12), snowBodyMat); b1.position.y = 1.05;
+      const b2 = new THREE.Mesh(new THREE.SphereGeometry(0.84, 16, 12), snowBodyMat); b2.position.y = 2.65;
+      const b3 = new THREE.Mesh(new THREE.SphereGeometry(0.58, 16, 12), snowBodyMat); b3.position.y = 3.85;
+      const scarf = new THREE.Mesh(new THREE.TorusGeometry(0.56, 0.12, 8, 20).rotateX(Math.PI / 2), scarfMat); scarf.position.y = 3.32;
+      const nose = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.62, 10).rotateX(Math.PI / 2), carrotMat); nose.position.set(0, 3.85, 0.72);
+      const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.075, 8, 8), coalMat); eyeL.position.set(-0.20, 4.02, 0.50);
+      const eyeR = new THREE.Mesh(new THREE.SphereGeometry(0.075, 8, 8), coalMat); eyeR.position.set(0.20, 4.02, 0.50);
+      const brim = new THREE.Mesh(new THREE.CylinderGeometry(0.68, 0.68, 0.08, 18), coalMat); brim.position.y = 4.35;
+      const hat = new THREE.Mesh(new THREE.CylinderGeometry(0.44, 0.42, 0.65, 18), coalMat); hat.position.y = 4.70;
+      sm.add(b1, b2, b3, scarf, nose, eyeL, eyeR, brim, hat);
+      sm.scale.setScalar(smScale);
+      sm.rotation.y = rotY;
+      sm.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+      const smY = this.earthGroundWave(smX, smZ, 0, 0);
+      sm.position.set(smX, smY, smZ);
+      this.world.add(sm);
+      this.waveObjects.push({ obj: sm, wx: smX, wz: smZ, baseY: 0, waveY: smY });
+    }
+    const crystalSpots = [[-10464, -6234], [-10555, -6206], [-10488, -6142], [-10512, -6256]];
+    for (const [cx, cz] of crystalSpots) {
+      if (!isDrySnowSpot(cx, cz)) continue;
+      const cg = new THREE.Group();
+      for (let ci = 0; ci < 4; ci++) {
+        const ch = 2.4 + (ci % 3) * 1.3;
+        const cr = 0.35 + (ci % 2) * 0.16;
+        const shard = new THREE.Mesh(new THREE.ConeGeometry(cr, ch, 6), iceMat);
+        shard.position.set((ci - 1.5) * 0.55, ch * 0.45, ((ci * 7) % 3 - 1) * 0.45);
+        shard.rotation.z = (ci - 1.5) * 0.16;
+        shard.rotation.x = ((ci % 2) - 0.5) * 0.18;
+        shard.castShadow = true;
+        cg.add(shard);
+      }
+      const cy = this.earthGroundWave(cx, cz, 0, 0);
+      cg.position.set(cx, cy, cz);
+      this.world.add(cg);
+      this.waveObjects.push({ obj: cg, wx: cx, wz: cz, baseY: 0, waveY: cy });
+    }
+
+    // 3D Glacial Ice Slabs ("miếng băng") across Earth's Snow Zone & around the (-10500, -6200) clearing
+    this.initSnowIceSlabs(snowmanSpots);
+
+    // Ambient falling 3D snowflakes when inside Earth's Snow Zone
+    const flakeCount = 900;
+    const flakePos = new Float32Array(flakeCount * 3);
+    for (let i = 0; i < flakeCount; i++) {
+      flakePos[i * 3] = (Math.random() - 0.5) * 180;
+      flakePos[i * 3 + 1] = Math.random() * 90;
+      flakePos[i * 3 + 2] = (Math.random() - 0.5) * 180;
+    }
+    const flakeGeo = new THREE.BufferGeometry();
+    flakeGeo.setAttribute('position', new THREE.BufferAttribute(flakePos, 3));
+    const flakeMat = new THREE.PointsMaterial({
+      color: 0xffffff,
+      size: 0.42,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    this.snowFlakes = new THREE.Points(flakeGeo, flakeMat);
+    this.snowFlakes.frustumCulled = false;
+    this.snowFlakes.visible = false;
+    this.scene.add(this.snowFlakes);
+
+    this.initSnowTracks();
+
+    // cloud layer
+    this.cloudMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, side: THREE.DoubleSide,
+      uniforms: { uOff: { value: new THREE.Vector2() }, uBend: { value: BEND }, uTime: { value: 0 }, uSunCol: { value: new THREE.Color(1, 0.9, 0.8) }, uFogColor: { value: new THREE.Color() }, uSun: { value: this.sunDir } },
+      vertexShader: /* glsl */`
+        varying vec2 vP; varying vec3 vW;
+        uniform vec2 uOff; uniform float uBend; varying vec2 vL;
+        void main() { vP = position.xy + uOff; vL = position.xy; vec4 w = modelMatrix * vec4(position, 1.0); w.y -= dot(w.xz, w.xz) * uBend; vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+      fragmentShader: /* glsl */`
+        ${NOISE_GLSL}
+        uniform float uTime; uniform vec3 uSunCol; uniform vec3 uFogColor; uniform vec3 uSun;
+        varying vec2 vP; varying vec3 vW; varying vec2 vL;
+        void main() {
+          vec2 p = vP + vec2(uTime * 6.0, uTime * 2.0);
+          float c = fbm3(vec3(p * 0.00028, 0.5), 7);
+          float big = fbm3(vec3(p * 0.00006, 2.5), 3);
+          float dens = smoothstep(0.56, 0.78, c + (big - 0.5) * 0.5);
+          if (dens < 0.01) discard;
+          float above = step(vW.y, cameraPosition.y);
+          float shade = fbm3(vec3((p + uSun.xz * 300.0) * 0.00028, 0.5), 5);
+          float lightAmt = clamp(1.0 - (shade - c) * 6.0, 0.25, 1.0);
+          vec3 col = uSunCol * mix(0.55, 1.0, lightAmt) * mix(0.55, 1.05, above) + vec3(0.1, 0.13, 0.18);
+          float dist = length(vW - cameraPosition);
+          float fog = 1.0 - exp(-dist * dist * 1.2e-10);
+          col = mix(col, uFogColor, fog * 0.85);
+          float a = dens * 0.92 * (1.0 - smoothstep(25000.0, 38000.0, length(vL)));
+          gl_FragColor = vec4(col, a);
+        }`,
+    });
+    const clouds = new THREE.Mesh(new THREE.PlaneGeometry(80000, 80000, 80, 80), this.cloudMat);
+    clouds.rotation.x = -Math.PI / 2;
+    clouds.position.y = 2800;
+    clouds.renderOrder = 3;
+    this.clouds = clouds;
+    this.world.add(clouds);
+  }
+
+  makeIceSlabTexture() {
+    const S = 256;
+    const cv = document.createElement('canvas');
+    cv.width = S;
+    cv.height = S;
+    const ctx = cv.getContext && cv.getContext('2d');
+    if (ctx) {
+      const bg = ctx.createRadialGradient(S * 0.46, S * 0.44, S * 0.05, S * 0.5, S * 0.5, S * 0.62);
+      bg.addColorStop(0.0, '#bef0ff');
+      bg.addColorStop(0.48, '#7dd8fc');
+      bg.addColorStop(0.82, '#4cc3f7');
+      bg.addColorStop(1.0, '#dff7ff');
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, S, S);
+
+      // Subtle internal crystalline sheen bands
+      const sheen = ctx.createLinearGradient(0, 0, S, S);
+      sheen.addColorStop(0.0, 'rgba(255, 255, 255, 0.24)');
+      sheen.addColorStop(0.35, 'rgba(14, 165, 233, 0.16)');
+      sheen.addColorStop(0.68, 'rgba(255, 255, 255, 0.30)');
+      sheen.addColorStop(1.0, 'rgba(2, 132, 199, 0.18)');
+      ctx.fillStyle = sheen;
+      ctx.fillRect(0, 0, S, S);
+
+      // Branching glacial fracture cracks & frost veins
+      if (ctx.beginPath && ctx.stroke) {
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        const cracks = [
+          [[34, 62], [88, 96], [142, 86], [198, 124], [232, 118]],
+          [[88, 96], [108, 148], [92, 206]],
+          [[142, 86], [164, 42]],
+          [[52, 178], [108, 148], [168, 166], [216, 198]],
+          [[168, 166], [186, 222]],
+          [[64, 124], [32, 142]],
+        ];
+        for (const pts of cracks) {
+          ctx.strokeStyle = 'rgba(12, 110, 172, 0.38)';
+          ctx.lineWidth = 4.2;
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0] + 1.5, pts[0][1] + 1.5);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0] + 1.5, pts[i][1] + 1.5);
+          ctx.stroke();
+
+          ctx.strokeStyle = 'rgba(248, 253, 255, 0.88)';
+          ctx.lineWidth = 2.1;
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+          ctx.stroke();
+        }
+      }
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = 8;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  initSnowIceSlabs(snowmanSpots = []) {
+    const polyVariants = [
+      [[-0.96, -0.28], [-0.58, -0.86], [0.16, -0.95], [0.84, -0.56], [0.98, 0.14], [0.62, 0.82], [-0.18, 0.94], [-0.82, 0.52]],
+      [[-0.92, -0.14], [-0.64, -0.78], [-0.04, -0.96], [0.68, -0.74], [0.96, -0.12], [0.54, 0.28], [0.76, 0.78], [0.04, 0.95], [-0.74, 0.64]],
+      [[-0.88, -0.44], [-0.26, -0.92], [0.52, -0.84], [0.95, -0.22], [0.78, 0.58], [0.08, 0.92], [-0.72, 0.68]],
+    ];
+    const slabGeos = polyVariants.map((pts) => {
+      const sh = new THREE.Shape();
+      sh.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) sh.lineTo(pts[i][0], pts[i][1]);
+      sh.closePath();
+      const geo = new THREE.ExtrudeGeometry(sh, {
+        depth: 0.38,
+        bevelEnabled: true,
+        bevelThickness: 0.055,
+        bevelSize: 0.09,
+        bevelSegments: 2,
+      });
+      geo.rotateX(Math.PI / 2);
+      geo.translate(0, 0.055, 0); // top crystal surface at +0.11m, beveled edge down to +0.055m, skirt buried to -0.38m
+      geo.computeVertexNormals();
+      const pos = geo.attributes.position;
+      const nrm = geo.attributes.normal;
+      const uvs = new Float32Array(pos.count * 2);
+      const cols = new Float32Array(pos.count * 3);
+      for (let i = 0; i < pos.count; i++) {
+        uvs[i * 2] = THREE.MathUtils.clamp(pos.getX(i) * 0.46 + 0.5, 0.02, 0.98);
+        uvs[i * 2 + 1] = THREE.MathUtils.clamp(pos.getZ(i) * 0.46 + 0.5, 0.02, 0.98);
+        const ny = nrm.getY(i);
+        if (ny > 0.92) {
+          cols[i * 3] = 0.80; cols[i * 3 + 1] = 0.95; cols[i * 3 + 2] = 1.0;
+        } else if (ny > 0.25) {
+          cols[i * 3] = 0.42; cols[i * 3 + 1] = 0.80; cols[i * 3 + 2] = 0.98;
+        } else {
+          cols[i * 3] = 0.24; cols[i * 3 + 1] = 0.62; cols[i * 3 + 2] = 0.90;
+        }
+      }
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+      return geo;
+    });
+
+    const iceSlabMat = new THREE.MeshStandardMaterial({
+      map: this.makeIceSlabTexture(),
+      vertexColors: true,
+      roughness: 0.09,
+      metalness: 0.16,
+      emissive: 0x0ea5e9,
+      emissiveIntensity: 0.14,
+    });
+
+    const spotsByVar = [[], [], []];
+    const hasTreeNear = (px, pz, rad) => {
+      if (!this.treeGrid) return false;
+      const c0x = Math.floor((px - rad) / 32), c1x = Math.floor((px + rad) / 32);
+      const c0z = Math.floor((pz - rad) / 32), c1z = Math.floor((pz + rad) / 32);
+      for (let gx = c0x; gx <= c1x; gx++) {
+        for (let gz = c0z; gz <= c1z; gz++) {
+          const b = this.treeGrid.get(`${gx},${gz}`);
+          if (!b) continue;
+          for (let k = 0; k < b.length; k++) {
+            if (Math.hypot(px - b[k].x, pz - b[k].z) < rad + b[k].r * 0.65) return true;
+          }
+        }
+      }
+      return false;
+    };
+    const hasSnowmanNear = (px, pz, rad) => {
+      for (let i = 0; i < snowmanSpots.length; i++) {
+        if (Math.hypot(px - snowmanSpots[i][0], pz - snowmanSpots[i][1]) < rad + 4.5) return true;
+      }
+      return false;
+    };
+
+    // Curated hero ice slabs right around the (-10500, -6200) Snow Zone clearing
+    const heroSlabs = [
+      [-10498, -6226, 6.8, 5.0, 0.42, 0],
+      [-10519, -6215, 4.6, 3.6, 1.85, 1],
+      [-10478, -6212, 5.8, 4.5, -0.75, 2],
+      [-10485, -6252, 8.2, 6.0, 0.95, 0],
+      [-10528, -6264, 7.4, 5.4, 2.30, 1],
+      [-10503, -6286, 9.2, 6.6, -0.35, 2],
+      [-10524, -6186, 5.2, 4.2, 1.15, 2],
+      [-10474, -6188, 6.0, 4.8, -1.25, 0],
+      [-10505, -6162, 6.8, 5.0, 0.65, 1],
+      [-10560, -6232, 6.6, 5.0, 2.60, 0],
+      [-10444, -6218, 7.4, 5.6, -0.52, 1],
+      [-10462, -6278, 8.0, 5.8, 1.72, 2],
+    ];
+    for (const [hx, hz, sx, sz, yaw, vi] of heroSlabs) {
+      if (this.earthSnowAmount(hx, hz) > 0.5 && !this.isLagoonWater(hx, hz)) {
+        spotsByVar[vi % 3].push({ x: hx, z: hz, sx, sy: 0.95 + (vi % 3) * 0.14, sz, yaw, waveY: 0 });
+      }
+    }
+
+    // Scattered natural ice slab clusters across the entire Northern Snow Zone
+    let totalScattered = 0;
+    const maxScattered = 420;
+    for (let tries = 0; totalScattered < maxScattered && tries < 6500; tries++) {
+      const cx = -15300 + Math.random() * 14100;
+      const cz = -3650 - Math.random() * 9500;
+      if (cx > this.earthCoastX(cz) - 280.0) continue;
+      if (Math.hypot(cx + 10500.0, cz + 6200.0) < 95.0) continue;
+      if (this.earthRoadDist(cx, cz) < 22.0) continue;
+      if (this.earthAirportBoxDist(cx, cz) < 65.0) continue;
+      if (this.isLagoonWater(cx, cz)) continue;
+      if (this.earthSnowAmount(cx, cz) < 0.52) continue;
+
+      const subCount = 1 + Math.floor(Math.random() * 3);
+      for (let si = 0; si < subCount && totalScattered < maxScattered; si++) {
+        const ang = Math.random() * Math.PI * 2;
+        const off = si === 0 ? 0 : (7.5 + Math.random() * 11.0);
+        const px = cx + Math.cos(ang) * off;
+        const pz = cz + Math.sin(ang) * off;
+        const rx = (si === 0 ? 4.8 : 2.8) + Math.random() * (si === 0 ? 4.6 : 2.8);
+        const rz = rx * (0.68 + Math.random() * 0.30);
+        const maxR = Math.max(rx, rz);
+        if (px > this.earthCoastX(pz) - 260.0) continue;
+        if (this.earthRoadDist(px, pz) < maxR + 14.0) continue;
+        if (this.isLagoonWater(px, pz)) continue;
+        if (this.earthSnowAmount(px, pz) < 0.50) continue;
+        if (hasTreeNear(px, pz, maxR + 1.2) || hasSnowmanNear(px, pz, maxR)) continue;
+        const vi = (totalScattered + si) % 3;
+        spotsByVar[vi].push({
+          x: px,
+          z: pz,
+          sx: rx,
+          sy: 0.85 + Math.random() * 0.45,
+          sz: rz,
+          yaw: Math.random() * Math.PI * 2,
+          waveY: 0,
+        });
+        totalScattered++;
+      }
+    }
+
+    this.snowIceSpots = spotsByVar;
+    this.snowIceMeshes = spotsByVar.map((list, vi) => {
+      const im = new THREE.InstancedMesh(slabGeos[vi], iceSlabMat, Math.max(1, list.length));
+      im.count = list.length;
+      im.receiveShadow = true;
+      im.castShadow = false;
+      this.world.add(im);
+      return im;
+    });
+    this.recomputeSnowIceWaves();
+    this.syncSnowIceSlabs(false);
+  }
+
+  recomputeSnowIceWaves() {
+    if (!this.snowIceSpots) return;
+    const upAxis = new THREE.Vector3(0, 1, 0);
+    const nrm = new THREE.Vector3();
+    const qSlope = new THREE.Quaternion();
+    const qYaw = new THREE.Quaternion();
+    const eps = 3.2;
+    for (let vi = 0; vi < this.snowIceSpots.length; vi++) {
+      const list = this.snowIceSpots[vi];
+      for (let i = 0; i < list.length; i++) {
+        const sp = list[i];
+        const yc = this.earthGroundWave(sp.x, sp.z, 0, 0);
+        const yx = this.earthGroundWave(sp.x + eps, sp.z, 0, 0);
+        const yz = this.earthGroundWave(sp.x, sp.z + eps, 0, 0);
+        nrm.set(-(yx - yc) / eps, 1, -(yz - yc) / eps).normalize();
+        qSlope.setFromUnitVectors(upAxis, nrm);
+        qYaw.setFromAxisAngle(upAxis, sp.yaw);
+        sp.waveY = yc;
+        sp.qFlat = sp.qFlat || new THREE.Quaternion();
+        sp.qSloped = sp.qSloped || new THREE.Quaternion();
+        sp.qFlat.copy(qYaw);
+        sp.qSloped.copy(qSlope).multiply(qYaw);
+      }
+    }
+  }
+
+  syncSnowIceSlabs(isAirport) {
+    if (!this.snowIceMeshes || !this.snowIceSpots) return;
+    const m = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const s = new THREE.Vector3();
+    const qDef = new THREE.Quaternion();
+    for (let vi = 0; vi < this.snowIceMeshes.length; vi++) {
+      const im = this.snowIceMeshes[vi];
+      const list = this.snowIceSpots[vi];
+      for (let i = 0; i < list.length; i++) {
+        const sp = list[i];
+        v.set(sp.x, isAirport ? 0 : (sp.waveY || 0), sp.z);
+        s.set(sp.sx, sp.sy, sp.sz);
+        m.compose(v, (isAirport ? sp.qFlat : sp.qSloped) || qDef, s);
+        im.setMatrixAt(i, m);
+      }
+      im.instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  makeSnowTrackTexture() {
+    const W = 128, H = 256;
+    const cv = document.createElement('canvas');
+    cv.width = W;
+    cv.height = H;
+    const ctx = cv.getContext && cv.getContext('2d');
+    if (ctx) {
+      if (ctx.clearRect) ctx.clearRect(0, 0, W, H);
+      // Raised soft snow berms pushed out on left & right sides of tire
+      const gLeft = ctx.createLinearGradient(4, 0, 26, 0);
+      gLeft.addColorStop(0.0, 'rgba(248, 252, 255, 0.0)');
+      gLeft.addColorStop(0.55, 'rgba(248, 252, 255, 0.72)');
+      gLeft.addColorStop(1.0, 'rgba(205, 222, 242, 0.55)');
+      ctx.fillStyle = gLeft;
+      ctx.fillRect(4, 0, 22, H);
+
+      const gRight = ctx.createLinearGradient(102, 0, 124, 0);
+      gRight.addColorStop(0.0, 'rgba(205, 222, 242, 0.55)');
+      gRight.addColorStop(0.45, 'rgba(248, 252, 255, 0.72)');
+      gRight.addColorStop(1.0, 'rgba(248, 252, 255, 0.0)');
+      ctx.fillStyle = gRight;
+      ctx.fillRect(102, 0, 22, H);
+
+      // Compacted icy blue-slate snow rut floor with shadowed sidewalls
+      const gRut = ctx.createLinearGradient(24, 0, 104, 0);
+      gRut.addColorStop(0.0, 'rgba(62, 86, 118, 0.90)');
+      gRut.addColorStop(0.14, 'rgba(98, 124, 156, 0.85)');
+      gRut.addColorStop(0.46, 'rgba(112, 138, 170, 0.82)');
+      gRut.addColorStop(0.50, 'rgba(136, 162, 192, 0.80)');
+      gRut.addColorStop(0.54, 'rgba(112, 138, 170, 0.82)');
+      gRut.addColorStop(0.86, 'rgba(98, 124, 156, 0.85)');
+      gRut.addColorStop(1.0, 'rgba(62, 86, 118, 0.90)');
+      ctx.fillStyle = gRut;
+      ctx.fillRect(24, 0, 80, H);
+
+      // Repeating V-chevron off-road tire lug grooves + crisp snow ridges (seamless wrap)
+      const rows = 6;
+      const stepY = H / rows;
+      if (ctx.beginPath && ctx.stroke) {
+        ctx.lineCap = 'round';
+        for (let r = -1; r <= rows; r++) {
+          const y0 = r * stepY + stepY * 0.5;
+          // Raised compressed snow ridge between lugs
+          ctx.strokeStyle = 'rgba(226, 239, 252, 0.82)';
+          ctx.lineWidth = 5.5;
+          ctx.beginPath();
+          ctx.moveTo(28, y0 + 18);
+          ctx.lineTo(58, y0 + 8);
+          ctx.moveTo(100, y0 + 18);
+          ctx.lineTo(70, y0 + 8);
+          ctx.stroke();
+
+          // Deep off-road chevron lug impression
+          ctx.strokeStyle = 'rgba(44, 66, 96, 0.93)';
+          ctx.lineWidth = 10.5;
+          ctx.beginPath();
+          ctx.moveTo(27, y0 + 8);
+          ctx.lineTo(58, y0 - 2);
+          ctx.moveTo(101, y0 + 8);
+          ctx.lineTo(70, y0 - 2);
+          ctx.stroke();
+
+          // Outer shoulder lug notches
+          ctx.fillStyle = 'rgba(40, 60, 88, 0.88)';
+          ctx.fillRect(23, y0 + 2, 8, 11);
+          ctx.fillRect(97, y0 + 2, 8, 11);
+        }
+      }
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.anisotropy = 8;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  initSnowTracks() {
+    const MAX_SEGS = 8192;
+    this.snowTrackMaxSegs = MAX_SEGS;
+    this.snowTrackHead = 0;
+    this.snowTrackCount = 0;
+    this.snowWheelStates = [];
+
+    const posArr = new Float32Array(MAX_SEGS * 12);
+    const nrmArr = new Float32Array(MAX_SEGS * 12);
+    for (let i = 1; i < nrmArr.length; i += 3) nrmArr[i] = 1;
+    const uvArr = new Float32Array(MAX_SEGS * 8);
+    const alphaArr = new Float32Array(MAX_SEGS * 4);
+    const idxArr = new Uint32Array(MAX_SEGS * 6);
+    for (let s = 0; s < MAX_SEGS; s++) {
+      const b = s * 4;
+      const o = s * 6;
+      idxArr[o] = b;
+      idxArr[o + 1] = b + 1;
+      idxArr[o + 2] = b + 2;
+      idxArr[o + 3] = b + 2;
+      idxArr[o + 4] = b + 1;
+      idxArr[o + 5] = b + 3;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    const posAttr = new THREE.BufferAttribute(posArr, 3);
+    const nrmAttr = new THREE.BufferAttribute(nrmArr, 3);
+    const uvAttr = new THREE.BufferAttribute(uvArr, 2);
+    const alphaAttr = new THREE.BufferAttribute(alphaArr, 1);
+    posAttr.setUsage(THREE.DynamicDrawUsage);
+    nrmAttr.setUsage(THREE.DynamicDrawUsage);
+    uvAttr.setUsage(THREE.DynamicDrawUsage);
+    alphaAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('position', posAttr);
+    geo.setAttribute('normal', nrmAttr);
+    geo.setAttribute('uv', uvAttr);
+    geo.setAttribute('aAlpha', alphaAttr);
+    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+    geo.setDrawRange(0, 0);
+
+    const trackMat = new THREE.MeshStandardMaterial({
+      map: this.makeSnowTrackTexture(),
+      transparent: true,
+      depthWrite: false,
+      roughness: 0.84,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    });
+    trackMat.onBeforeCompile = (sh) => {
+      sh.uniforms.uBend = this.groundUniforms.uBend;
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aAlpha;\nvarying float vTrackAlpha;\nuniform float uBend;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvTrackAlpha = aAlpha;')
+        .replace('#include <project_vertex>', `
+          vec4 mvPosition = vec4( transformed, 1.0 );
+          vec4 wpB = modelMatrix * mvPosition;
+          wpB.y -= dot(wpB.xz, wpB.xz) * uBend;
+          mvPosition = viewMatrix * wpB;
+          gl_Position = projectionMatrix * mvPosition;`);
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying float vTrackAlpha;')
+        .replace('#include <alphamap_fragment>', '#include <alphamap_fragment>\ndiffuseColor.a *= vTrackAlpha;');
+    };
+
+    const trackMesh = new THREE.Mesh(geo, trackMat);
+    trackMesh.frustumCulled = false;
+    trackMesh.renderOrder = 1;
+    trackMesh.visible = false;
+    this.snowTrackMesh = trackMesh;
+    this.world.add(trackMesh);
+  }
+
+  resetSnowTrackWheelStates() {
+    if (!this.snowWheelStates) return;
+    for (let i = 0; i < this.snowWheelStates.length; i++) {
+      if (this.snowWheelStates[i]) this.snowWheelStates[i].active = false;
+    }
+  }
+
+  clearSnowTracks() {
+    this.snowTrackHead = 0;
+    this.snowTrackCount = 0;
+    this.resetSnowTrackWheelStates();
+    if (this.snowTrackMesh?.geometry) {
+      this.snowTrackMesh.geometry.setDrawRange(0, 0);
+      this.snowTrackMesh.visible = false;
+    }
+  }
+
+  updateSnowTracks(F) {
+    if (!this.snowTrackMesh) return;
+    const P = this.player;
+    const wheels = this.rocket?.wheels;
+    if (P && !P.dead && !P.crashed && P.isRover && P.ref === 'earth' && P.landed && !P.clamped && wheels && wheels.length) {
+      P.root.updateMatrixWorld(true);
+      const rootPos = P.root.position;
+      const pSx = P.sx || 0;
+      const pSz = P.s?.z || 0;
+      const wPos = this._snowWPos || (this._snowWPos = new THREE.Vector3());
+      const geo = this.snowTrackMesh.geometry;
+      const posAttr = geo.attributes.position;
+      const nrmAttr = geo.attributes.normal;
+      const uvAttr = geo.attributes.uv;
+      const alphaAttr = geo.attributes.aAlpha;
+      const posArr = posAttr.array;
+      const nrmArr = nrmAttr.array;
+      const uvArr = uvAttr.array;
+      const alphaArr = alphaAttr.array;
+      const maxSegs = this.snowTrackMaxSegs;
+      const hw = 0.20;
+      const liftY = 0.032;
+      let dirty = false;
+
+      for (let wi = 0; wi < wheels.length; wi++) {
+        const wo = wheels[wi];
+        const wg = wo?.userData?.wheelGroup || wo;
+        if (!wg) continue;
+        let ws = this.snowWheelStates[wi];
+        if (!ws) {
+          ws = { active: false, hasEdge: false, x: 0, z: 0, lx: 0, ly: 0, lz: 0, rx: 0, ry: 0, rz: 0, fx: 0, fz: 0, v: 0, a: 0 };
+          this.snowWheelStates[wi] = ws;
+        }
+        wg.getWorldPosition(wPos);
+        const wx = pSx + (wPos.x - rootPos.x);
+        const wz = pSz + (wPos.z - rootPos.z);
+        const snowAmt = this.earthSnowAmount(wx, wz);
+        const onDrySnow = snowAmt >= 0.22 && wx <= this.earthCoastX(wz) - 15.0 && !this.isLagoonWater(wx, wz);
+        if (!onDrySnow) {
+          ws.active = false;
+          ws.hasEdge = false;
+          continue;
+        }
+        const curAlpha = THREE.MathUtils.smoothstep(snowAmt, 0.22, 0.46) * 0.94;
+        if (!ws.active) {
+          ws.active = true;
+          ws.hasEdge = false;
+          ws.x = wx;
+          ws.z = wz;
+          ws.a = curAlpha;
+          continue;
+        }
+        const totalDx = wx - ws.x;
+        const totalDz = wz - ws.z;
+        const dist = Math.hypot(totalDx, totalDz);
+        if (dist > 120.0) {
+          ws.hasEdge = false;
+          ws.x = wx;
+          ws.z = wz;
+          ws.a = curAlpha;
+          continue;
+        }
+        if (dist < 0.24) continue;
+
+        const fx = totalDx / dist;
+        const fz = totalDz / dist;
+        const rtx = -fz;
+        const rtz = fx;
+        if (ws.hasEdge && (fx * ws.fx + fz * ws.fz) < 0.15) {
+          ws.hasEdge = false;
+        }
+
+        const steps = Math.max(1, Math.min(48, Math.ceil(dist / 0.52)));
+        const startX = ws.x;
+        const startZ = ws.z;
+        const startA = ws.a;
+
+        if (!ws.hasEdge) {
+          const lx0 = startX - rtx * hw, lz0 = startZ - rtz * hw;
+          const rx0 = startX + rtx * hw, rz0 = startZ + rtz * hw;
+          ws.lx = lx0; ws.ly = this.earthGroundWave(lx0, lz0, 0.0, 0.0) + liftY; ws.lz = lz0;
+          ws.rx = rx0; ws.ry = this.earthGroundWave(rx0, rz0, 0.0, 0.0) + liftY; ws.rz = rz0;
+          ws.hasEdge = true;
+        }
+
+        for (let si = 1; si <= steps; si++) {
+          const f = si / steps;
+          const cx = startX + totalDx * f;
+          const cz = startZ + totalDz * f;
+          const sAmt = si === steps ? snowAmt : this.earthSnowAmount(cx, cz);
+          const a1 = THREE.MathUtils.smoothstep(sAmt, 0.22, 0.46) * 0.94;
+          const lx1 = cx - rtx * hw, lz1 = cz - rtz * hw;
+          const rx1 = cx + rtx * hw, rz1 = cz + rtz * hw;
+          const ly1 = this.earthGroundWave(lx1, lz1, 0.0, 0.0) + liftY;
+          const ry1 = this.earthGroundWave(rx1, rz1, 0.0, 0.0) + liftY;
+          const segLen = dist / steps;
+          const v0 = ws.v;
+          const v1 = v0 + segLen * 1.45;
+
+          const s = this.snowTrackHead;
+          this.snowTrackHead = (s + 1) % maxSegs;
+          if (this.snowTrackCount < maxSegs) this.snowTrackCount++;
+
+          const b12 = s * 12;
+          posArr[b12] = ws.lx; posArr[b12 + 1] = ws.ly; posArr[b12 + 2] = ws.lz;
+          posArr[b12 + 3] = ws.rx; posArr[b12 + 4] = ws.ry; posArr[b12 + 5] = ws.rz;
+          posArr[b12 + 6] = lx1; posArr[b12 + 7] = ly1; posArr[b12 + 8] = lz1;
+          posArr[b12 + 9] = rx1; posArr[b12 + 10] = ry1; posArr[b12 + 11] = rz1;
+
+          const ux = ws.rx - ws.lx, uy = ws.ry - ws.ly, uz = ws.rz - ws.lz;
+          const vx = lx1 - ws.lx, vy = ly1 - ws.ly, vz = lz1 - ws.lz;
+          let nx = uy * vz - uz * vy;
+          let ny = uz * vx - ux * vz;
+          let nz = ux * vy - uy * vx;
+          if (ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
+          const nLen = Math.hypot(nx, ny, nz);
+          if (nLen > 1e-5) { nx /= nLen; ny /= nLen; nz /= nLen; } else { nx = 0; ny = 1; nz = 0; }
+          for (let k = 0; k < 12; k += 3) {
+            nrmArr[b12 + k] = nx; nrmArr[b12 + k + 1] = ny; nrmArr[b12 + k + 2] = nz;
+          }
+
+          const b8 = s * 8;
+          uvArr[b8] = 0; uvArr[b8 + 1] = v0;
+          uvArr[b8 + 2] = 1; uvArr[b8 + 3] = v0;
+          uvArr[b8 + 4] = 0; uvArr[b8 + 5] = v1;
+          uvArr[b8 + 6] = 1; uvArr[b8 + 7] = v1;
+
+          const b4 = s * 4;
+          const a0 = si === 1 ? startA : ws.a;
+          alphaArr[b4] = a0; alphaArr[b4 + 1] = a0;
+          alphaArr[b4 + 2] = a1; alphaArr[b4 + 3] = a1;
+
+          ws.lx = lx1; ws.ly = ly1; ws.lz = lz1;
+          ws.rx = rx1; ws.ry = ry1; ws.rz = rz1;
+          ws.v = v1;
+          ws.a = a1;
+          dirty = true;
+        }
+        ws.x = wx;
+        ws.z = wz;
+        ws.fx = fx;
+        ws.fz = fz;
+      }
+
+      if (dirty) {
+        geo.setDrawRange(0, this.snowTrackCount * 6);
+        posAttr.needsUpdate = true;
+        nrmAttr.needsUpdate = true;
+        uvAttr.needsUpdate = true;
+        alphaAttr.needsUpdate = true;
+      }
+    }
+    this.snowTrackMesh.visible = !!(F && F.ref === 'earth' && F.alt < 12000 && this.snowTrackCount > 0);
+  }
+
+  // =================================================================== PAD
+  initPad() {
+    const conc = TX.concreteTextures();
+    const concMat = new THREE.MeshStandardMaterial({ map: conc.map.clone(), roughness: 0.85, color: 0xd8d4cc });
+    concMat.map.repeat.set(6, 6); concMat.map.needsUpdate = true;
+    const pad = new THREE.Group();
+    this.pad = pad;
+    this.world.add(pad);
+    // mound
+    const mound = new THREE.Mesh(new THREE.CylinderGeometry(PAD_RADIUS, PAD_RADIUS + 22, 6, 96), concMat);
+    mound.position.y = 3; mound.receiveShadow = true; mound.castShadow = true;
+    pad.add(mound);
+    // flame trench (dark slot along x)
+    const trenchMat = new THREE.MeshStandardMaterial({ color: 0x0b0b0b, roughness: 1 });
+    const trench = new THREE.Mesh(new THREE.BoxGeometry(PAD_RADIUS * 2 - 4, 0.1, 7), trenchMat);
+    trench.position.y = 6.0; pad.add(trench);
+    // launch mount
+    const mountMat = new THREE.MeshStandardMaterial({ color: 0x55585e, metalness: 0.7, roughness: 0.5 });
+    const legs = [[-5, -5], [5, -5], [5, 5], [-5, 5]];
+    for (const [x, z] of legs) {
+      const l = new THREE.Mesh(new THREE.BoxGeometry(1.6, 3, 1.6), mountMat);
+      l.position.set(x, 7.5, z); l.castShadow = true; l.receiveShadow = true; pad.add(l);
+    }
+    const ringGeo = new THREE.RingGeometry(2.4, 7.5, 4, 1);
+    const ringShape = new THREE.Shape();
+    ringShape.moveTo(-7, -7); ringShape.lineTo(7, -7); ringShape.lineTo(7, 7); ringShape.lineTo(-7, 7); ringShape.closePath();
+    const hole = new THREE.Path(); hole.absarc(0, 0, 3.2, 0, Math.PI * 2, true); ringShape.holes.push(hole);
+    const deck = new THREE.Mesh(new THREE.ExtrudeGeometry(ringShape, { depth: 1, bevelEnabled: false }), mountMat);
+    deck.rotation.x = -Math.PI / 2; deck.position.y = PAD_TOP - 1.0 - 0.01;
+    deck.castShadow = true; deck.receiveShadow = true;
+    pad.add(deck);
+    ringGeo.dispose();
+    // hold-down clamps
+    this.clamps = [];
+    for (let i = 0; i < 4; i++) {
+      const a = i * Math.PI / 2 + Math.PI / 4;
+      const c = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.6, 0.6), new THREE.MeshStandardMaterial({ color: 0xd4a62a, metalness: 0.5, roughness: 0.4 }));
+      c.position.set(Math.cos(a) * 2.2, PAD_TOP + 0.6, Math.sin(a) * 2.2);
+      c.castShadow = true;
+      pad.add(c); this.clamps.push(c);
+    }
+    // umbilical tower
+    const towerMat = new THREE.MeshStandardMaterial({ color: 0xa63b22, metalness: 0.5, roughness: 0.55 });
+    this.towerX = -13;
+    this.towerGroup = new THREE.Group();
+    this.towerGroup.position.x = this.towerX;
+    pad.add(this.towerGroup);
+    const tower = latticeTower(80, 6, towerMat, { step: 3.2, t: 0.35, brace: 0.16 });
+    tower.position.set(0, 6, 0);
+    this.towerGroup.add(tower);
+    for (let y = 14; y < 86; y += 12) {
+      const deckT = new THREE.Mesh(new THREE.BoxGeometry(7, 0.3, 7), towerMat);
+      deckT.position.set(0, y, 0); deckT.castShadow = true; this.towerGroup.add(deckT);
+    }
+    const lampMat = new THREE.MeshStandardMaterial({ color: 0, emissive: 0xff2010, emissiveIntensity: 20 });
+    this.beacons = [];
+    const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 8), lampMat);
+    beacon.position.set(0, 87, 0); this.towerGroup.add(beacon); this.beacons.push(beacon);
+    // swing arms (rebuilt per rocket)
+    this.arms = [];
+    // lightning masts
+    const mastMat = new THREE.MeshStandardMaterial({ color: 0x8a8d93, metalness: 0.7, roughness: 0.4 });
+    for (const [x, z] of [[-75, -60], [75, -60], [10, 85]]) {
+      const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.6, 110, 10), mastMat);
+      mast.position.set(x, 55, z); mast.castShadow = true; pad.add(mast);
+      const b = new THREE.Mesh(new THREE.SphereGeometry(0.5, 10, 8), lampMat); b.position.set(x, 110.5, z); pad.add(b); this.beacons.push(b);
+    }
+    this.buildingColliders = this.buildingColliders || [];
+    this.waveObjects = this.waveObjects || [];
+    // water tower
+    const wt = new THREE.Group();
+    const wtMat = new THREE.MeshStandardMaterial({ color: 0xd9dbe0, metalness: 0.5, roughness: 0.35 });
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(9, 32, 16), wtMat); sphere.position.y = 55; wt.add(sphere);
+    for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.6, 50, 8), mastMat); leg.position.set(Math.cos(a) * 6, 25, Math.sin(a) * 6); wt.add(leg); }
+    const wtY = this.earthGroundWave(140, -170, 0, 0);
+    wt.position.set(140, wtY, -170);
+    wt.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    this.world.add(wt);
+    const wtCol = { minX: 140 - 7.5, maxX: 140 + 7.5, minZ: -170 - 7.5, maxZ: -170 + 7.5, maxY: wtY + 64, mode: 'all' };
+    this.buildingColliders.push(wtCol);
+    this.waveObjects.push({ obj: wt, wx: 140, wz: -170, baseY: 0, waveY: wtY, collider: wtCol, colH: 64 });
+    // flood light poles
+    const headMat = new THREE.MeshStandardMaterial({ color: 0, emissive: 0xfff5e4, emissiveIntensity: 38 });
+    for (let i = 0; i < 6; i++) {
+      const a = (i * Math.PI * 2) / 6 + 0.35;
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.44, 42, 8), mastMat);
+      pole.position.set(Math.cos(a) * 95, 21, Math.sin(a) * 95); pole.castShadow = true;
+      const head = new THREE.Mesh(new THREE.BoxGeometry(4.6, 2.4, 0.7), headMat);
+      head.position.set(Math.cos(a) * 95, 42, Math.sin(a) * 95); head.lookAt(0, 18, 0);
+      pad.add(pole, head);
+    }
+    // Vehicle Assembly Building (far)
+    const vabY = this.earthGroundWave(-1500, -2500, 0, 0);
+    const vabMat = new THREE.MeshStandardMaterial({ color: 0xc8c6c0, roughness: 0.8 });
+    const vab = new THREE.Mesh(new THREE.BoxGeometry(160, 160, 130), vabMat);
+    vab.position.set(-1500, vabY + 80, -2500); vab.castShadow = true; vab.receiveShadow = true;
+    this.world.add(vab);
+    const vabCol = { minX: -1580, maxX: -1420, minZ: -2565, maxZ: -2435, maxY: vabY + 160, mode: 'all' };
+    this.buildingColliders.push(vabCol);
+    this.waveObjects.push({ obj: vab, wx: -1500, wz: -2500, baseY: 80, waveY: vabY, collider: vabCol, colH: 160 });
+    const door = new THREE.Mesh(new THREE.PlaneGeometry(40, 140), new THREE.MeshStandardMaterial({ color: 0x55575c, roughness: 0.6 }));
+    door.position.set(-1500, vabY + 72, -2434.9); this.world.add(door);
+    this.waveObjects.push({ obj: door, wx: -1500, wz: -2500, baseY: 72, waveY: vabY });
+    const stripe = new THREE.Mesh(new THREE.PlaneGeometry(60, 40), new THREE.MeshStandardMaterial({ map: TX.flagDecal(), transparent: true }));
+    stripe.position.set(-1460 + 30, vabY + 120, -2434.8); this.world.add(stripe);
+    this.waveObjects.push({ obj: stripe, wx: -1460 + 30, wz: -2434.8, baseY: 120, waveY: vabY });
+    // small buildings
+    const bMat = new THREE.MeshStandardMaterial({ color: 0xb0aea8, roughness: 0.8 });
+    for (let i = 0; i < 18; i++) {
+      const bw = 20 + Math.random() * 40;
+      const bh = 8 + Math.random() * 20;
+      const bd = 20 + Math.random() * 30;
+      const bx = -700 - Math.random() * 1600;
+      const bz = -1200 - Math.random() * 1400;
+      const by = this.earthGroundWave(bx, bz, 0, 0);
+      const b = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, bd), bMat);
+      b.position.set(bx, by + bh / 2, bz);
+      b.castShadow = true; b.receiveShadow = true;
+      this.world.add(b);
+      const bCol = {
+        minX: bx - bw / 2,
+        maxX: bx + bw / 2,
+        minZ: bz - bd / 2,
+        maxZ: bz + bd / 2,
+        maxY: by + bh,
+        mode: 'all',
+      };
+      this.buildingColliders.push(bCol);
+      this.waveObjects.push({ obj: b, wx: bx, wz: bz, baseY: bh / 2, waveY: by, collider: bCol, colH: bh });
+    }
+    pad.traverse((o) => { if (o.isMesh) o.receiveShadow = true; });
+  }
+
+  randomizeGroundWaves() {
+    this.clearSnowTracks();
+    this.groundWaveSeed = Math.random() * 6.283185;
+    if (this.groundUniforms && this.groundUniforms.uWaveSeed) {
+      this.groundUniforms.uWaveSeed.value = this.groundWaveSeed;
+    }
+    if (this.waveObjects) {
+      for (const item of this.waveObjects) {
+        if (item.wx !== undefined && item.wz !== undefined) {
+          item.waveY = this.earthGroundWave(item.wx, item.wz, 0, 0);
+          if (item.collider && item.colH !== undefined) {
+            item.collider.maxY = item.waveY + item.colH;
+          }
+        }
+      }
+    }
+    if (this.treeSpots && this.treeWaveY) {
+      for (let i = 0; i < this.treeSpots.length; i++) {
+        const sp = this.treeSpots[i];
+        const ty = this.earthGroundWave(sp.x, sp.z, 0, 0);
+        this.treeWaveY[i] = ty;
+        if (sp.bucketItem) sp.bucketItem.ty = ty;
+      }
+    }
+    if (this.snowTreeSpots && this.snowTreeWaveY) {
+      for (let i = 0; i < this.snowTreeSpots.length; i++) {
+        const sp = this.snowTreeSpots[i];
+        const ty = this.earthGroundWave(sp.x, sp.z, 0, 0);
+        this.snowTreeWaveY[i] = ty;
+        if (sp.bucketItem) sp.bucketItem.ty = ty;
+      }
+    }
+    this.recomputeSnowIceWaves();
+  }
+
+  syncAirportFlatGround(isAirport) {
+    if (this.waveObjects) {
+      for (const item of this.waveObjects) {
+        if (item.obj) item.obj.position.y = item.baseY + (isAirport ? 0 : item.waveY);
+      }
+    }
+    if (this.trees && this.treeWaveY) {
+      const m = new THREE.Matrix4();
+      for (let i = 0; i < this.trees.count; i++) {
+        this.trees.getMatrixAt(i, m);
+        m.elements[13] = isAirport ? 0 : (this.treeWaveY[i] || 0);
+        this.trees.setMatrixAt(i, m);
+      }
+      this.trees.instanceMatrix.needsUpdate = true;
+    }
+    if (this.snowTrees && this.snowTreeWaveY) {
+      const m = new THREE.Matrix4();
+      for (let i = 0; i < this.snowTrees.count; i++) {
+        this.snowTrees.getMatrixAt(i, m);
+        m.elements[13] = isAirport ? 0 : (this.snowTreeWaveY[i] || 0);
+        this.snowTrees.setMatrixAt(i, m);
+      }
+      this.snowTrees.instanceMatrix.needsUpdate = true;
+    }
+    this.syncSnowIceSlabs(isAirport);
+  }
+
+  makeAirportSignTexture(aIdx) {
+    const cv = document.createElement('canvas');
+    cv.width = 512;
+    cv.height = 128;
+    const ctx = cv.getContext && cv.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#071426';
+      ctx.fillRect(0, 0, 512, 128);
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 8;
+      if (ctx.strokeRect) ctx.strokeRect(8, 8, 496, 112);
+      ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+      ctx.lineWidth = 3;
+      if (ctx.strokeRect) ctx.strokeRect(18, 18, 476, 92);
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = '900 54px Orbitron, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(tr(`🛫 SÂN BAY ${aIdx}`, `🛫 AIRPORT ${aIdx}`), 256, 66);
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  initAirport() {
+    const airport = new THREE.Group();
+    airport.visible = false;
+    this.airport = airport;
+    this.subAirports = [];
+    this.airportRadars = [];
+    this.airportWindsocks = [];
+    this.airportFoundations = [];
+    this.airportSignMats = [];
+    this.airportCenterGroup = null;
+
+    const conc = TX.concreteTextures();
+    const asphaltMap = conc.map.clone();
+    asphaltMap.repeat.set(36, 4);
+    asphaltMap.needsUpdate = true;
+    const concMap = conc.map.clone();
+    concMap.repeat.set(16, 6);
+    concMap.needsUpdate = true;
+    const asphaltMat = new THREE.MeshStandardMaterial({
+      map: asphaltMap,
+      color: 0x2b2e34,
+      roughness: 0.88,
+      metalness: 0.06,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    });
+    const shoulderMat = new THREE.MeshStandardMaterial({
+      map: concMap,
+      color: 0x585c64,
+      roughness: 0.9,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const apronMat = new THREE.MeshStandardMaterial({
+      map: concMap,
+      color: 0x6c7078,
+      roughness: 0.85,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -2,
+    });
+    const foundMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.85, metalness: 0.25 });
+    const mastMat = new THREE.MeshStandardMaterial({ color: 0xd9dbe0, metalness: 0.5, roughness: 0.45 });
+    const headMat = new THREE.MeshStandardMaterial({ color: 0, emissive: 0xfff5e4, emissiveIntensity: 38 });
+    const whiteLineMat = new THREE.MeshBasicMaterial({
+      color: 0xf4f6fa,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -8,
+    });
+    const yellowLineMat = new THREE.MeshBasicMaterial({
+      color: 0xfacc15,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -8,
+    });
+
+    const rwyLen = 2400, rwyW = 38, rwyCenterX = 1040;
+    const shoulderGeo = new THREE.BoxGeometry(rwyLen + 20, 0.14, rwyW + 10);
+    const runwayGeo = new THREE.BoxGeometry(rwyLen, 0.25, rwyW);
+    const foundGeo = new THREE.BoxGeometry(rwyLen + 40, 48, 150);
+    const sideStripeGeo = new THREE.PlaneGeometry(rwyLen - 40, 0.75);
+    sideStripeGeo.rotateX(-Math.PI / 2);
+    const dashGeo = new THREE.PlaneGeometry(28, 0.85);
+    dashGeo.rotateX(-Math.PI / 2);
+    const keyGeo = new THREE.PlaneGeometry(22, 1.35);
+    keyGeo.rotateX(-Math.PI / 2);
+    const aimGeo = new THREE.PlaneGeometry(36, 3.6);
+    aimGeo.rotateX(-Math.PI / 2);
+    const apronGeo = new THREE.BoxGeometry(380, 0.20, 86);
+    const parallelTaxiGeo = new THREE.BoxGeometry(920, 0.20, 18);
+    const connGeo = new THREE.BoxGeometry(20, 0.22, 24);
+    const holdGeo = new THREE.PlaneGeometry(18, 0.6);
+    holdGeo.rotateX(-Math.PI / 2);
+    const taxiLineGeo = new THREE.PlaneGeometry(0.45, 24);
+    taxiLineGeo.rotateX(-Math.PI / 2);
+
+    const edgeLightGeo = new THREE.SphereGeometry(0.28, 8, 8);
+    const stemGeo = new THREE.CylinderGeometry(0.08, 0.1, 0.45, 6);
+    const stemMat = new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.5 });
+    const whiteLightMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff7ed, emissiveIntensity: 13 });
+    const amberLightMat = new THREE.MeshStandardMaterial({ color: 0xfbbf24, emissive: 0xf59e0b, emissiveIntensity: 13 });
+    const greenLightMat = new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x22c55e, emissiveIntensity: 15 });
+    const redLightMat = new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0xef4444, emissiveIntensity: 15 });
+
+    const hangarWallMat = new THREE.MeshStandardMaterial({ color: 0xd1d5db, metalness: 0.35, roughness: 0.55 });
+    const hangarRoofMat = new THREE.MeshStandardMaterial({ color: 0x3b82f6, metalness: 0.45, roughness: 0.45 });
+    const hangarDoorMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.5, roughness: 0.4 });
+    const hangarGlowMat = new THREE.MeshBasicMaterial({ color: 0xfef3c7 });
+    const hangarBodyGeo = new THREE.BoxGeometry(46, 14, 36);
+    const hangarArchGeo = new THREE.CylinderGeometry(23, 23, 36, 20, 1, false, 0, Math.PI);
+    const hangarDoorGeo = new THREE.PlaneGeometry(36, 11.5);
+    const hangarStripGeo = new THREE.PlaneGeometry(34, 0.8);
+
+    const termBodyMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.45, metalness: 0.25 });
+    const termGlassMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, emissive: 0x0ea5e9, emissiveIntensity: 0.45, roughness: 0.15, metalness: 0.85 });
+    const termRoofMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.5, roughness: 0.4 });
+    const termBodyGeo = new THREE.BoxGeometry(96, 13, 32);
+    const termGlassGeo = new THREE.PlaneGeometry(90, 9.5);
+    const termRoofGeo = new THREE.BoxGeometry(104, 1.4, 38);
+    const jetwayGeo = new THREE.BoxGeometry(3.6, 3.4, 18);
+
+    const atcShaftMat = new THREE.MeshStandardMaterial({ color: 0xd6d3d1, roughness: 0.65 });
+    const atcCabBaseMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.4, metalness: 0.5 });
+    const atcCabGlassMat = new THREE.MeshStandardMaterial({ color: 0x67e8f9, emissive: 0x06b6d4, emissiveIntensity: 0.65, roughness: 0.15, metalness: 0.8 });
+    const atcCabRoofMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.4, metalness: 0.5 });
+    const dishMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, metalness: 0.4, roughness: 0.3 });
+    const sockOrange = new THREE.MeshStandardMaterial({ color: 0xf97316, emissive: 0xea580c, emissiveIntensity: 0.25, roughness: 0.6 });
+    const sockWhite = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.6 });
+    const poleGeo = new THREE.CylinderGeometry(0.28, 0.4, 28, 8);
+    const headGeo = new THREE.BoxGeometry(3.8, 1.6, 0.6);
+
+    for (let aIdx = 0; aIdx < AIRPORT_SCATTER_OFFSETS.length; aIdx++) {
+      const off = AIRPORT_SCATTER_OFFSETS[aIdx];
+      const subAirport = new THREE.Group();
+      subAirport.position.set(off.dx, 0, off.dz);
+      this.subAirports.push(subAirport);
+      if (aIdx === 0) this.airportCenterGroup = subAirport;
+
+      const foundMesh = new THREE.Mesh(foundGeo, foundMat);
+      foundMesh.position.set(rwyCenterX, -24.0, -34);
+      foundMesh.visible = false;
+      subAirport.add(foundMesh);
+      this.airportFoundations.push(foundMesh);
+
+      const shoulder = new THREE.Mesh(shoulderGeo, shoulderMat);
+      shoulder.position.set(rwyCenterX, 0.07, 0);
+      shoulder.receiveShadow = true;
+      subAirport.add(shoulder);
+
+      const runway = new THREE.Mesh(runwayGeo, asphaltMat);
+      runway.position.set(rwyCenterX, 0.125, 0);
+      runway.receiveShadow = true;
+      subAirport.add(runway);
+
+      for (const s of [-1, 1]) {
+        const edgeLine = new THREE.Mesh(sideStripeGeo, whiteLineMat);
+        edgeLine.position.set(rwyCenterX, 0.262, s * 17.6);
+        subAirport.add(edgeLine);
+      }
+
+      for (let x = -90; x <= 2160; x += 52) {
+        const dash = new THREE.Mesh(dashGeo, whiteLineMat);
+        dash.position.set(x, 0.264, 0);
+        subAirport.add(dash);
+      }
+
+      for (const endX of [-132, 2212]) {
+        for (const s of [-1, 1]) {
+          for (let k = 0; k < 4; k++) {
+            const key = new THREE.Mesh(keyGeo, whiteLineMat);
+            key.position.set(endX, 0.265, s * (3.2 + k * 3.1));
+            subAirport.add(key);
+          }
+        }
+      }
+      for (const s of [-1, 1]) {
+        const aim1 = new THREE.Mesh(aimGeo, whiteLineMat);
+        aim1.position.set(190, 0.265, s * 8.5);
+        subAirport.add(aim1);
+        const aim2 = new THREE.Mesh(aimGeo, whiteLineMat);
+        aim2.position.set(1890, 0.265, s * 8.5);
+        subAirport.add(aim2);
+      }
+
+      const apron = new THREE.Mesh(apronGeo, apronMat);
+      apron.position.set(70, 0.10, -64);
+      apron.receiveShadow = true;
+      subAirport.add(apron);
+
+      const parallelTaxi = new THREE.Mesh(parallelTaxiGeo, asphaltMat);
+      parallelTaxi.position.set(340, 0.10, -34);
+      parallelTaxi.receiveShadow = true;
+      subAirport.add(parallelTaxi);
+
+      for (const tx of [-35, 85, 235, 520, 760]) {
+        const conn = new THREE.Mesh(connGeo, asphaltMat);
+        conn.position.set(tx, 0.11, -22);
+        conn.receiveShadow = true;
+        subAirport.add(conn);
+
+        const hold = new THREE.Mesh(holdGeo, yellowLineMat);
+        hold.position.set(tx, 0.262, -19.5);
+        subAirport.add(hold);
+
+        const tLine = new THREE.Mesh(taxiLineGeo, yellowLineMat);
+        tLine.position.set(tx, 0.232, -22);
+        subAirport.add(tLine);
+      }
+
+      for (let x = -150; x <= 2230; x += 80) {
+        const lMat = x > 1750 ? amberLightMat : whiteLightMat;
+        for (const s of [-1, 1]) {
+          const stem = new THREE.Mesh(stemGeo, stemMat);
+          stem.position.set(x, 0.25, s * 19.6);
+          const bulb = new THREE.Mesh(edgeLightGeo, lMat);
+          bulb.position.set(x, 0.52, s * 19.6);
+          subAirport.add(stem, bulb);
+        }
+      }
+      for (let z = -17.5; z <= 17.5; z += 5.0) {
+        const gBulb = new THREE.Mesh(edgeLightGeo, greenLightMat);
+        gBulb.position.set(-154, 0.36, z);
+        const rBulb = new THREE.Mesh(edgeLightGeo, redLightMat);
+        rBulb.position.set(2234, 0.36, z);
+        subAirport.add(gBulb, rBulb);
+      }
+
+      for (const hx of [-58, 8]) {
+        const hg = new THREE.Group();
+        hg.position.set(hx, 0.2, -72);
+
+        const body = new THREE.Mesh(hangarBodyGeo, hangarWallMat);
+        body.position.y = 7;
+        body.castShadow = true;
+        body.receiveShadow = true;
+        hg.add(body);
+
+        const arch = new THREE.Mesh(hangarArchGeo, hangarRoofMat);
+        arch.rotation.z = Math.PI / 2;
+        arch.rotation.y = Math.PI / 2;
+        arch.scale.set(1, 0.34, 1);
+        arch.position.y = 14;
+        arch.castShadow = true;
+        hg.add(arch);
+
+        const doorOpen = new THREE.Mesh(hangarDoorGeo, hangarDoorMat);
+        doorOpen.position.set(0, 5.75, 18.08);
+        hg.add(doorOpen);
+
+        const lightStrip = new THREE.Mesh(hangarStripGeo, hangarGlowMat);
+        lightStrip.position.set(0, 11.2, 18.12);
+        hg.add(lightStrip);
+
+        subAirport.add(hg);
+        this.buildingColliders.push({
+          aIdx,
+          minX: hx - 23,
+          maxX: hx + 23,
+          minZ: -72 - 18,
+          maxZ: -72 + 18,
+          maxY: 22,
+          mode: 'plane',
+        });
+      }
+
+      const termGroup = new THREE.Group();
+      termGroup.position.set(138, 0.2, -76);
+      const termBody = new THREE.Mesh(termBodyGeo, termBodyMat);
+      termBody.position.y = 6.5;
+      termBody.castShadow = true;
+      termBody.receiveShadow = true;
+      termGroup.add(termBody);
+
+      const glassWall = new THREE.Mesh(termGlassGeo, termGlassMat);
+      glassWall.position.set(0, 6.2, 16.08);
+      termGroup.add(glassWall);
+
+      const termRoof = new THREE.Mesh(termRoofGeo, termRoofMat);
+      termRoof.position.set(0, 13.7, 1.5);
+      termRoof.castShadow = true;
+      termGroup.add(termRoof);
+
+      const apSignTex = this.makeAirportSignTexture(aIdx);
+      const apSignMat = new THREE.MeshStandardMaterial({
+        map: apSignTex,
+        emissive: 0xffffff,
+        emissiveMap: apSignTex,
+        emissiveIntensity: 0.95,
+        roughness: 0.25,
+        metalness: 0.14,
+      });
+      this.airportSignMats.push({ aIdx, mat: apSignMat });
+
+      const termSignBack = new THREE.Mesh(new THREE.BoxGeometry(28.0, 6.8, 1.0), termRoofMat);
+      termSignBack.position.set(0, 17.8, 17.5);
+      const termSignFront = new THREE.Mesh(new THREE.PlaneGeometry(27.0, 6.2), apSignMat);
+      termSignFront.position.set(0, 17.8, 18.06);
+      const termSignRear = new THREE.Mesh(new THREE.PlaneGeometry(27.0, 6.2), apSignMat);
+      termSignRear.rotation.y = Math.PI;
+      termSignRear.position.set(0, 17.8, 16.94);
+      termGroup.add(termSignBack, termSignFront, termSignRear);
+
+      const spawnSignGroup = new THREE.Group();
+      spawnSignGroup.position.set(8, 19.6, -54);
+      const spawnSignBack = new THREE.Mesh(new THREE.BoxGeometry(24.0, 5.8, 0.9), hangarDoorMat);
+      const spawnSignFront = new THREE.Mesh(new THREE.PlaneGeometry(23.0, 5.2), apSignMat);
+      spawnSignFront.position.z = 0.50;
+      spawnSignGroup.add(spawnSignBack, spawnSignFront);
+      subAirport.add(spawnSignGroup);
+
+      for (const jx of [-26, 26]) {
+        const jw = new THREE.Mesh(jetwayGeo, hangarWallMat);
+        jw.position.set(jx, 5.2, 24);
+        jw.castShadow = true;
+        termGroup.add(jw);
+        this.buildingColliders.push({
+          aIdx,
+          minX: 138 + jx - 1.8,
+          maxX: 138 + jx + 1.8,
+          minZ: -76 + 24 - 9,
+          maxZ: -76 + 24 + 9,
+          maxY: 7.2,
+          mode: 'plane',
+        });
+      }
+      subAirport.add(termGroup);
+      this.buildingColliders.push({
+        aIdx,
+        minX: 138 - 52,
+        maxX: 138 + 52,
+        minZ: -76 - 19,
+        maxZ: -76 + 19,
+        maxY: 15.5,
+        mode: 'plane',
+      });
+
+      const atc = new THREE.Group();
+      atc.position.set(58, 0.2, -56);
+      this.buildingColliders.push({
+        aIdx,
+        minX: 58 - 7.5,
+        maxX: 58 + 7.5,
+        minZ: -56 - 7.5,
+        maxZ: -56 + 7.5,
+        maxY: 45,
+        mode: 'plane',
+      });
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 4.6, 32, 12), atcShaftMat);
+      shaft.position.y = 16;
+      shaft.castShadow = true;
+      atc.add(shaft);
+
+      const cabBase = new THREE.Mesh(new THREE.CylinderGeometry(6.8, 3.8, 3.2, 12), atcCabBaseMat);
+      cabBase.position.y = 33.6;
+      atc.add(cabBase);
+
+      const cabGlass = new THREE.Mesh(new THREE.CylinderGeometry(7.4, 6.6, 4.6, 12), atcCabGlassMat);
+      cabGlass.position.y = 37.5;
+      atc.add(cabGlass);
+
+      const cabRoof = new THREE.Mesh(new THREE.CylinderGeometry(5.8, 7.8, 1.4, 12), atcCabRoofMat);
+      cabRoof.position.y = 40.5;
+      atc.add(cabRoof);
+
+      const radarGroup = new THREE.Group();
+      radarGroup.position.y = 42.2;
+      const ped = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.6, 1.6, 8), hangarDoorMat);
+      const dish = new THREE.Mesh(new THREE.BoxGeometry(6.2, 1.3, 0.45), dishMat);
+      dish.position.y = 1.1;
+      const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.38, 8, 8), redLightMat);
+      beacon.position.y = 2.2;
+      radarGroup.add(ped, dish, beacon);
+      this.airportRadars.push(radarGroup);
+      if (aIdx === 0) this.airportRadar = radarGroup;
+      atc.add(radarGroup);
+      subAirport.add(atc);
+
+      const wsGroup = new THREE.Group();
+      wsGroup.position.set(-28, 0.25, -25);
+      const wsPole = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.14, 6.5, 8), mastMat);
+      wsPole.position.y = 3.25;
+      wsGroup.add(wsPole);
+      const sockPivot = new THREE.Group();
+      sockPivot.position.y = 6.3;
+      for (let i = 0; i < 5; i++) {
+        const r1 = 0.55 - i * 0.07, r2 = 0.55 - (i + 1) * 0.07;
+        const seg = new THREE.Mesh(new THREE.CylinderGeometry(r2, r1, 0.55, 10, 1, true), i % 2 === 0 ? sockOrange : sockWhite);
+        seg.rotation.z = Math.PI / 2;
+        seg.position.x = 0.35 + i * 0.55;
+        sockPivot.add(seg);
+      }
+      this.airportWindsocks.push(sockPivot);
+      if (aIdx === 0) this.airportWindsock = sockPivot;
+      wsGroup.add(sockPivot);
+      subAirport.add(wsGroup);
+
+      for (const lx of [-85, 35, 195, 420, 740]) {
+        const pole = new THREE.Mesh(poleGeo, mastMat);
+        pole.position.set(lx, 14, -104);
+        pole.castShadow = true;
+        const head = new THREE.Mesh(headGeo, headMat);
+        head.position.set(lx, 28, -104);
+        head.lookAt(lx, 0, 0);
+        subAirport.add(pole, head);
+      }
+      for (const lx of [120, 620, 1160, 1700, 2140]) {
+        const pole = new THREE.Mesh(poleGeo, mastMat);
+        pole.position.set(lx, 14, 38);
+        pole.castShadow = true;
+        const head = new THREE.Mesh(headGeo, headMat);
+        head.position.set(lx, 28, 38);
+        head.lookAt(lx, 0, 0);
+        subAirport.add(pole, head);
+      }
+
+      airport.add(subAirport);
+    }
+
+    this.world.add(airport);
+  }
+
+  makeHarborSignTexture(hIdx) {
+    const cv = document.createElement('canvas');
+    cv.width = 512;
+    cv.height = 128;
+    const ctx = cv.getContext && cv.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#061826';
+      ctx.fillRect(0, 0, 512, 128);
+      ctx.strokeStyle = '#2dd4bf';
+      ctx.lineWidth = 8;
+      if (ctx.strokeRect) ctx.strokeRect(8, 8, 496, 112);
+      ctx.strokeStyle = 'rgba(250, 204, 21, 0.78)';
+      ctx.lineWidth = 2.5;
+      if (ctx.strokeRect) ctx.strokeRect(18, 18, 476, 92);
+      ctx.fillStyle = '#f0fdfa';
+      ctx.font = '900 58px Orbitron, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(tr(`⚓ CẢNG ${hIdx}`, `⚓ HARBOR ${hIdx}`), 256, 66);
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  initHarbor() {
+    const harbor = new THREE.Group();
+    harbor.visible = false;
+    this.harbor = harbor;
+    this.subHarbors = [];
+    this.harborRadars = [];
+    this.harborLighthouseBeacons = [];
+    this.harborSignMats = [];
+
+    const concreteMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.82, metalness: 0.12 });
+    const darkQuayMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.85, metalness: 0.18 });
+    const woodDeckMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.72, metalness: 0.10 });
+    const pilingMat = new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.88, metalness: 0.20 });
+    const bollardGoldMat = new THREE.MeshStandardMaterial({ color: 0xd97706, emissive: 0x78350f, emissiveIntensity: 0.22, roughness: 0.35, metalness: 0.65 });
+    const fenderMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.55, metalness: 0.25 });
+    const hazardYellowMat = new THREE.MeshBasicMaterial({ color: 0xfacc15 });
+    const whiteMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.38, metalness: 0.22 });
+    const redLighthouseMat = new THREE.MeshStandardMaterial({ color: 0xdc2626, emissive: 0x7f1d1d, emissiveIntensity: 0.18, roughness: 0.42, metalness: 0.25 });
+    const glassCurtainMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, emissive: 0x0284c7, emissiveIntensity: 0.55, roughness: 0.14, metalness: 0.88 });
+    const craneOrangeMat = new THREE.MeshStandardMaterial({ color: 0xea580c, roughness: 0.45, metalness: 0.50 });
+    const lampGlowMat = new THREE.MeshStandardMaterial({ color: 0xfef08a, emissive: 0xfacc15, emissiveIntensity: 4.5, roughness: 0.2 });
+    const greenBuoyMat = new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x16a34a, emissiveIntensity: 3.5, roughness: 0.3 });
+    const redBuoyMat = new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0xdc2626, emissiveIntensity: 3.5, roughness: 0.3 });
+
+    const H_X = COAST_X + 115; // 2615: main harbor seawall edge (boat spawns at x = 2660, z = 0)
+    const pierLen = 132;
+    const pierCenterX = H_X + pierLen / 2 - 2;
+
+    const quayPromGeo = new THREE.BoxGeometry(90, 2.2, 310);
+    const quayEdgeGeo = new THREE.BoxGeometry(3.2, 2.6, 310);
+    const quayHazardGeo = new THREE.PlaneGeometry(0.9, 306);
+    quayHazardGeo.rotateX(-Math.PI / 2);
+
+    const northPierGeo = new THREE.BoxGeometry(pierLen, 0.75, 7.5);
+    const northDeckGeo = new THREE.BoxGeometry(pierLen - 2, 0.14, 6.2);
+    const southPierGeo = new THREE.BoxGeometry(pierLen, 0.75, 7.2);
+    const southDeckGeo = new THREE.BoxGeometry(pierLen - 1.6, 0.12, 6.2);
+    const gangwayGeo = new THREE.BoxGeometry(5.6, 0.14, 2.4);
+    const postGeo = new THREE.CylinderGeometry(0.06, 0.06, 1.1, 8);
+
+    const pilingGeo = new THREE.CylinderGeometry(0.32, 0.36, 5.5, 10);
+    const bollardBaseGeo = new THREE.CylinderGeometry(0.24, 0.28, 0.52, 10);
+    const bollardCapGeo = new THREE.CylinderGeometry(0.32, 0.24, 0.14, 10);
+    const fenderGeo = new THREE.CylinderGeometry(0.28, 0.28, 1.35, 10);
+    const lampPoleGeo = new THREE.CylinderGeometry(0.09, 0.12, 4.6, 8);
+    const lampBulbGeo = new THREE.SphereGeometry(0.28, 10, 8);
+
+    const termMainGeo = new THREE.BoxGeometry(44, 14, 62);
+    const termGlassEastGeo = new THREE.PlaneGeometry(58, 10.5);
+    termGlassEastGeo.rotateY(Math.PI / 2);
+    const termGlassSouthGeo = new THREE.PlaneGeometry(40, 10.5);
+    const termRoofGeo = new THREE.BoxGeometry(50, 1.6, 68);
+    const hTowerShaftGeo = new THREE.CylinderGeometry(3.8, 4.8, 22, 12);
+    const hTowerCabGeo = new THREE.CylinderGeometry(6.8, 5.8, 4.5, 12);
+    const hTowerRoofGeo = new THREE.CylinderGeometry(5.2, 7.4, 1.4, 12);
+    const rPedGeo = new THREE.CylinderGeometry(0.4, 0.55, 1.5, 8);
+    const rBarGeo = new THREE.BoxGeometry(5.8, 1.1, 0.45);
+
+    const craneLegGeo = new THREE.BoxGeometry(1.4, 32, 1.4);
+    const craneCrossGeo = new THREE.BoxGeometry(16, 2.2, 16);
+    const craneBoomGeo = new THREE.BoxGeometry(56, 2.0, 3.6);
+    const craneApexGeo = new THREE.BoxGeometry(2.2, 12, 10);
+    const trolleyGeo = new THREE.BoxGeometry(4.2, 1.4, 3.8);
+    const suspContGeo = new THREE.BoxGeometry(3.6, 3.6, 12.2);
+
+    const contCols = [0x2563eb, 0xdc2626, 0x16a34a, 0xd97706, 0x9333ea];
+    const contMats = contCols.map((c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.55, metalness: 0.35 }));
+    const contGeo = new THREE.BoxGeometry(12.2, 3.2, 3.4);
+
+    const bwLen = 158;
+    const bwGeo = new THREE.BoxGeometry(bwLen, 2.8, 10.5);
+    const lhBaseGeo = new THREE.CylinderGeometry(4.8, 5.6, 4.0, 16);
+    const galleryGeo = new THREE.CylinderGeometry(3.2, 2.6, 1.2, 16);
+    const lanternGeo = new THREE.CylinderGeometry(2.2, 2.2, 3.6, 16);
+    const lhDomeGeo = new THREE.SphereGeometry(2.35, 16, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+    const beamGeo = new THREE.ConeGeometry(4.5, 42, 16, 1, true);
+    beamGeo.translate(0, -21, 0);
+    beamGeo.rotateZ(Math.PI / 2);
+    const beamMat = new THREE.MeshBasicMaterial({ color: 0xfef08a, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false });
+
+    const buoyFloatGeo = new THREE.CylinderGeometry(1.4, 1.1, 1.2, 12);
+    const buoyTowerGeo = new THREE.ConeGeometry(0.75, 2.8, 8);
+
+    for (let hIdx = 0; hIdx < HARBOR_SCATTER_Z.length; hIdx++) {
+      const hSite = this.getHarborSite(hIdx);
+      const subHarbor = new THREE.Group();
+      subHarbor.position.set(hSite.seawallX - H_X, 0, hSite.sz);
+
+      const quayPromenade = new THREE.Mesh(quayPromGeo, concreteMat);
+      quayPromenade.position.set(H_X - 45, 0.55, 0);
+      quayPromenade.receiveShadow = true;
+      subHarbor.add(quayPromenade);
+
+      const quayEdgeWall = new THREE.Mesh(quayEdgeGeo, darkQuayMat);
+      quayEdgeWall.position.set(H_X - 1.2, 0.65, 0);
+      subHarbor.add(quayEdgeWall);
+
+      const quayHazardLine = new THREE.Mesh(quayHazardGeo, hazardYellowMat);
+      quayHazardLine.position.set(H_X - 0.6, 1.97, 0);
+      subHarbor.add(quayHazardLine);
+
+      const northPier = new THREE.Mesh(northPierGeo, concreteMat);
+      northPier.position.set(pierCenterX, 1.35, -16);
+      northPier.castShadow = true;
+      northPier.receiveShadow = true;
+      subHarbor.add(northPier);
+
+      const northDeck = new THREE.Mesh(northDeckGeo, woodDeckMat);
+      northDeck.position.set(pierCenterX, 1.78, -16);
+      northDeck.receiveShadow = true;
+      subHarbor.add(northDeck);
+
+      const southPier = new THREE.Mesh(southPierGeo, darkQuayMat);
+      southPier.position.set(pierCenterX, 0.15, 8.6);
+      southPier.castShadow = true;
+      southPier.receiveShadow = true;
+      subHarbor.add(southPier);
+
+      const southDeck = new THREE.Mesh(southDeckGeo, woodDeckMat);
+      southDeck.position.set(pierCenterX, 0.56, 8.6);
+      southDeck.receiveShadow = true;
+      subHarbor.add(southDeck);
+
+      const gangway = new THREE.Mesh(gangwayGeo, woodDeckMat);
+      gangway.position.set(COAST_X + 160, 0.58, 4.2);
+      subHarbor.add(gangway);
+      for (const gx of [-2.6, 2.6]) {
+        const post = new THREE.Mesh(postGeo, bollardGoldMat);
+        post.position.set(COAST_X + 160 + gx, 1.12, 4.2);
+        subHarbor.add(post);
+      }
+
+      for (let px = H_X + 8; px <= H_X + pierLen - 6; px += 21) {
+        for (const dz of [-18.8, -13.2]) {
+          const pile = new THREE.Mesh(pilingGeo, pilingMat);
+          pile.position.set(px, -0.8, dz);
+          subHarbor.add(pile);
+        }
+        const bN = new THREE.Mesh(bollardBaseGeo, bollardGoldMat);
+        bN.position.set(px, 2.08, -12.8);
+        const bCapN = new THREE.Mesh(bollardCapGeo, bollardGoldMat);
+        bCapN.position.set(px, 2.38, -12.8);
+        const fN = new THREE.Mesh(fenderGeo, fenderMat);
+        fN.position.set(px, 1.15, -12.15);
+        subHarbor.add(bN, bCapN, fN);
+
+        const poleN = new THREE.Mesh(lampPoleGeo, pilingMat);
+        poleN.position.set(px, 4.1, -18.8);
+        const bulbN = new THREE.Mesh(lampBulbGeo, lampGlowMat);
+        bulbN.position.set(px, 6.45, -18.8);
+        subHarbor.add(poleN, bulbN);
+
+        for (const dz of [5.6, 11.6]) {
+          const pile = new THREE.Mesh(pilingGeo, pilingMat);
+          pile.position.set(px, -1.5, dz);
+          subHarbor.add(pile);
+        }
+        const bS = new THREE.Mesh(bollardBaseGeo, bollardGoldMat);
+        bS.position.set(px, 0.85, 5.5);
+        const bCapS = new THREE.Mesh(bollardCapGeo, bollardGoldMat);
+        bCapS.position.set(px, 1.15, 5.5);
+        const fS = new THREE.Mesh(fenderGeo, fenderMat);
+        fS.position.set(px, 0.25, 4.9);
+        subHarbor.add(bS, bCapS, fS);
+
+        const poleS = new THREE.Mesh(lampPoleGeo, pilingMat);
+        poleS.position.set(px, 2.9, 11.6);
+        const bulbS = new THREE.Mesh(lampBulbGeo, lampGlowMat);
+        bulbS.position.set(px, 5.25, 11.6);
+        subHarbor.add(poleS, bulbS);
+      }
+
+      const termGroup = new THREE.Group();
+      termGroup.position.set(H_X - 42, 1.65, -48);
+      const termMain = new THREE.Mesh(termMainGeo, whiteMat);
+      termMain.position.y = 7.0;
+      termMain.castShadow = true;
+      termMain.receiveShadow = true;
+      termGroup.add(termMain);
+
+      const termGlassEast = new THREE.Mesh(termGlassEastGeo, glassCurtainMat);
+      termGlassEast.position.set(22.08, 7.2, 0);
+      termGroup.add(termGlassEast);
+
+      const termGlassSouth = new THREE.Mesh(termGlassSouthGeo, glassCurtainMat);
+      termGlassSouth.position.set(0, 7.2, 31.08);
+      termGroup.add(termGlassSouth);
+
+      const termRoof = new THREE.Mesh(termRoofGeo, darkQuayMat);
+      termRoof.position.set(1.5, 14.8, 0);
+      termRoof.castShadow = true;
+      termGroup.add(termRoof);
+
+      const hTowerShaft = new THREE.Mesh(hTowerShaftGeo, whiteMat);
+      hTowerShaft.position.set(6, 25, 18);
+      hTowerShaft.castShadow = true;
+      termGroup.add(hTowerShaft);
+
+      const hTowerCab = new THREE.Mesh(hTowerCabGeo, glassCurtainMat);
+      hTowerCab.position.set(6, 37.5, 18);
+      termGroup.add(hTowerCab);
+
+      const hTowerRoof = new THREE.Mesh(hTowerRoofGeo, darkQuayMat);
+      hTowerRoof.position.set(6, 40.4, 18);
+      termGroup.add(hTowerRoof);
+
+      const hRadar = new THREE.Group();
+      hRadar.position.set(6, 41.8, 18);
+      const rPed = new THREE.Mesh(rPedGeo, darkQuayMat);
+      const rBar = new THREE.Mesh(rBarGeo, bollardGoldMat);
+      rBar.position.y = 1.0;
+      hRadar.add(rPed, rBar);
+      this.harborRadars.push(hRadar);
+      if (hIdx === 0) this.harborRadar = hRadar;
+      termGroup.add(hRadar);
+
+      const signTex = this.makeHarborSignTexture(hIdx);
+      const signMat = new THREE.MeshStandardMaterial({
+        map: signTex,
+        emissive: 0xffffff,
+        emissiveMap: signTex,
+        emissiveIntensity: 0.85,
+        roughness: 0.28,
+        metalness: 0.12,
+      });
+      this.harborSignMats.push({ hIdx, mat: signMat });
+
+      const roofBackEast = new THREE.Mesh(new THREE.BoxGeometry(0.9, 5.2, 20.8), darkQuayMat);
+      roofBackEast.position.set(23.2, 18.0, -6);
+      const roofFaceEast = new THREE.Mesh(new THREE.PlaneGeometry(20.0, 4.6), signMat);
+      roofFaceEast.rotation.y = Math.PI / 2;
+      roofFaceEast.position.set(23.7, 18.0, -6);
+      termGroup.add(roofBackEast, roofFaceEast);
+
+      const roofBackSouth = new THREE.Mesh(new THREE.BoxGeometry(20.8, 5.2, 0.9), darkQuayMat);
+      roofBackSouth.position.set(-8, 18.0, 32.2);
+      const roofFaceSouth = new THREE.Mesh(new THREE.PlaneGeometry(20.0, 4.6), signMat);
+      roofFaceSouth.position.set(-8, 18.0, 32.7);
+      termGroup.add(roofBackSouth, roofFaceSouth);
+
+      subHarbor.add(termGroup);
+
+      // Berth / channel welcome signboard right beside the South channel lane (visible on boat spawn at Cảng 0 & from sea)
+      const berthSignGroup = new THREE.Group();
+      berthSignGroup.position.set(H_X + 162, 0, 18.5);
+      for (const szOff of [-4.2, 4.2]) {
+        const sPost = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 9.0, 10), pilingMat);
+        sPost.position.set(0, 2.0, szOff);
+        berthSignGroup.add(sPost);
+      }
+      const berthSignBox = new THREE.Mesh(new THREE.BoxGeometry(0.6, 3.0, 11.6), darkQuayMat);
+      berthSignBox.position.set(0, 6.2, 0);
+      const berthSignWest = new THREE.Mesh(new THREE.PlaneGeometry(11.0, 2.65), signMat);
+      berthSignWest.rotation.y = -Math.PI / 2;
+      berthSignWest.position.set(-0.34, 6.2, 0);
+      const berthSignEast = new THREE.Mesh(new THREE.PlaneGeometry(11.0, 2.65), signMat);
+      berthSignEast.rotation.y = Math.PI / 2;
+      berthSignEast.position.set(0.34, 6.2, 0);
+      berthSignGroup.add(berthSignBox, berthSignWest, berthSignEast);
+      subHarbor.add(berthSignGroup);
+
+      for (const cz of [48, 92]) {
+        const crane = new THREE.Group();
+        crane.position.set(H_X - 10, 1.65, cz);
+        for (const [lx, lz] of [[-7, -7], [7, -7], [-7, 7], [7, 7]]) {
+          const leg = new THREE.Mesh(craneLegGeo, craneOrangeMat);
+          leg.position.set(lx, 16, lz);
+          leg.castShadow = true;
+          crane.add(leg);
+        }
+        const crossTop = new THREE.Mesh(craneCrossGeo, craneOrangeMat);
+        crossTop.position.set(0, 31, 0);
+        crane.add(crossTop);
+        const boom = new THREE.Mesh(craneBoomGeo, craneOrangeMat);
+        boom.position.set(16, 33, 0);
+        boom.castShadow = true;
+        crane.add(boom);
+        const apex = new THREE.Mesh(craneApexGeo, craneOrangeMat);
+        apex.position.set(-2, 39, 0);
+        crane.add(apex);
+        const trolley = new THREE.Mesh(trolleyGeo, darkQuayMat);
+        trolley.position.set(24, 31.2, 0);
+        const cont = new THREE.Mesh(suspContGeo, bollardGoldMat);
+        cont.position.set(24, 21.0, 0);
+        crane.add(trolley, cont);
+        subHarbor.add(crane);
+      }
+
+      for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 5; col++) {
+          const stackH = 1 + ((row + col) % 3);
+          for (let hStack = 0; hStack < stackH; hStack++) {
+            const cm = contMats[(row * 3 + col + hStack) % contMats.length];
+            const box = new THREE.Mesh(contGeo, cm);
+            box.position.set(H_X - 36 - row * 14, 1.65 + 1.6 + hStack * 3.25, 36 + col * 4.2);
+            box.castShadow = true;
+            box.receiveShadow = true;
+            subHarbor.add(box);
+          }
+        }
+      }
+
+      for (const sSign of [-1, 1]) {
+        const bw = new THREE.Mesh(bwGeo, darkQuayMat);
+        bw.position.set(H_X + bwLen / 2 - 4, 0.6, sSign * 56);
+        bw.receiveShadow = true;
+        subHarbor.add(bw);
+      }
+
+      const lhGroup = new THREE.Group();
+      lhGroup.position.set(H_X + 148, 1.8, -56);
+      const lhBase = new THREE.Mesh(lhBaseGeo, concreteMat);
+      lhBase.position.y = 2.0;
+      lhGroup.add(lhBase);
+      for (let seg = 0; seg < 6; seg++) {
+        const rBot = 4.2 - seg * 0.32;
+        const rTop = 4.2 - (seg + 1) * 0.32;
+        const stripe = new THREE.Mesh(new THREE.CylinderGeometry(rTop, rBot, 4.2, 16), seg % 2 === 0 ? redLighthouseMat : whiteMat);
+        stripe.position.y = 4.0 + seg * 4.2 + 2.1;
+        stripe.castShadow = true;
+        lhGroup.add(stripe);
+      }
+      const gallery = new THREE.Mesh(galleryGeo, darkQuayMat);
+      gallery.position.y = 29.6;
+      const lantern = new THREE.Mesh(lanternGeo, lampGlowMat);
+      lantern.position.y = 32.0;
+      const lhDome = new THREE.Mesh(lhDomeGeo, redLighthouseMat);
+      lhDome.position.y = 33.8;
+      lhGroup.add(gallery, lantern, lhDome);
+
+      const lhBeacon = new THREE.Group();
+      lhBeacon.position.y = 32.0;
+      const beam1 = new THREE.Mesh(beamGeo, beamMat);
+      const beam2 = new THREE.Mesh(beamGeo, beamMat);
+      beam2.rotation.y = Math.PI;
+      lhBeacon.add(beam1, beam2);
+      this.harborLighthouseBeacons.push(lhBeacon);
+      if (hIdx === 0) this.harborLighthouseBeacon = lhBeacon;
+      lhGroup.add(lhBeacon);
+      subHarbor.add(lhGroup);
+
+      for (const bx of [H_X + 168, H_X + 235, H_X + 305]) {
+        for (const [bz, bMat] of [[-24, greenBuoyMat], [24, redBuoyMat]]) {
+          const bg = new THREE.Group();
+          bg.position.set(bx, 0.2, bz);
+          const fl = new THREE.Mesh(buoyFloatGeo, bMat);
+          const tw = new THREE.Mesh(buoyTowerGeo, bMat);
+          tw.position.y = 1.8;
+          const topLight = new THREE.Mesh(lampBulbGeo, bMat);
+          topLight.position.y = 3.3;
+          bg.add(fl, tw, topLight);
+          subHarbor.add(bg);
+        }
+      }
+
+      this.subHarbors.push(subHarbor);
+      harbor.add(subHarbor);
+    }
+
+    this.world.add(harbor);
+  }
+
+  buildArms(height) {
+    for (const a of this.arms) this.pad.remove(a.pivot);
+    this.arms = [];
+    const mat = new THREE.MeshStandardMaterial({ color: 0x9c3a22, metalness: 0.5, roughness: 0.55 });
+    const ufoIt = (this.stack || []).find((s) => isUfoPart(s.type));
+    const maxUfoS = ufoIt ? (PARTS[ufoIt.type]?.ufoScale || 1) : 1;
+    const maxUfoR = ufoIt ? ((PARTS[ufoIt.type]?.ufoRadius || 0) + (ufoIt.attach?.includes('solarUfo') ? 1.8 * maxUfoS : 0)) : 0;
+    this.towerX = maxUfoR > 4.5 ? -(Math.ceil(maxUfoR * 1.45) + 7) : -13;
+    if (this.towerGroup) this.towerGroup.position.x = this.towerX;
+    const ys = maxUfoR > 0 ? [] : [height * 0.35, height * 0.7, height - 2.5].filter((y) => y > 4 && y < 80);
+    const isSaturn = this.stack && this.stack.some((s) => s.type.startsWith('saturn'));
+    const isSoyuz = this.stack && this.stack.some((s) => s.type.startsWith('soyuz'));
+    const isN1 = this.stack && this.stack.some((s) => s.type.startsWith('n1'));
+    const isBuran = this.stack && this.stack.some((s) => s.type.startsWith('buran') || s.type.startsWith('energia'));
+    const coreR = isBuran ? 3.85 : isN1 ? 3.05 : isSaturn ? CORE_R * 1.92 : isSoyuz ? 2.45 : CORE_R;
+    const reach = -this.towerX - 3 - coreR;
+    for (const y of ys) {
+      const pivot = new THREE.Group();
+      pivot.position.set(this.towerX + 3, PAD_TOP + y, 2.0);
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(reach, 1.2, 1.6), mat);
+      arm.position.set(reach / 2, 0, -2.0);
+      arm.castShadow = true;
+      pivot.add(arm);
+      this.pad.add(pivot);
+      this.arms.push({ pivot, target: 0 });
+    }
+    const clampR = maxUfoS > 1 ? (CORE_R * ufoEngineScale(maxUfoS) + 0.85) : isBuran ? 4.15 : isN1 ? 4.65 : isSoyuz ? 3.65 : isSaturn ? 2.95 : 2.2;
+    this.clamps.forEach((c, i) => {
+      const a = i * Math.PI / 2 + Math.PI / 4;
+      c.position.set(Math.cos(a) * clampR, PAD_TOP + 0.6, Math.sin(a) * clampR);
+    });
+  }
+
+  // =================================================================== FX
+  initFX() {
+    this.smoke = new ParticleSystem({ max: 28000, texture: TX.smokeSprite(), sort: true });
+    this.fire = new ParticleSystem({ max: 6000, texture: TX.fireSprite(), additive: true });
+    this.scene.add(this.smoke.mesh, this.fire.mesh);
+    this.engineLight = new THREE.PointLight(0xff8a3a, 0, 0, 2);
+    this.scene.add(this.engineLight);
+    this.flashLight = new THREE.PointLight(0xffaa55, 0, 0, 2);
+    this.scene.add(this.flashLight);
+  }
+
+  // =================================================================== UI
+  initUI() {
+    window.addEventListener('keydown', (e) => {
+      if (!this.active) return;
+      const tag = e.target && e.target.tagName ? e.target.tagName.toLowerCase() : '';
+      if (tag === 'input' || tag === 'textarea') return;
+      const k = e.key.toLowerCase();
+      this.keys[k] = true;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (this.missionSuccessStopped) return;
+        if (this.phase === 'ready') {
+          this.startCountdown();
+        } else if (this.player && this.player.landed && (!this.player.engineOn || this.throttle <= 0.01)) {
+          audio.init();
+          this.ignited = true;
+          this.throttle = 1;
+          this.player.throttle = 1;
+          this.player.engineOn = true;
+          this.event(tr('🔥 Đánh lửa động cơ cất cánh!', '🔥 Main engine ignited for liftoff!'), 'warn');
+        } else {
+          this.stage();
+        }
+      }
+      if (k === 'r') { this.sas = !this.sas; if (this.player) this.holdAttitude(); }
+      if (k === 'k') {
+        const sasModes = tr(SAS_MODES_VI, SAS_MODES_EN);
+        this.sasMode = (this.sasMode + 1) % sasModes.length;
+        this.sas = true;
+        this.event(tr('Chế độ SAS: ', 'SAS Mode: ') + sasModes[this.sasMode]);
+      }
+      if (k === 'g') this.toggleAutopilot();
+      if (k === 'c') this.cycleCam();
+      if (k === 'm') {
+        if (!this.map.visible) this.updateMap();
+        this.map.toggle();
+        if (this.map.visible) this.updateMap();
+        this.updateAirportCompass(this.player);
+      }
+      if (k === 'y') { e.preventDefault(); audio.init(); this.toggleTeleportModal(); }
+      if (k === 'tab') { e.preventDefault(); this.map.cycleFocus(); }
+      if (k === 'b') this.toggleBoosterFocus();
+      if (k === 'p') this.toggleDeploy();
+      if (k === 'e') { e.preventDefault(); audio.init(); this.toggleUfoEngineMode(); }
+      if (k === 'u') { e.preventDefault(); audio.init(); audio.click(); this.toggleAliens(); }
+      if (k === 'v' || e.key === 'Enter') { e.preventDefault(); audio.init(); this.fireWeapons(); }
+      if (k === 'z' && !this.docked && !this.missionSuccessStopped) this.throttle = 1;
+      if (k === 'x') this.throttle = 0;
+      if (k === '.' && !this.missionSuccessStopped) this.setWarp(1);
+      if (k === ',') this.setWarp(-1);
+      if (e.key === 'Escape') {
+        const tpModal = $('teleport-modal');
+        if (tpModal && !tpModal.classList.contains('hidden')) {
+          this.toggleTeleportModal(false);
+        } else if ($('settings').classList.contains('hidden')) {
+          this.app.toggleMenu();
+        }
+      }
+      if (e.key === 'Shift' || e.key === 'Control') e.preventDefault();
+    });
+    window.addEventListener('keyup', (e) => { this.keys[e.key.toLowerCase()] = false; });
+    window.addEventListener('blur', () => { this.keys = {}; this.joyX = 0; this.joyY = 0; });
+    $('btn-go').onclick = () => { audio.init(); this.startCountdown(); };
+    $('btn-back').onclick = () => this.app.goBuild();
+    const btnAp = $('btn-autopilot');
+    if (btnAp) btnAp.onclick = () => { audio.init(); this.toggleAutopilot(); };
+    const btnMap = $('btn-toggle-map');
+    if (btnMap) btnMap.onclick = () => {
+      if (!this.map.visible) this.updateMap();
+      this.map.toggle();
+      if (this.map.visible) this.updateMap();
+      this.updateAirportCompass(this.player);
+    };
+    const btnTp = $('btn-teleport');
+    if (btnTp) btnTp.onclick = () => { audio.init(); this.toggleTeleportModal(); };
+    const btnTpExpand = $('btn-tp-expand');
+    if (btnTpExpand) btnTpExpand.onclick = () => { audio.init(); this.toggleTeleportModal(true); };
+    const btnFs = $('btn-fullscreen');
+    if (btnFs) btnFs.onclick = () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(err => {
+          console.error(`Error attempting to enable full-screen mode: ${err.message}`);
+        });
+      } else {
+        document.exitFullscreen();
+      }
+    };
+    const btnTpMode = $('btn-tp-mode');
+    if (btnTpMode) {
+      btnTpMode.onclick = () => {
+        audio.init();
+        audio.click();
+        this.setTeleportMode(this.teleportMode === 'orbit' ? 'surface' : 'orbit');
+      };
+    }
+    const tpBarBtns = $('tp-bar-btns');
+    if (tpBarBtns) {
+      tpBarBtns.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-tp]');
+        if (!btn) return;
+        this.teleportToBody(btn.dataset.tp, this.teleportMode);
+      });
+    }
+    const btnTpX = $('btn-teleport-x');
+    if (btnTpX) btnTpX.onclick = () => { audio.click(); this.toggleTeleportModal(false); };
+    const btnTpClose = $('btn-teleport-close');
+    if (btnTpClose) btnTpClose.onclick = () => { audio.click(); this.toggleTeleportModal(false); };
+    const tpModal = $('teleport-modal');
+    if (tpModal) {
+      tpModal.addEventListener('click', (e) => {
+        if (e.target === tpModal) {
+          audio.click();
+          this.toggleTeleportModal(false);
+        }
+      });
+    }
+    const tpModeSeg = $('tp-mode-seg');
+    if (tpModeSeg) {
+      tpModeSeg.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-tpmode]');
+        if (!btn) return;
+        audio.click();
+        this.setTeleportMode(btn.dataset.tpmode);
+      });
+    }
+    this.setTeleportMode('surface');
+    const astroPadBtns = $('astro-pad-btns');
+    if (astroPadBtns) {
+      astroPadBtns.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-add-astro]');
+        if (!btn) return;
+        audio.init();
+        audio.click();
+        this.addAstronauts(Number(btn.dataset.addAstro) || 1);
+      });
+    }
+    const btnAstroDeploy = $('btn-astro-deploy');
+    if (btnAstroDeploy) {
+      btnAstroDeploy.addEventListener('click', () => {
+        audio.init();
+        audio.click();
+        this.deployAstronauts();
+      });
+    }
+    const acTargets = $('ac-targets');
+    if (acTargets) {
+      acTargets.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-ac-idx]');
+        if (!btn) return;
+        audio.init();
+        audio.click();
+        const raw = btn.dataset.acIdx;
+        if (this.player?.isBoat) {
+          this.compassHarborTarget = raw === 'auto'
+            ? 'auto'
+            : Math.max(0, Math.min(HARBOR_SCATTER_Z.length - 1, Number(raw) || 0));
+        } else {
+          this.compassAirportTarget = raw === 'auto'
+            ? 'auto'
+            : Math.max(0, Math.min(AIRPORT_SCATTER_OFFSETS.length - 1, Number(raw) || 0));
+        }
+        this.updateAirportCompass(this.player);
+      });
+    }
+    const btnUfoEng = $('btn-ufo-engine');
+    if (btnUfoEng) {
+      btnUfoEng.addEventListener('click', () => {
+        audio.init();
+        this.toggleUfoEngineMode();
+      });
+    }
+    const btnToggleAliens = $('btn-toggle-aliens');
+    if (btnToggleAliens) {
+      btnToggleAliens.addEventListener('click', () => {
+        audio.init();
+        audio.click();
+        this.toggleAliens();
+      });
+    }
+    document.querySelectorAll('[data-aliens-mode]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        audio.init();
+        audio.click();
+        this.setAliensDisabled(btn.dataset.aliensMode === 'off', this.active);
+      });
+    });
+    this.syncAlienToggleUI();
+    const btnFire = $('btn-fire-weapon');
+    if (btnFire) {
+      btnFire.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        audio.init();
+        this.firingHeld = true;
+        this.fireWeapons();
+      });
+      window.addEventListener('pointerup', () => {
+        this.firingHeld = false;
+        this.lastClickedRock = null;
+      });
+    }
+    this.app.canvas.addEventListener('pointerdown', (e) => {
+      if (!this.active || this.map.visible) return;
+      const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(ndc, this.camera);
+      if (this.aliens && this.aliens.length) {
+        const hits = ray.intersectObjects(this.aliens.map((a) => a.mesh), true);
+        if (hits.length) {
+          let obj = hits[0].object;
+          const hitAlien = this.aliens.find((a) => {
+            let cur = obj;
+            while (cur) { if (cur === a.mesh) return true; cur = cur.parent; }
+            return false;
+          });
+          if (hitAlien) {
+            audio.init();
+            this.firingHeld = true;
+            this.lastClickedRock = null;
+            this.fireWeapons(hitAlien, null);
+            return;
+          }
+        }
+      }
+      const hitRock = this.pickBeltRockByRay(ray);
+      if (hitRock) {
+        audio.init();
+        this.firingHeld = true;
+        this.lastClickedRock = hitRock;
+        this.fireWeapons(null, hitRock);
+      }
+    });
+  }
+
+  setTeleportMode(mode) {
+    this.teleportMode = mode === 'orbit' ? 'orbit' : 'surface';
+    const isOrb = this.teleportMode === 'orbit';
+    const btnTpMode = $('btn-tp-mode');
+    if (btnTpMode) {
+      btnTpMode.textContent = isOrb
+        ? tr('🛰️ Quỹ đạo', '🛰️ Orbit')
+        : tr('🛬 Bề mặt', '🛬 Surf');
+    }
+    const surfBtn = $('btn-tpmode-surf');
+    const orbBtn = $('btn-tpmode-orb');
+    if (surfBtn) surfBtn.classList.toggle('on', !isOrb);
+    if (orbBtn) orbBtn.classList.toggle('on', isOrb);
+    const tpModal = $('teleport-modal');
+    if (tpModal && !tpModal.classList.contains('hidden')) {
+      this.renderTeleportModal();
+    }
+  }
+
+  toggleTeleportModal(force) {
+    const m = $('teleport-modal');
+    if (!m) return;
+    const show = force !== undefined ? force : m.classList.contains('hidden');
+    if (show) this.renderTeleportModal();
+    m.classList.toggle('hidden', !show);
+  }
+
+  canPlaneTeleportTo(target) {
+    if (!target) return false;
+    if (target === 'iss' || target === 'oort' || target === 'interstellar' || target === 'supernova' || target === 'royal1b' || target === 'sun') {
+      return false;
+    }
+    const bodyKey = target === 'olympus' ? 'mars' : target === 'earth_snow' ? 'earth' : target;
+    const B = BODIES[bodyKey];
+    if (!B) return false;
+    return (B.atm || 0) > 0 && (B.rho0 || 0) > 0;
+  }
+
+  hasSurfaceAirports(target) {
+    if (!this.canPlaneTeleportTo(target)) return false;
+    const bodyKey = target === 'olympus' ? 'mars' : target === 'earth_snow' ? 'earth' : target;
+    const B = BODIES[bodyKey];
+    return !!(B && !B.gasGiant);
+  }
+
+  earthCoastX(sz = 0) {
+    const py = -sz;
+    const s = THREE.MathUtils.clamp((Math.abs(py) - 650.0) / (1500.0 - 650.0), 0, 1);
+    const sm = s * s * (3 - 2 * s);
+    const capeJut = 1450.0 * Math.exp(-Math.pow((py + 2200.0) / 3800.0, 2.0)) * sm;
+    const sw = THREE.MathUtils.clamp((Math.abs(py) - 2000.0) / (5000.0 - 2000.0), 0, 1);
+    const smW = sw * sw * (3 - 2 * sw);
+    const coastWave = 1100.0 * Math.sin(py * 0.00016) * smW;
+    const u0 = sz / 10500.0;
+    let pen = 50600.0 * Math.exp(-u0 * u0 * u0 * u0);
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const off = AIRPORT_SCATTER_OFFSETS[i];
+      const uAp = (sz - off.dz) / 6800.0;
+      const pVal = (off.dx + 52200.0) * Math.exp(-uAp * uAp);
+      if (pVal > pen) pen = pVal;
+    }
+    return -48000.0 + pen + capeJut + coastWave;
+  }
+
+  getHarborSite(hIdx = 0) {
+    const idx = Math.max(0, Math.min(HARBOR_SCATTER_Z.length - 1, Number(hIdx) || 0));
+    const sz = HARBOR_SCATTER_Z[idx] || 0;
+    const coastX = this.earthCoastX(sz);
+    const seawallX = coastX + 15;
+    const berthX = coastX + 60;
+    return { seawallX, berthX, sz, coastX, hIdx: idx };
+  }
+
+  getCurrentHarborId(v) {
+    if (!v || v.ref !== 'earth') return null;
+    const sx = v.sx || 0;
+    const sz = v.s ? (v.s.z || 0) : 0;
+    for (let i = 0; i < HARBOR_SCATTER_Z.length; i++) {
+      const hs = this.getHarborSite(i);
+      if (sx >= hs.seawallX - 30 && sx <= hs.seawallX + 340 && Math.abs(sz - hs.sz) <= 165) {
+        return `earth:${i}`;
+      }
+    }
+    return null;
+  }
+
+  getNextUnvisitedHarborSite(v = this.player) {
+    const curZ = v?.s ? (v.s.z || 0) : 0;
+    const curHId = this.getCurrentHarborId(v);
+    let bestSite = null;
+    let bestDist = Infinity;
+    for (let i = 0; i < HARBOR_SCATTER_Z.length; i++) {
+      const hId = `earth:${i}`;
+      if (hId === curHId || hId === this.lastVisitedHarborId) continue;
+      if (this.harborsVisitedSet && this.harborsVisitedSet.has(hId)) continue;
+      if (this.visitedHarborIds && this.visitedHarborIds.has(hId)) continue;
+      const hs = this.getHarborSite(i);
+      const dz = Math.abs(hs.sz - curZ);
+      if (dz < bestDist) {
+        bestDist = dz;
+        bestSite = hs;
+      }
+    }
+    if (bestSite) return bestSite;
+    for (let i = 0; i < HARBOR_SCATTER_Z.length; i++) {
+      const hId = `earth:${i}`;
+      if (hId === curHId || hId === this.lastVisitedHarborId) continue;
+      if (this.harborsVisitedSet && this.harborsVisitedSet.has(hId)) continue;
+      const hs = this.getHarborSite(i);
+      const dz = Math.abs(hs.sz - curZ);
+      if (dz < bestDist) {
+        bestDist = dz;
+        bestSite = hs;
+      }
+    }
+    if (bestSite) return bestSite;
+    for (let i = 0; i < HARBOR_SCATTER_Z.length; i++) {
+      const hId = `earth:${i}`;
+      if (hId === curHId || hId === this.lastVisitedHarborId) continue;
+      const hs = this.getHarborSite(i);
+      const dz = Math.abs(hs.sz - curZ);
+      if (dz < bestDist) {
+        bestDist = dz;
+        bestSite = hs;
+      }
+    }
+    const fallbackIdx = ((this.harborsVisitedSet ? this.harborsVisitedSet.size : 0) + 1) % HARBOR_SCATTER_Z.length;
+    return bestSite || this.getHarborSite(fallbackIdx);
+  }
+
+  bodyDeltaX(bodyKey, x1, x2) {
+    if (!bodyKey || bodyKey === 'earth') return x1 - x2;
+    const B = BODIES[bodyKey] || BODIES.mars;
+    return wrapPi((x1 - x2) / B.R) * B.R;
+  }
+
+  getAirportSite(bodyKey = 'earth', aIdx = 0) {
+    const idx = Math.max(0, Math.min(AIRPORT_SCATTER_OFFSETS.length - 1, Number(aIdx) || 0));
+    const sc = AIRPORT_SCATTER_OFFSETS[idx] || AIRPORT_SCATTER_OFFSETS[0];
+    if (!bodyKey || bodyKey === 'earth') {
+      return { sx: sc.dx, sz: sc.dz, h: 0, aIdx: idx };
+    }
+    const B = BODIES[bodyKey] || BODIES.mars;
+    const originSx = this.getPlanetAirportOrigin(bodyKey);
+    const pScale = Math.min(1, B.R / 230000);
+    const rawPlanetDx = (sc.planetDx !== undefined ? sc.planetDx : sc.dx) * pScale;
+    const sx = wrapPi((originSx + rawPlanetDx) / B.R) * B.R;
+    const sz = sc.planetDz !== undefined ? sc.planetDz : sc.dz;
+    if (B.gasGiant) {
+      return { sx, sz, h: 0, aIdx: idx };
+    }
+    if (!this._planetApHeightCache) this._planetApHeightCache = {};
+    const cacheKey = `${bodyKey}:${idx}:${Math.round(originSx)}`;
+    let h = this._planetApHeightCache[cacheKey];
+    if (h === undefined) {
+      let maxSurfY = -Infinity;
+      for (const sampleDx of [-170, 450, 1100, 1650, 2250]) {
+        const psi = (sx + sampleDx) / B.R;
+        const spx = Math.sin(psi), spy = Math.cos(psi);
+        for (const sampleDz of [-110, 0, 30]) {
+          const zSample = sz + sampleDz;
+          const uz = zSample / B.R;
+          const mh = moonHeight(spx, spy, uz, bodyKey);
+          const surfY = mh - (zSample * zSample) / (2 * B.R);
+          if (surfY > maxSurfY) maxSurfY = surfY;
+        }
+      }
+      h = maxSurfY;
+      this._planetApHeightCache[cacheKey] = h;
+    }
+    return { sx, sz, h, aIdx: idx };
+  }
+
+  getCurrentAirportId(v) {
+    if (!v || !this.hasSurfaceAirports(v.ref)) return null;
+    const sx = v.sx || 0;
+    const sz = v.s ? (v.s.z || 0) : 0;
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const site = this.getAirportSite(v.ref, i);
+      const dx = this.bodyDeltaX(v.ref, sx, site.sx);
+      const dz = sz - site.sz;
+      if (dx >= -180 && dx <= 2255 && (Math.abs(dz) <= 28 || (dx >= -125 && dx <= 820 && dz >= -110 && dz <= 25))) {
+        return `${v.ref}:${i}`;
+      }
+    }
+    return null;
+  }
+
+  getNextUnvisitedAirportSite(v = this.player) {
+    const bodyKey = v?.ref || 'earth';
+    const curSx = v?.sx || 0;
+    const curSz = v?.s ? (v.s.z || 0) : 0;
+    const curApId = (v?.landed || v?.clamped) ? this.getCurrentAirportId(v) : null;
+    let bestSite = null;
+    let bestDist = Infinity;
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const apId = `${bodyKey}:${i}`;
+      if (apId === curApId || apId === this.lastLandedAirportId) continue;
+      if (this.airportsLandedSet && this.airportsLandedSet.has(apId)) continue;
+      if (this.visitedAirportIds && this.visitedAirportIds.has(apId)) continue;
+      const site = this.getAirportSite(bodyKey, i);
+      const d = Math.hypot(this.bodyDeltaX(bodyKey, site.sx, curSx), site.sz - curSz);
+      if (d < bestDist) {
+        bestDist = d;
+        bestSite = site;
+      }
+    }
+    if (bestSite) return bestSite;
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const apId = `${bodyKey}:${i}`;
+      if (apId === curApId || apId === this.lastLandedAirportId) continue;
+      const site = this.getAirportSite(bodyKey, i);
+      const d = Math.hypot(this.bodyDeltaX(bodyKey, site.sx, curSx), site.sz - curSz);
+      if (d < bestDist) {
+        bestDist = d;
+        bestSite = site;
+      }
+    }
+    const fallbackIdx = ((this.airportsLandedSet ? this.airportsLandedSet.size : 0) + 1) % AIRPORT_SCATTER_OFFSETS.length;
+    return bestSite || this.getAirportSite(bodyKey, fallbackIdx);
+  }
+
+  computeAirportCompassData(v = this.player) {
+    if (!v || v.dead || v.crashed || !v.isPlane || !this.hasSurfaceAirports(v.ref)) {
+      return null;
+    }
+    const mode = this.compassAirportTarget ?? 'auto';
+    const site = mode === 'auto'
+      ? this.getNextUnvisitedAirportSite(v)
+      : this.getAirportSite(v.ref, mode);
+    const targetIdx = site.aIdx ?? 0;
+    const targetApId = `${v.ref}:${targetIdx}`;
+    const curApId = this.getCurrentAirportId(v);
+    const onTargetAirport = curApId === targetApId && (!!v.landed || (v.agl !== undefined && v.agl < 25));
+    const visited = !!(this.airportsLandedSet && this.airportsLandedSet.has(targetApId));
+
+    const curSx = v.sx || 0;
+    const curSz = v.s ? (v.s.z || 0) : 0;
+    const targetSx = site.sx + 1040;
+    const targetSz = site.sz;
+    const dx = this.bodyDeltaX(v.ref, targetSx, curSx);
+    const dz = targetSz - curSz;
+    const dist = Math.hypot(dx, dz);
+
+    const h = v.heading || 0;
+    const fwdX = Math.cos(h);
+    const fwdZ = -Math.sin(h);
+    const planeBearingDeg = ((Math.atan2(fwdX, -fwdZ) * 180 / Math.PI) % 360 + 360) % 360;
+    const targetBearingDeg = dist > 1
+      ? (((Math.atan2(dx, -dz) * 180 / Math.PI) % 360 + 360) % 360)
+      : planeBearingDeg;
+
+    let relDeg = targetBearingDeg - planeBearingDeg;
+    while (relDeg > 180) relDeg -= 360;
+    while (relDeg < -180) relDeg += 360;
+    if (onTargetAirport) relDeg = 0;
+
+    const cardIdx = Math.round(targetBearingDeg / 45) % 8;
+    const cardsVi = ['B', 'ĐB', 'Đ', 'ĐN', 'N', 'TN', 'T', 'TB'];
+    const cardsEn = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const cardinal = tr(cardsVi[cardIdx], cardsEn[cardIdx]);
+
+    return {
+      mode,
+      targetIdx,
+      targetApId,
+      onTargetAirport,
+      visited,
+      dx,
+      dz,
+      dist,
+      planeBearingDeg,
+      targetBearingDeg,
+      relDeg,
+      cardinal,
+    };
+  }
+
+  computeHarborCompassData(v = this.player) {
+    if (!v || v.dead || v.crashed || !v.isBoat || v.ref !== 'earth') {
+      return null;
+    }
+    const mode = this.compassHarborTarget ?? 'auto';
+    const site = mode === 'auto'
+      ? this.getNextUnvisitedHarborSite(v)
+      : this.getHarborSite(mode);
+    const targetIdx = site.hIdx ?? 0;
+    const targetHarborId = `earth:${targetIdx}`;
+    const curHarborId = this.getCurrentHarborId(v);
+    const onTargetHarbor = curHarborId === targetHarborId;
+    const visited = !!(
+      (this.harborsVisitedSet && this.harborsVisitedSet.has(targetHarborId)) ||
+      (this.visitedHarborIds && this.visitedHarborIds.has(targetHarborId))
+    );
+
+    const curSx = v.sx || 0;
+    const curSz = v.s ? (v.s.z || 0) : 0;
+    const directDz = site.sz - curSz;
+    const finalHarborX = Math.abs(directDz) <= 140 ? (site.berthX + 35) : (site.coastX + 260);
+    const finalHarborZ = site.sz;
+    const directDist = Math.hypot((site.berthX + 35) - curSx, directDz);
+
+    let wpX = finalHarborX;
+    let wpZ = finalHarborZ;
+    let isCapeDetour = false;
+
+    if (!onTargetHarbor && Math.abs(directDz) > 140) {
+      const startCoastX = this.earthCoastX(curSz);
+      if (curSx < startCoastX + 260) {
+        // Exit the harbor channel East into open water before turning North/South along the coast
+        wpX = startCoastX + 340;
+        wpZ = curSz;
+        isCapeDetour = true;
+      } else {
+        const samples = [];
+        const M = 240;
+        for (let i = 1; i < M; i++) samples.push(i / M);
+        const critZs = [0];
+        for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+          const dzAp = AIRPORT_SCATTER_OFFSETS[i].dz;
+          critZs.push(dzAp - 2200, dzAp, dzAp + 2200);
+        }
+        for (let i = 0; i < critZs.length; i++) {
+          const tCrit = (critZs[i] - curSz) / directDz;
+          if (tCrit > 0.001 && tCrit < 0.999) samples.push(tCrit);
+        }
+        samples.sort((a, b) => a - b);
+
+        let clearDirect = true;
+        for (let i = 0; i < samples.length; i++) {
+          const t = samples[i];
+          const z = curSz + directDz * t;
+          const lineX = curSx + (finalHarborX - curSx) * t;
+          if (lineX < this.earthCoastX(z) + 60) {
+            clearDirect = false;
+            break;
+          }
+        }
+
+        if (!clearDirect) {
+          let bestT = 1.0;
+          let bestWpX = finalHarborX;
+          let bestSlope = (finalHarborX - curSx);
+          for (let i = 0; i < samples.length; i++) {
+            const t = samples[i];
+            const z = curSz + directDz * t;
+            const dEnd = Math.min(Math.abs(z - curSz), Math.abs(finalHarborZ - z));
+            const clearance = 260 + 420 * Math.min(1, dEnd / 1600);
+            const reqX = this.earthCoastX(z) + clearance;
+            const slope = (reqX - curSx) / t;
+            if (slope > bestSlope) {
+              bestSlope = slope;
+              bestT = t;
+              bestWpX = reqX;
+            }
+          }
+          if (bestT < 0.999) {
+            wpX = bestWpX;
+            wpZ = curSz + directDz * bestT;
+            isCapeDetour = true;
+          }
+        }
+      }
+    }
+
+    const dx = wpX - curSx;
+    const dz = wpZ - curSz;
+    const legDist = Math.hypot(dx, dz);
+    const dist = onTargetHarbor
+      ? Math.hypot((site.berthX + 35) - curSx, directDz)
+      : isCapeDetour
+        ? (legDist + Math.hypot((site.berthX + 35) - wpX, finalHarborZ - wpZ))
+        : directDist;
+
+    const h = v.heading || 0;
+    const fwdX = Math.cos(h);
+    const fwdZ = -Math.sin(h);
+    const boatBearingDeg = ((Math.atan2(fwdX, -fwdZ) * 180 / Math.PI) % 360 + 360) % 360;
+    const targetBearingDeg = legDist > 1
+      ? (((Math.atan2(dx, -dz) * 180 / Math.PI) % 360 + 360) % 360)
+      : boatBearingDeg;
+
+    let relDeg = targetBearingDeg - boatBearingDeg;
+    while (relDeg > 180) relDeg -= 360;
+    while (relDeg < -180) relDeg += 360;
+    if (onTargetHarbor) relDeg = 0;
+
+    const cardIdx = Math.round(targetBearingDeg / 45) % 8;
+    const cardsVi = ['B', 'ĐB', 'Đ', 'ĐN', 'N', 'TN', 'T', 'TB'];
+    const cardsEn = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const cardinal = tr(cardsVi[cardIdx], cardsEn[cardIdx]);
+
+    return {
+      isBoatCompass: true,
+      mode,
+      targetIdx,
+      targetHarborId,
+      onTargetHarbor,
+      isCapeDetour,
+      visited,
+      dx,
+      dz,
+      dist,
+      directDist,
+      planeBearingDeg: boatBearingDeg,
+      boatBearingDeg,
+      targetBearingDeg,
+      relDeg,
+      cardinal,
+    };
+  }
+
+  updateAirportCompass(P = this.player) {
+    const wrap = $('airport-compass');
+    if (!wrap) return;
+    const isBoat = !!(P && P.isBoat);
+    const data = this.map?.visible
+      ? null
+      : isBoat
+        ? this.computeHarborCompassData(P)
+        : this.computeAirportCompassData(P);
+    if (!data) {
+      wrap.classList.add('hidden');
+      return;
+    }
+    wrap.classList.remove('hidden');
+    wrap.classList.toggle('boat-mode', !!data.isBoatCompass);
+
+    const arrived = data.isBoatCompass ? data.onTargetHarbor : data.onTargetAirport;
+    const aligned = arrived || Math.abs(data.relDeg) <= 7;
+    wrap.classList.toggle('aligned', aligned);
+
+    const rose = $('ac-rose');
+    if (rose) rose.style.transform = `rotate(${(-data.planeBearingDeg).toFixed(2)}deg)`;
+    const needle = $('ac-needle');
+    if (needle) needle.style.transform = `rotate(${data.relDeg.toFixed(2)}deg)`;
+
+    const setTxt = (el, txt) => {
+      if (el && el._lastTxt !== txt) {
+        el._lastTxt = txt;
+        el.textContent = txt;
+      }
+    };
+
+    setTxt($('ac-lbl-n'), tr('B', 'N'));
+    setTxt($('ac-lbl-e'), tr('Đ', 'E'));
+    setTxt($('ac-lbl-s'), tr('N', 'S'));
+    setTxt($('ac-lbl-w'), tr('T', 'W'));
+
+    let targetStr;
+    if (data.isBoatCompass) {
+      const hNum = data.targetIdx;
+      targetStr = arrived
+        ? tr(`⚓ Cảng ${hNum}`, `⚓ Harbor ${hNum}`)
+        : tr(`⚓ Cảng ${hNum}${data.visited ? ' ✔' : ''}`, `⚓ Harbor ${hNum}${data.visited ? ' ✔' : ''}`);
+    } else {
+      const apNum = data.targetIdx;
+      targetStr = arrived
+        ? tr(`🛬 Sân bay ${apNum}`, `🛬 Airport ${apNum}`)
+        : tr(`🛫 Sân bay ${apNum}${data.visited ? ' ✔' : ''}`, `🛫 Airport ${apNum}${data.visited ? ' ✔' : ''}`);
+    }
+    setTxt($('ac-target'), targetStr);
+
+    const distStr = data.dist >= 1000
+      ? `${(data.dist / 1000).toFixed(1)} km`
+      : `${Math.round(data.dist)} m`;
+    setTxt($('ac-dist'), distStr);
+
+    let turnStr;
+    if (data.isBoatCompass) {
+      if (arrived) {
+        turnStr = tr('⚓ Đã cập cảng!', '⚓ In harbor!');
+      } else if (Math.abs(data.relDeg) <= 5) {
+        turnStr = data.isCapeDetour
+          ? tr('🌊 Lướt vòng mũi đất!', '🌊 Clear headland!')
+          : tr('▲ Lướt thẳng vào cảng!', '▲ Sail straight in!');
+      } else if (data.relDeg < 0) {
+        const deg = Math.round(Math.abs(data.relDeg));
+        turnStr = tr(`↰ Bẻ lái trái ${deg}° (A)`, `↰ Steer left ${deg}° (A)`);
+      } else {
+        const deg = Math.round(data.relDeg);
+        turnStr = tr(`↱ Bẻ lái phải ${deg}° (D)`, `↱ Steer right ${deg}° (D)`);
+      }
+    } else {
+      if (arrived) {
+        turnStr = tr('🛬 Đã tới sân bay!', '🛬 At airport!');
+      } else if (Math.abs(data.relDeg) <= 5) {
+        turnStr = tr('▲ Bay thẳng tiến!', '▲ Fly straight!');
+      } else if (data.relDeg < 0) {
+        const deg = Math.round(Math.abs(data.relDeg));
+        turnStr = tr(`↰ Rẽ trái ${deg}° (A)`, `↰ Turn left ${deg}° (A)`);
+      } else {
+        const deg = Math.round(data.relDeg);
+        turnStr = tr(`↱ Rẽ phải ${deg}° (D)`, `↱ Turn right ${deg}° (D)`);
+      }
+    }
+    setTxt($('ac-turn'), turnStr);
+
+    const brgNum = String(Math.round(data.targetBearingDeg) % 360).padStart(3, '0');
+    setTxt($('ac-brg'), `🧭 ${brgNum}° ${data.cardinal}`);
+    setTxt($('ac-btn-auto'), tr('Tự động', 'Auto'));
+
+    const targetsEl = $('ac-targets');
+    if (targetsEl) {
+      const btns = targetsEl.querySelectorAll('button[data-ac-idx]');
+      for (let i = 0; i < btns.length; i++) {
+        const b = btns[i];
+        const raw = b.dataset.acIdx;
+        if (raw === 'auto') {
+          b.classList.toggle('active', data.mode === 'auto');
+        } else {
+          const idx = Number(raw);
+          const maxCount = data.isBoatCompass ? HARBOR_SCATTER_Z.length : AIRPORT_SCATTER_OFFSETS.length;
+          b.classList.toggle('hidden', idx >= maxCount);
+          setTxt(b, `#${idx}`);
+          b.title = data.isBoatCompass
+            ? tr(`Chỉ la bàn tới Cảng ${idx}`, `Point compass to Harbor ${idx}`)
+            : tr(`Chỉ la bàn tới Sân bay ${idx}`, `Point compass to Airport ${idx}`);
+          const siteId = data.isBoatCompass ? `earth:${idx}` : `${P.ref}:${idx}`;
+          const isVisited = data.isBoatCompass
+            ? !!((this.harborsVisitedSet && this.harborsVisitedSet.has(siteId)) || (this.visitedHarborIds && this.visitedHarborIds.has(siteId)))
+            : !!(this.airportsLandedSet && this.airportsLandedSet.has(siteId));
+          b.classList.toggle('active', data.mode === idx);
+          b.classList.toggle('auto-target', data.mode === 'auto' && data.targetIdx === idx);
+          b.classList.toggle('visited', isVisited);
+        }
+      }
+    }
+  }
+
+  getPlanetAirportOrigin(bodyKey) {
+    if (!bodyKey || bodyKey === 'earth') return 0;
+    if (!this.planetAirportOrigins) this.planetAirportOrigins = {};
+    if (this.planetAirportOrigins[bodyKey] !== undefined) {
+      return this.planetAirportOrigins[bodyKey];
+    }
+    const B = BODIES[bodyKey] || BODIES.mars;
+    if (bodyKey === 'mars') {
+      const phiRot = OLYMPUS_PSI - (-2450) / B.R;
+      this.planetAirportOrigins.mars = phiRot * B.R;
+      return this.planetAirportOrigins.mars;
+    }
+    const sunPhi = Math.atan2(SUN_ECI.x, SUN_ECI.y) - 0.35;
+    const phiRot = wrapPi(sunPhi - bodyRotation(bodyKey, this.simT || 0));
+    this.planetAirportOrigins[bodyKey] = phiRot * B.R;
+    return this.planetAirportOrigins[bodyKey];
+  }
+
+  getNearestAirportAnchor(bodyKey, curSx = 0, curSz = 0) {
+    let bestSite = this.getAirportSite(bodyKey, 0);
+    let bestD2 = Infinity;
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const site = this.getAirportSite(bodyKey, i);
+      const dx = this.bodyDeltaX(bodyKey, curSx, site.sx + 1040);
+      const dz = curSz - site.sz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        bestSite = site;
+      }
+    }
+    return { sx: bestSite.sx, sz: bestSite.sz, h: bestSite.h, sectorIdx: bestSite.aIdx };
+  }
+
+  teleportToAirport(bodyKey, airportIdx = 0) {
+    const idx = Math.max(0, Math.min(AIRPORT_SCATTER_OFFSETS.length - 1, Number(airportIdx) || 0));
+    this.selectedAirportBody = bodyKey;
+    this.selectedAirportIdx = idx;
+    this.selectedHarborIdx = undefined;
+    this.teleportToBody(bodyKey, 'surface', { airportIdx: idx });
+  }
+
+  teleportToHarbor(harborIdx = 0) {
+    const idx = Math.max(0, Math.min(HARBOR_SCATTER_Z.length - 1, Number(harborIdx) || 0));
+    this.selectedHarborIdx = idx;
+    this.selectedAirportBody = null;
+    this.teleportToBody('earth', 'surface', { harborIdx: idx });
+  }
+
+  updatePlaneTeleportUI() {
+    const isPlane = !!this.player?.isPlane;
+    document.querySelectorAll('#tp-bar-btns button[data-tp]').forEach((btn) => {
+      const tp = btn.dataset.tp;
+      const hide = isPlane && !this.canPlaneTeleportTo(tp);
+      btn.classList.toggle('hidden', hide);
+    });
+    const btnTpMode = $('btn-tp-mode');
+    if (btnTpMode) btnTpMode.classList.toggle('hidden', isPlane);
+    const tpModeSwitch = document.querySelector('.tp-mode-switch');
+    if (tpModeSwitch) tpModeSwitch.classList.toggle('hidden', isPlane);
+  }
+
+  renderTeleportModal() {
+    const box = $('teleport-groups');
+    if (!box) return;
+    this.updatePlaneTeleportUI();
+    const isPlane = !!this.player?.isPlane;
+    const isOrb = !isPlane && this.teleportMode === 'orbit';
+    const curTarget = this.currentTeleportTarget || (this.player ? this.player.ref : 'earth');
+    const groups = [
+      {
+        title: tr('🌍 Hệ Trái Đất & Trạm Vũ Trụ', '🌍 Earth System & Space Station'),
+        items: ['earth', 'earth_snow', 'iss', 'moon'],
+      },
+      {
+        title: tr('☀️ Mặt Trời, Hành Tinh Đá, Hệ Sao Hỏa & Vành Đai Tiểu Hành Tinh', '☀️ Sun, Inner Rocky Planets, Mars System & Asteroid Belt'),
+        items: ['mercury', 'venus', 'mars', 'olympus', 'phobos', 'deimos', 'ceres', 'asteroid_belt', 'sun'],
+      },
+      {
+        title: tr('🟠 Hệ Sao Mộc & 4 Mặt Trăng Galilean', '🟠 Jupiter System & Galilean Moons'),
+        items: ['jupiter', 'io', 'europa', 'ganymede', 'callisto'],
+      },
+      {
+        title: tr('🪐 Hệ Sao Thổ & 7 Mặt Trăng Lớn', '🪐 Saturn System & Major Moons'),
+        items: ['saturn', 'mimas', 'enceladus', 'tethys', 'dione', 'rhea', 'titan', 'iapetus'],
+      },
+      {
+        title: tr('🩵 Hệ Sao Thiên Vương & 5 Mặt Trăng', '🩵 Uranus System & Major Moons'),
+        items: ['uranus', 'miranda', 'ariel', 'umbriel', 'titania', 'oberon'],
+      },
+      {
+        title: tr('🔵 Hệ Sao Hải Vương & Vành Đai Kuiper (Pluto, Haumea, Makemake, Eris)', '🔵 Neptune, Triton & Kuiper Belt (Pluto, Haumea, Makemake, Eris)'),
+        items: ['neptune', 'triton', 'pluto', 'haumea', 'makemake', 'eris', 'kuiper_belt'],
+      },
+      {
+        title: tr('☄️ Đám Mây Oort & 🌌 Không Gian Liên Sao (Ngoài Hệ Mặt Trời)', '☄️ Oort Cloud & 🌌 Interstellar Space (Beyond Solar System)'),
+        items: ['oort', 'interstellar', 'royal1b'],
+      },
+    ];
+
+    box.innerHTML = groups.map((g) => {
+      const visibleItems = isPlane ? g.items.filter((k) => this.canPlaneTeleportTo(k)) : g.items;
+      if (!visibleItems.length) return '';
+      const cards = visibleItems.map((key) => {
+        if (key === 'earth_snow') {
+          const active = curTarget === 'earth_snow' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="earth_snow">
+            <span class="tp-card-top">❄️ ${tr('Khu Tuyết Trái Đất', 'Earth Snow Zone')}</span>
+            <span class="tp-card-sub">${tr('Trái Đất · Rừng thông tuyết, đồi tuyết trắng & mưa tuyết rơi', 'Earth · Snowy pine forest, alpine hills & falling snow')}</span>
+          </button>`;
+        }
+        if (key === 'iss') {
+          const active = curTarget === 'iss' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="iss">
+            <span class="tp-card-top">🛰️ ${tr('Trạm Vũ Trụ ISS', 'ISS Space Station')}</span>
+            <span class="tp-card-sub">${tr('Quỹ đạo Trái Đất · 400 km', 'Earth Orbit · 400 km')}</span>
+          </button>`;
+        }
+        if (key === 'olympus') {
+          const active = curTarget === 'olympus' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="olympus">
+            <span class="tp-card-top">🌋 ${tr('Đỉnh Olympus Mons', 'Olympus Mons Summit')}</span>
+            <span class="tp-card-sub">${tr('Sao Hỏa · Đỉnh 21,9 km & Miệng núi lửa', 'Mars · 21.9 km Summit & Caldera')}</span>
+          </button>`;
+        }
+        if (key === 'asteroid_belt') {
+          const active = curTarget === 'asteroid_belt' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="asteroid_belt">
+            <span class="tp-card-top">🪨 ${tr('Vành Đai Tiểu Hành Tinh', 'Main Asteroid Belt')}</span>
+            <span class="tp-card-sub">${tr('Vành đai đá giữa Sao Hỏa & Sao Mộc (98.000 – 126.000 km)', 'Rocky Belt between Mars & Jupiter (98,000 – 126,000 km)')}</span>
+          </button>`;
+        }
+        if (key === 'kuiper_belt') {
+          const active = curTarget === 'kuiper_belt' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="kuiper_belt">
+            <span class="tp-card-top">🧊 ${tr('Vành Đai Kuiper', 'Kuiper Belt')}</span>
+            <span class="tp-card-sub">${tr('Vành đai thiên thể băng 3D (740.000 – 1.040.000 km)', '3D Icy Belt beyond Neptune (740,000 – 1,040,000 km)')}</span>
+          </button>`;
+        }
+        if (key === 'oort') {
+          const active = curTarget === 'oort' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="oort">
+            <span class="tp-card-top">☄️ ${tr('Đám Mây Oort', 'Oort Cloud')}</span>
+            <span class="tp-card-sub">${tr('Vỏ cầu sao chổi băng 3D (1.120.000 – 1.520.000 km)', '3D Spherical Icy Cometary Shell (1,120,000 – 1,520,000 km)')}</span>
+          </button>`;
+        }
+        if (key === 'interstellar') {
+          const active = curTarget === 'interstellar' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="interstellar">
+            <span class="tp-card-top">🌌 ${tr('Không Gian Liên Sao', 'Interstellar Space')}</span>
+            <span class="tp-card-sub">${tr('Ngoài Đám mây Oort (>1.560.000 km) · Siêu Tân Tinh (Supernova)', 'Beyond Oort Cloud (>1,560,000 km) · Supernova Zone')}</span>
+          </button>`;
+        }
+        if (key === 'royal1b') {
+          const active = curTarget === 'royal1b' ? 'active' : '';
+          return `<button type="button" class="tp-card-btn ${active}" data-tp="royal1b">
+            <span class="tp-card-top">👑👸 ${tr('Độ Cao 1.000.000.000 km', '1,000,000,000 km Altitude')}</span>
+            <span class="tp-card-sub">${tr('Lãnh địa Alien Vua (100.000 HP) & Alien Hoàng Hậu (90.500 HP)', 'Domain of Colossal Alien King (100,000 HP) & Alien Queen (90,500 HP)')}</span>
+          </button>`;
+        }
+        const B = BODIES[key] || BODIES.earth;
+        const active = curTarget === key ? 'active' : '';
+        const has6Airports = this.hasSurfaceAirports(key);
+        const forceOrb = isOrb || !!B.gasGiant || key === 'sun';
+        const modeDesc = has6Airports
+          ? tr('🛬 Sân bay 0–5', '🛬 Airports 0–5') + (key === 'earth' ? tr(' · ⚓ Cảng 0–5', ' · ⚓ Harbors 0–5') : '')
+          : isPlane
+            ? tr('✈️ Bay trong khí quyển', '✈️ Atmospheric Flight')
+            : (forceOrb ? tr('🛰️ Vào quỹ đạo', '🛰️ Enter Orbit') : tr('🛬 Đáp bề mặt', '🛬 Land on Surface'));
+        const parentB = B.parent && B.parent !== 'sun' ? BODIES[B.parent] : null;
+        const parentTag = parentB ? `${tr('Thân chủ', 'Parent')}: ${parentB.label} · ` : '';
+        const atmTag = this.canPlaneTeleportTo(key) ? ` · ρ₀ = ${B.rho0} kg/m³` : '';
+        const airportSubBtns = has6Airports
+          ? `<div class="tp-sub-row">
+              ${[0, 1, 2, 3, 4, 5].map((idx) => {
+                const isSel = curTarget === key && this.selectedAirportBody === key && this.selectedAirportIdx === idx;
+                return `<button type="button" class="tp-sub-pill tp-sub-airport ${isSel ? 'on' : ''}" data-tp-airport="${key}:${idx}" title="${B.label} — ${tr(`Sân bay ${idx}`, `Airport ${idx}`)}">🛫 ${tr(`SB ${idx}`, `AP ${idx}`)}</button>`;
+              }).join('')}
+            </div>`
+          : '';
+        const harborSubBtns = (key === 'earth' && !isPlane)
+          ? `<div class="tp-sub-row tp-sub-harbors">
+              ${[0, 1, 2, 3, 4, 5].map((idx) => {
+                const isSel = curTarget === 'earth' && this.selectedHarborIdx === idx;
+                return `<button type="button" class="tp-sub-pill tp-sub-harbor ${isSel ? 'on' : ''}" data-tp-harbor="${idx}" title="${tr(`Trái Đất — Cảng ${idx}`, `Earth — Harbor ${idx}`)}">⚓ ${tr(`Cảng ${idx}`, `Port ${idx}`)}</button>`;
+              }).join('')}
+            </div>`
+          : '';
+        return `<div class="tp-card-wrap ${active}">
+          <button type="button" class="tp-card-btn ${active}" data-tp="${key}">
+            <span class="tp-card-top">${B.icon} ${B.label}</span>
+            <span class="tp-card-sub">${parentTag}${modeDesc} · g = ${B.g.toFixed(2)} m/s²${atmTag}</span>
+          </button>
+          ${airportSubBtns}
+          ${harborSubBtns}
+        </div>`;
+      }).join('');
+      return `<div class="tp-group"><div class="tp-group-title">${g.title}</div><div class="tp-group-grid">${cards}</div></div>`;
+    }).join('');
+
+    box.querySelectorAll('button[data-tp]').forEach((btn) => {
+      btn.onclick = () => {
+        this.selectedAirportBody = null;
+        this.selectedHarborIdx = undefined;
+        this.teleportToBody(btn.dataset.tp, this.teleportMode);
+      };
+    });
+    box.querySelectorAll('button[data-tp-airport]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const [bKey, idxStr] = (btn.dataset.tpAirport || 'earth:0').split(':');
+        this.teleportToAirport(bKey, Number(idxStr) || 0);
+      };
+    });
+    box.querySelectorAll('button[data-tp-harbor]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this.teleportToHarbor(Number(btn.dataset.tpHarbor) || 0);
+      };
+    });
+  }
+
+  updateTeleportActiveButtons(activeTarget) {
+    this.currentTeleportTarget = activeTarget;
+    document.querySelectorAll('#tp-bar-btns .tp-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tp === activeTarget);
+    });
+    document.querySelectorAll('#teleport-groups .tp-card-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tp === activeTarget);
+    });
+  }
+
+  getCrewRoleInfo() {
+    const P = this.player;
+    if (P?.isRover || P?.isBoat) {
+      return {
+        role: 'none',
+        hidden: true,
+        icon: '',
+        nameVi: '',
+        nameUpperVi: '',
+        crewVi: '',
+        vesselVi: P?.isBoat ? 'thuyền' : 'xe Rover',
+        vesselUpperVi: P?.isBoat ? 'THUYỀN' : 'XE ROVER',
+        nameEn: '',
+        namePluralEn: '',
+        nameUpperEn: '',
+        crewEn: '',
+        labelVi: '',
+        labelEn: '',
+        hudLabelVi: '',
+        hudLabelEn: '',
+      };
+    }
+    if (P?.isPlane) {
+      return {
+        role: 'pilot',
+        hidden: false,
+        icon: '👨‍✈️',
+        nameVi: 'phi công',
+        nameUpperVi: 'PHI CÔNG',
+        crewVi: 'Phi đoàn',
+        vesselVi: 'máy bay',
+        vesselUpperVi: 'MÁY BAY',
+        nameEn: 'pilot',
+        namePluralEn: 'pilot(s)',
+        nameUpperEn: 'PILOT(S)',
+        crewEn: 'Flight crew',
+        labelVi: '👨‍✈️ Phi công:',
+        labelEn: '👨‍✈️ Pilots:',
+        hudLabelVi: 'Phi công',
+        hudLabelEn: 'Pilots',
+      };
+    }
+    return {
+      role: 'astronaut',
+      hidden: false,
+      icon: '👨‍🚀',
+      nameVi: 'phi hành gia',
+      nameUpperVi: 'PHI HÀNH GIA',
+      crewVi: 'Phi hành đoàn',
+      vesselVi: 'tàu',
+      vesselUpperVi: 'TÀU',
+      nameEn: 'astronaut',
+      namePluralEn: 'astronaut(s)',
+      nameUpperEn: 'ASTRONAUT(S)',
+      crewEn: 'Crew',
+      labelVi: '👨‍🚀 Phi hành gia:',
+      labelEn: '👨‍🚀 Astronauts:',
+      hudLabelVi: 'Phi hành gia',
+      hudLabelEn: 'Astronauts',
+    };
+  }
+
+  createAstronautMesh(index = 0, role = null) {
+    const resolvedRole = role || this.getCrewRoleInfo().role;
+    const g = new THREE.Group();
+
+    if (resolvedRole === 'pilot') {
+      // Fighter Pilot (Olive/Navy Flight Suit, G-Suit Harness, Flight Helmet with Dark Tactical Visor & Oxygen Mask)
+      const suitColors = [0x3f6212, 0x1e3a8a, 0x365314, 0x1e293b, 0x4d7c0f];
+      const vestColors = [0xeab308, 0xf97316, 0xfacc15, 0xf59e0b, 0x22c55e];
+      const suitMat = new THREE.MeshStandardMaterial({ color: suitColors[index % suitColors.length], roughness: 0.62, metalness: 0.12 });
+      const darkMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.55, metalness: 0.35 });
+      const vestMat = new THREE.MeshStandardMaterial({ color: vestColors[index % vestColors.length], roughness: 0.45, metalness: 0.18 });
+      const skinMat = new THREE.MeshStandardMaterial({ color: 0xfdba74, roughness: 0.65, metalness: 0.05 });
+      const helmetMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.28, metalness: 0.65 });
+      const visorMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.08, metalness: 0.95, emissive: 0x0284c7, emissiveIntensity: 0.18 });
+
+      const leftLeg = new THREE.Group();
+      leftLeg.position.set(-0.16, 0.95, 0);
+      const lThigh = new THREE.Mesh(new THREE.CylinderGeometry(0.105, 0.095, 0.72, 12), suitMat);
+      lThigh.position.y = -0.36;
+      const lStrap = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.105, 0.14, 12), darkMat);
+      lStrap.position.y = -0.28;
+      const lBoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.32), darkMat);
+      lBoot.position.set(0, -0.80, 0.05);
+      leftLeg.add(lThigh, lStrap, lBoot);
+
+      const rightLeg = new THREE.Group();
+      rightLeg.position.set(0.16, 0.95, 0);
+      const rThigh = new THREE.Mesh(new THREE.CylinderGeometry(0.105, 0.095, 0.72, 12), suitMat);
+      rThigh.position.y = -0.36;
+      const rStrap = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.105, 0.14, 12), darkMat);
+      rStrap.position.y = -0.28;
+      const rBoot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.32), darkMat);
+      rBoot.position.set(0, -0.80, 0.05);
+      rightLeg.add(rThigh, rStrap, rBoot);
+      g.add(leftLeg, rightLeg);
+
+      const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.24, 0.85, 16), suitMat);
+      torso.position.y = 1.35;
+      const belt = new THREE.Mesh(new THREE.CylinderGeometry(0.255, 0.255, 0.09, 16), darkMat);
+      belt.position.y = 1.02;
+      const vestL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.52, 0.30), vestMat);
+      vestL.position.set(-0.13, 1.44, 0.12);
+      const vestR = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.52, 0.30), vestMat);
+      vestR.position.set(0.13, 1.44, 0.12);
+      const oxyReg = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.10), darkMat);
+      oxyReg.position.set(0, 1.34, 0.25);
+      const chutePack = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.48, 0.12), darkMat);
+      chutePack.position.set(0, 1.38, -0.22);
+      g.add(torso, belt, vestL, vestR, oxyReg, chutePack);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.24, 16, 14), skinMat);
+      head.position.y = 2.00;
+      const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.285, 20, 16), helmetMat);
+      helmet.position.set(0, 2.04, -0.02);
+      const visor = new THREE.Mesh(new THREE.SphereGeometry(0.265, 18, 14), visorMat);
+      visor.position.set(0, 2.06, 0.09);
+      visor.scale.set(1.0, 0.68, 0.92);
+      const oxyMask = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.20, 10), darkMat);
+      oxyMask.rotation.x = Math.PI * 0.52;
+      oxyMask.position.set(0, 1.93, 0.26);
+      const oxyHose = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 0.46, 8), darkMat);
+      oxyHose.position.set(0, 1.66, 0.28);
+      oxyHose.rotation.x = -0.15;
+      g.add(head, helmet, visor, oxyMask, oxyHose);
+
+      const leftArm = new THREE.Group();
+      leftArm.position.set(-0.35, 1.68, 0);
+      const lSleeve = new THREE.Mesh(new THREE.CylinderGeometry(0.085, 0.08, 0.62, 12), suitMat);
+      lSleeve.position.y = -0.28;
+      const lPatch = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.08, 12), vestMat);
+      lPatch.position.y = -0.14;
+      const lGlove = new THREE.Mesh(new THREE.SphereGeometry(0.095, 10, 10), darkMat);
+      lGlove.position.y = -0.62;
+      leftArm.add(lSleeve, lPatch, lGlove);
+      leftArm.rotation.z = 0.22;
+
+      const rightArm = new THREE.Group();
+      rightArm.position.set(0.35, 1.68, 0);
+      const rSleeve = new THREE.Mesh(new THREE.CylinderGeometry(0.085, 0.08, 0.62, 12), suitMat);
+      rSleeve.position.y = -0.28;
+      const rPatch = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.08, 12), vestMat);
+      rPatch.position.y = -0.14;
+      const rGlove = new THREE.Mesh(new THREE.SphereGeometry(0.095, 10, 10), darkMat);
+      rGlove.position.y = -0.62;
+      rightArm.add(rSleeve, rPatch, rGlove);
+      rightArm.rotation.z = -2.35;
+      g.add(leftArm, rightArm);
+
+      g.scale.setScalar(1.15 / 3);
+      g.userData = { leftLeg, rightLeg, leftArm, rightArm, phaseOffset: index * 1.17, role: resolvedRole };
+      return g;
+    }
+
+    const suitColors = [0xf8fafc, 0xf1f5f9, 0xeff6ff, 0xfefce8, 0xf0fdf4];
+    const stripeColors = [0xef4444, 0x3b82f6, 0xf59e0b, 0x10b981, 0xa855f7];
+    const suitMat = new THREE.MeshStandardMaterial({ color: suitColors[index % suitColors.length], roughness: 0.45, metalness: 0.1 });
+    const darkMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.6, metalness: 0.3 });
+    const stripeMat = new THREE.MeshStandardMaterial({ color: stripeColors[index % stripeColors.length], roughness: 0.4, metalness: 0.2 });
+    const visorMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.12, metalness: 0.92, emissive: 0x78350f, emissiveIntensity: 0.25 });
+    const ledMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
+
+    // Left & Right Legs (pivoted at hip y = 0.95)
+    const leftLeg = new THREE.Group();
+    leftLeg.position.set(-0.16, 0.95, 0);
+    const lThigh = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.10, 0.72, 12), suitMat);
+    lThigh.position.y = -0.36;
+    const lBoot = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.22, 0.34), darkMat);
+    lBoot.position.set(0, -0.80, 0.05);
+    leftLeg.add(lThigh, lBoot);
+
+    const rightLeg = new THREE.Group();
+    rightLeg.position.set(0.16, 0.95, 0);
+    const rThigh = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.10, 0.72, 12), suitMat);
+    rThigh.position.y = -0.36;
+    const rBoot = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.22, 0.34), darkMat);
+    rBoot.position.set(0, -0.80, 0.05);
+    rightLeg.add(rThigh, rBoot);
+    g.add(leftLeg, rightLeg);
+
+    // Torso & Commander Stripe
+    const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.25, 0.85, 16), suitMat);
+    torso.position.y = 1.35;
+    const belt = new THREE.Mesh(new THREE.CylinderGeometry(0.265, 0.265, 0.10, 16), stripeMat);
+    belt.position.y = 1.02;
+    const chestBox = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.26, 0.14), darkMat);
+    chestBox.position.set(0, 1.38, 0.24);
+    const chestLed = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.08, 0.03), ledMat);
+    chestLed.position.set(0, 1.40, 0.315);
+    g.add(torso, belt, chestBox, chestLed);
+
+    // PLSS Life-Support Backpack
+    const pack = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.68, 0.26), suitMat);
+    pack.position.set(0, 1.42, -0.28);
+    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.45, 8), darkMat);
+    antenna.position.set(0.16, 1.95, -0.28);
+    const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 8), ledMat);
+    beacon.position.set(0.16, 2.18, -0.28);
+    g.add(pack, antenna, beacon);
+
+    // Helmet & Gold Visor
+    const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.31, 20, 16), suitMat);
+    helmet.position.y = 2.04;
+    const visor = new THREE.Mesh(new THREE.SphereGeometry(0.275, 18, 14), visorMat);
+    visor.position.set(0, 2.04, 0.09);
+    g.add(helmet, visor);
+
+    // Left & Right Arms (pivoted at shoulder y = 1.68)
+    const leftArm = new THREE.Group();
+    leftArm.position.set(-0.36, 1.68, 0);
+    const lSleeve = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.085, 0.62, 12), suitMat);
+    lSleeve.position.y = -0.28;
+    const lGlove = new THREE.Mesh(new THREE.SphereGeometry(0.10, 10, 10), darkMat);
+    lGlove.position.y = -0.62;
+    leftArm.add(lSleeve, lGlove);
+    leftArm.rotation.z = 0.22;
+
+    const rightArm = new THREE.Group();
+    rightArm.position.set(0.36, 1.68, 0);
+    const rSleeve = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.085, 0.62, 12), suitMat);
+    rSleeve.position.y = -0.28;
+    const rBand = new THREE.Mesh(new THREE.CylinderGeometry(0.095, 0.095, 0.08, 12), stripeMat);
+    rBand.position.y = -0.22;
+    const rGlove = new THREE.Mesh(new THREE.SphereGeometry(0.10, 10, 10), darkMat);
+    rGlove.position.y = -0.62;
+    rightArm.add(rSleeve, rBand, rGlove);
+    rightArm.rotation.z = -2.35;
+    g.add(leftArm, rightArm);
+
+    g.scale.setScalar(1.15 / 3);
+    g.userData = { leftLeg, rightLeg, leftArm, rightArm, phaseOffset: index * 1.17, role: resolvedRole };
+    return g;
+  }
+
+  ensurePadAstronautMeshes() {
+    const info = this.getCrewRoleInfo();
+    if (info.hidden) {
+      for (const m of this.padAstronautMeshes) {
+        if (m) m.visible = false;
+      }
+      return;
+    }
+    if (this.padAstronautMeshes.length && this.padAstronautMeshes[0]?.userData?.role !== info.role) {
+      for (const m of this.padAstronautMeshes) {
+        if (m && m.parent) m.parent.remove(m);
+      }
+      this.padAstronautMeshes = [];
+    }
+    while (this.padAstronautMeshes.length < this.maxAstronauts) {
+      const idx = this.padAstronautMeshes.length;
+      const mesh = this.createAstronautMesh(idx, info.role);
+      const side = idx % 2 === 0 ? 1 : -1;
+      const rank = Math.floor(idx / 2);
+      const x = side * (4.8 + rank * 1.85);
+      const z = 5.5 + (rank % 2) * 1.6;
+      mesh.position.set(x, PAD_TOP, z);
+      mesh.rotation.y = -side * 0.25;
+      mesh.visible = false;
+      this.world.add(mesh);
+      this.padAstronautMeshes.push(mesh);
+    }
+    this.ensureBoardingHatchMesh();
+  }
+
+  getBoardingHatchZ() {
+    const P = this.player;
+    const activeItems = (P && P.ctx && P.segIdx && P.segIdx.length)
+      ? P.segIdx.flatMap((k) => (P.ctx.segs[k] || []).map((i) => P.ctx.stack[i]).filter(Boolean))
+      : (this.stack || []);
+    if (!activeItems.length) return 1.28;
+    if (activeItems.some((s) => s.type.startsWith('energia'))) return 3.45;
+    if (activeItems.some((s) => s.type.startsWith('buran'))) return 3.25;
+    if (activeItems.some((s) => s.type === 'n1BlockA')) return 4.05;
+    if (activeItems.some((s) => s.type === 'n1BlockB')) return 2.95;
+    if (activeItems.some((s) => s.type.startsWith('n1'))) return 2.20;
+    if (activeItems.some((s) => s.type === 'saturnS1C' || s.type === 'saturnSII')) return 2.42;
+    if (activeItems.some((s) => s.type.startsWith('saturn'))) return 1.65;
+    if (activeItems.some((s) => s.type.startsWith('soyuz')) && (!P || (P.boosters && P.boosters().length > 0))) return 2.30;
+    const ufoItem = activeItems.find((s) => isUfoPart(s.type));
+    if (ufoItem) return Math.max(2.95, CORE_R * ufoEngineScale(PARTS[ufoItem.type]?.ufoScale || 1) + 0.18);
+    return 1.28;
+  }
+
+  ensureBoardingHatchMesh() {
+    if (this.boardingHatch) return this.boardingHatch;
+    const g = new THREE.Group();
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.42, metalness: 0.72 });
+    const doorMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.35, metalness: 0.45 });
+    const stripeMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.38, metalness: 0.25 });
+    const darkRecessMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.85, metalness: 0.2 });
+    const cabinGlowMat = new THREE.MeshStandardMaterial({
+      color: 0xbae6fd,
+      emissive: 0x38bdf8,
+      emissiveIntensity: 1.65,
+      roughness: 0.2,
+    });
+    const greenLedMat = new THREE.MeshStandardMaterial({
+      color: 0x4ade80,
+      emissive: 0x22c55e,
+      emissiveIntensity: 2.2,
+      roughness: 0.2,
+    });
+    const visorMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      emissive: 0x0284c7,
+      emissiveIntensity: 0.9,
+      roughness: 0.15,
+      metalness: 0.8,
+    });
+
+    // Armored Airlock Housing & Glowing Interior Cabin Bay
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(2.36, 3.15, 0.75), frameMat);
+    housing.position.set(0, 1.58, -0.32);
+    const recess = new THREE.Mesh(new THREE.BoxGeometry(1.96, 2.76, 0.55), darkRecessMat);
+    recess.position.set(0, 1.54, -0.18);
+    const cabinBack = new THREE.Mesh(new THREE.PlaneGeometry(1.84, 2.64), cabinGlowMat);
+    cabinBack.position.set(0, 1.54, -0.02);
+    g.add(housing, recess, cabinBack);
+
+    // Outer Frame Pillars, Header Arch & LED Strips
+    for (const sgn of [-1, 1]) {
+      const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.22, 2.96, 0.26), frameMat);
+      pillar.position.set(sgn * 1.06, 1.54, 0.04);
+      const ledStrip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 2.60, 0.06), greenLedMat);
+      ledStrip.position.set(sgn * 1.06, 1.54, 0.18);
+      g.add(pillar, ledStrip);
+    }
+    const header = new THREE.Mesh(new THREE.BoxGeometry(2.42, 0.30, 0.32), frameMat);
+    header.position.set(0, 3.04, 0.06);
+    const beacon = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.12, 0.08), greenLedMat);
+    beacon.position.set(0, 3.04, 0.23);
+    const threshold = new THREE.Mesh(new THREE.BoxGeometry(2.38, 0.18, 0.34), frameMat);
+    threshold.position.set(0, 0.09, 0.06);
+    g.add(header, beacon, threshold);
+
+    // Hinged Left & Right Double Airlock Doors (swing outward when opening)
+    const leftDoorPivot = new THREE.Group();
+    leftDoorPivot.position.set(-0.95, 1.54, 0.08);
+    const lDoor = new THREE.Mesh(new THREE.BoxGeometry(0.95, 2.68, 0.10), doorMat);
+    lDoor.position.set(0.475, 0, 0);
+    const lWin = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.58, 0.12), visorMat);
+    lWin.position.set(0.48, 0.45, 0);
+    const lStripe = new THREE.Mesh(new THREE.BoxGeometry(0.82, 0.16, 0.11), stripeMat);
+    lStripe.position.set(0.475, -0.55, 0);
+    leftDoorPivot.add(lDoor, lWin, lStripe);
+
+    const rightDoorPivot = new THREE.Group();
+    rightDoorPivot.position.set(0.95, 1.54, 0.08);
+    const rDoor = new THREE.Mesh(new THREE.BoxGeometry(0.95, 2.68, 0.10), doorMat);
+    rDoor.position.set(-0.475, 0, 0);
+    const rWin = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.58, 0.12), visorMat);
+    rWin.position.set(-0.48, 0.45, 0);
+    const rStripe = new THREE.Mesh(new THREE.BoxGeometry(0.82, 0.16, 0.11), stripeMat);
+    rStripe.position.set(-0.475, -0.55, 0);
+    rightDoorPivot.add(rDoor, rWin, rStripe);
+    g.add(leftDoorPivot, rightDoorPivot);
+
+    // Fold-Down Boarding Ramp with Illuminated Side Handrails
+    const rampPivot = new THREE.Group();
+    rampPivot.position.set(0, 0.14, 0.14);
+    const rampLen = 2.40;
+    const rampPlate = new THREE.Mesh(new THREE.BoxGeometry(1.76, rampLen, 0.08), frameMat);
+    rampPlate.position.set(0, rampLen * 0.5, 0);
+    rampPivot.add(rampPlate);
+    for (let s = 1; s <= 5; s++) {
+      const step = new THREE.Mesh(new THREE.BoxGeometry(1.56, 0.07, 0.11), stripeMat);
+      step.position.set(0, (s / 6) * rampLen, 0.01);
+      rampPivot.add(step);
+    }
+    for (const sgn of [-1, 1]) {
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(0.06, rampLen, 0.24), greenLedMat);
+      rail.position.set(sgn * 0.86, rampLen * 0.5, 0.12);
+      rampPivot.add(rail);
+    }
+    g.add(rampPivot);
+
+    g.visible = false;
+    g.userData = { leftDoorPivot, rightDoorPivot, rampPivot };
+    this.scene.add(g);
+    this.boardingHatch = g;
+    return g;
+  }
+
+  addAstronauts(count) {
+    const P = this.player;
+    const info = this.getCrewRoleInfo();
+    if (!P || info.hidden) return;
+
+    if (this.phase === 'countdown') {
+      this.event(
+        tr(
+          `⚠️ Tên lửa đang đếm ngược chuẩn bị phóng — Cổng tàu đã đóng, không thể thêm ${info.nameVi}!`,
+          `⚠️ Countdown in progress — Airlock is sealed, cannot add more ${info.namePluralEn}!`
+        ),
+        'warn'
+      );
+      return;
+    }
+    const canBoard = P.isPlane
+      ? (!!P.landed && P.ref === 'earth' && Math.abs(P.planeRollSpeed || 0) < 15)
+      : P.isBoat
+        ? (!!P.landed && P.ref === 'earth')
+        : (this.phase === 'ready' && !this.lifted);
+    if (!canBoard) {
+      if (P.isPlane) {
+        this.event(
+          tr('⚠️ Máy bay phải đậu trên đường băng sân bay Trái Đất mới có thể đón phi công lên khoang lái!', '⚠️ Aircraft must be parked on the Earth airport runway to board pilots!'),
+          'warn'
+        );
+      } else if (P.isBoat) {
+        this.event(
+          tr('⚠️ Thuyền phải đậu tại Cảng hoặc trên mặt nước mới có thể đón sĩ quan lên tàu!', '⚠️ Boat must be docked at the Harbor or on the water surface to board naval officers!'),
+          'warn'
+        );
+      } else {
+        this.event(
+          tr('⚠️ Chỉ có thể thêm phi hành gia vào tàu trước khi bắt đầu đếm ngược phóng!', '⚠️ Astronauts can only board the craft before launch countdown starts!'),
+          'warn'
+        );
+      }
+      return;
+    }
+    const max = this.maxAstronauts || 10;
+    if (this.astronautsAboard >= max) {
+      this.event(
+        tr(
+          `⚠️ Đã đạt giới hạn tối đa ${max} ${info.nameVi} trên ${info.vesselVi}!`,
+          `⚠️ Reached the maximum limit of ${max} ${info.namePluralEn} aboard!`
+        ),
+        'warn'
+      );
+      return;
+    }
+    const prevAboard = this.astronautsAboard;
+    const added = Math.min(count, max - this.astronautsAboard);
+    this.astronautsAboard += added;
+    this.ensurePadAstronautMeshes();
+    const hatchZ = this.getBoardingHatchZ();
+    const isAlreadyOpen = this.hatchCloseStartT && this.time < this.hatchCloseStartT + 0.30;
+    if (!isAlreadyOpen) {
+      this.hatchOpenStartT = this.time;
+    }
+    const firstWalkDelay = isAlreadyOpen ? 0.05 : 0.24;
+    const stagger = 0.20;
+    const boardDur = 1.22;
+    const baseX = P.sx || 0;
+    const baseY = P.isPlane ? 0.25 : P.isBoat ? 0.56 : PAD_TOP;
+    const baseZ = P.s?.z || 0;
+    for (let i = 0; i < added; i++) {
+      const idx = prevAboard + i;
+      const m = this.padAstronautMeshes[idx];
+      if (!m || !m.userData) continue;
+      const side = idx % 2 === 0 ? 1 : -1;
+      const startX = side * (5.2 + i * 1.25);
+      const startZ = hatchZ + 4.4 + (i % 2) * 1.05;
+      m.userData.boarding = true;
+      m.userData.boardStartT = this.time + firstWalkDelay + i * stagger;
+      m.userData.boardDur = boardDur;
+      m.userData.startX = startX;
+      m.userData.startZ = startZ;
+      m.userData.hatchZ = hatchZ;
+      m.userData.baseX = baseX;
+      m.userData.baseY = baseY;
+      m.userData.baseZ = baseZ;
+      m.position.set(baseX + startX, baseY, baseZ + startZ);
+      m.rotation.set(0, Math.atan2(-startX, (hatchZ + 2.35) - startZ), 0);
+      m.scale.setScalar(1.15 / 3);
+    }
+    this.hatchCloseStartT = this.time + firstWalkDelay + (added - 1) * stagger + boardDur + 0.12;
+    audio.thunk(0.55);
+    this.hudTimer = 0;
+    this.updateHUD(0);
+    const fireMul = this.getCrewFireRateMultiplier();
+    const fireMulStr = Number.isInteger(fireMul) ? `${fireMul}.0` : fireMul.toFixed(1);
+    const fireBonusPct = Math.round((fireMul - 1) * 100);
+    this.milestone(
+      `${info.icon} +${added} ${tr(`${info.nameUpperVi} LÊN ${info.vesselUpperVi}`, `${info.nameUpperEn} ABOARD`)} · ⚡${fireMulStr}×`,
+      tr(
+        `${info.crewVi}: ${this.astronautsAboard}/${max} · Tốc độ bắn vũ khí tăng gấp ${fireMulStr}× (+${fireBonusPct}%)!`,
+        `${info.crewEn} aboard: ${this.astronautsAboard}/${max} · Weapon fire rate boosted to ${fireMulStr}× (+${fireBonusPct}%)!`
+      )
+    );
+    this.event(
+      tr(
+        `${info.icon}⚡ Đã thêm ${added} ${info.nameVi} lên ${info.vesselVi}! (Hiện có: ${this.astronautsAboard}/${max} · Tốc độ bắn: ${fireMulStr}× [+${fireBonusPct}%])`,
+        `${info.icon}⚡ Added ${added} ${info.namePluralEn} aboard! (Aboard: ${this.astronautsAboard}/${max} · Fire rate: ${fireMulStr}× [+${fireBonusPct}%])`
+      ),
+      'warn'
+    );
+  }
+
+  clearDeployedAstronauts(boardBack = false) {
+    if (this.deployedAstronauts && this.deployedAstronauts.length) {
+      if (boardBack) {
+        this.astronautsAboard = Math.min(this.maxAstronauts || 10, this.astronautsAboard + this.deployedAstronauts.length);
+      }
+      for (const a of this.deployedAstronauts) {
+        if (a.mesh && a.mesh.parent) a.mesh.parent.remove(a.mesh);
+      }
+    }
+    this.deployedAstronauts = [];
+  }
+
+  deployAstronauts() {
+    const P = this.player;
+    const info = this.getCrewRoleInfo();
+    if (!P || P.crashed || info.hidden) return;
+    const max = this.maxAstronauts || 10;
+    const B = BODIES[P.ref] || BODIES.earth;
+    if (B.gasGiant || P.ref === 'sun') return;
+
+    const isOnLaunchpad = !P.isPlane && !P.isBoat && (this.phase === 'ready' || this.phase === 'countdown' || (!this.lifted && P.ref === 'earth' && (P.clamped || (P.landed && P.landed.site === 'pad'))));
+    if (!P.landed || isOnLaunchpad || (P.isPlane && Math.abs(P.planeRollSpeed || 0) >= 15)) {
+      this.event(
+        tr(
+          `⚠️ Phương tiện phải hạ cánh chạm bề mặt mới thả ${info.nameVi} xuống được!`,
+          `⚠️ Craft must touch down on the surface before deploying ${info.namePluralEn}!`
+        ),
+        'warn'
+      );
+      return;
+    }
+
+    if (this.astronautsAboard <= 0) {
+      this.event(
+        tr(
+          `⚠️ Không có ${info.nameVi} nào trên ${info.vesselVi} để thả xuống!`,
+          `⚠️ No ${info.namePluralEn} aboard to deploy!`
+        ),
+        'warn'
+      );
+      return;
+    }
+
+    const alreadyDeployed = (this.deployedAstronauts || []).filter((a) => a.body === P.ref).length;
+    const canDeploy = Math.min(this.astronautsAboard, max - alreadyDeployed);
+    if (canDeploy <= 0) {
+      this.event(
+        tr(
+          `⚠️ Số lượng ${info.nameVi} trên ${B.label} đã đạt giới hạn tối đa ${max}!`,
+          `⚠️ ${info.crewEn} count on ${B.label} has reached the maximum limit of ${max}!`
+        ),
+        'warn'
+      );
+      return;
+    }
+
+    this.astronautsAboard = Math.max(0, this.astronautsAboard - canDeploy);
+    const isSurface = true;
+
+    // Open the craft's 3D airlock gate & boarding ramp so the player sees crew walk out
+    this.ensureBoardingHatchMesh();
+    const hatchZ = this.getBoardingHatchZ();
+    const isAlreadyOpen = this.hatchCloseStartT && this.time < this.hatchCloseStartT + 0.30;
+    if (!isAlreadyOpen) {
+      this.hatchOpenStartT = this.time;
+    }
+    const firstExitDelay = isAlreadyOpen ? 0.05 : 0.24;
+    const stagger = 0.22;
+    const exitDur = 1.28;
+    this.hatchCloseStartT = this.time + firstExitDelay + (canDeploy - 1) * stagger + exitDur + 0.12;
+    audio.thunk(0.55);
+
+    for (let i = 0; i < canDeploy; i++) {
+      const idx = alreadyDeployed + i;
+      const mesh = this.createAstronautMesh(idx, info.role);
+      mesh.visible = false;
+      this.scene.add(mesh);
+      const side = idx % 2 === 0 ? 1 : -1;
+      const rank = Math.floor(idx / 2);
+      const offsetX = side * (3.6 + rank * 1.6);
+      const offsetZ = hatchZ + 2.8 + (idx % 3) * 1.0;
+      const exitStartT = this.time + firstExitDelay + i * stagger;
+
+      if (P.ref === 'earth') {
+        const surf = this.surfaceAt({ ...P, sx: P.sx + offsetX, s: { ...P.s, z: (P.s.z || 0) + offsetZ } });
+        this.deployedAstronauts.push({
+          idx,
+          body: 'earth',
+          site: surf.site,
+          mode: isSurface ? 'surface' : 'eva',
+          sx: P.sx + offsetX,
+          z: (P.s.z || 0) + offsetZ,
+          h: surf.h,
+          dropH: isSurface ? Math.max(0, Math.min(60, (P.agl ?? P.alt) - 12)) : 0,
+          relX: offsetX,
+          relY: (idx % 3 - 1) * 3.0,
+          relZ: offsetZ,
+          exitStartT,
+          exitDur,
+          hatchZ,
+          mesh,
+        });
+      } else {
+        const psi = P.phiRot + offsetX / B.R;
+        const z = (P.s.z || 0) + offsetZ;
+        const surfH = moonHeight(Math.sin(psi), Math.cos(psi), z / B.R, P.ref);
+        this.deployedAstronauts.push({
+          idx,
+          body: P.ref,
+          mode: isSurface ? 'surface' : 'eva',
+          basePsi: psi,
+          psi,
+          z,
+          h: surfH,
+          dropH: isSurface ? Math.max(0, Math.min(60, (P.agl ?? P.alt) - 12)) : 0,
+          relX: offsetX,
+          relY: (idx % 3 - 1) * 3.0,
+          relZ: offsetZ,
+          exitStartT,
+          exitDur,
+          hatchZ,
+          mesh,
+        });
+      }
+    }
+
+    const totalNow = alreadyDeployed + canDeploy;
+    const parentB = B.parent && B.parent !== 'sun' ? BODIES[B.parent] : null;
+    const bodyDescVi = parentB ? `${B.label} (Thân chủ: ${parentB.label})` : B.label;
+    const bodyDescEn = parentB ? `${B.label} (Parent: ${parentB.label})` : B.label;
+
+    this.hudTimer = 0;
+    this.updateHUD(0);
+    const fireMul = this.getCrewFireRateMultiplier();
+    const fireMulStr = Number.isInteger(fireMul) ? `${fireMul}.0` : fireMul.toFixed(1);
+    this.milestone(
+      `${info.icon} ${tr('ĐÃ THẢ', 'DEPLOYED')} ${canDeploy} ${tr(`${info.nameUpperVi} XUỐNG`, `${info.nameUpperEn} ON`)} ${B.label.toUpperCase()}!`,
+      tr(
+        `Đã thả ${totalNow}/${max} ${info.nameVi} xuống ${bodyDescVi} · Còn trên ${info.vesselVi}: ${this.astronautsAboard}/${max} (Tốc độ bắn: ${fireMulStr}×)`,
+        `Deployed ${totalNow}/${max} ${info.namePluralEn} on ${bodyDescEn} · Remaining aboard: ${this.astronautsAboard}/${max} (Fire rate: ${fireMulStr}×)`
+      )
+    );
+    this.event(
+      tr(
+        `${info.icon}🏳️ Đã thả ${canDeploy} ${info.nameVi} xuống ${bodyDescVi}! (Đã thả: ${totalNow}/${max} · Trên ${info.vesselVi}: ${this.astronautsAboard}/${max} · Tốc độ bắn: ${fireMulStr}×)`,
+        `${info.icon}🏳️ Deployed ${canDeploy} ${info.namePluralEn} onto ${bodyDescEn}! (Deployed: ${totalNow}/${max} · Aboard: ${this.astronautsAboard}/${max} · Fire rate: ${fireMulStr}×)`
+      ),
+      'warn'
+    );
+  }
+
+  teleportToBody(target, mode = this.teleportMode, opts = {}) {
+    if (!target) return;
+    audio.init();
+    audio.click();
+
+    if (!this.player || this.player.crashed || this.player.dead || this.phase === 'crashed') {
+      this.setup(this.stack, this.mission?.id || 'free');
+    }
+
+    const P = this.player;
+    if (!P) return;
+
+    if (P.isPlane && !this.canPlaneTeleportTo(target)) {
+      this.toggleTeleportModal(false);
+      this.event(
+        tr(
+          '✈️ Máy bay chỉ có thể dịch chuyển tới các hành tinh hoặc mặt trăng có bầu khí quyển!',
+          '✈️ Aircraft can only teleport to planets or moons that have an atmosphere!'
+        ),
+        'warn'
+      );
+      return;
+    }
+
+    // Refill all stages & boosters so the rocket can freely launch from the destination
+    for (let k = 0; k < this.fuel.length; k++) this.fuel[k] = this.fuelMax[k];
+    for (const b of this.rocket.boosters) b.fuel = b.fuelMax;
+    P.updateMass();
+
+    // Reset flight & mission UI states
+    this.program = null;
+    this.programDone = false;
+    this.missionSuccessStopped = false;
+    this.missionStopAnchor = null;
+    P._guidedTargetAlt = null;
+    this.autopilotOutcomeRolled = false;
+    this.autopilotWillFail = false;
+    this.autopilotActiveSec = 0;
+    this.autopilotFailSec = 0;
+    this.autopilotWarned = false;
+    P._autopilotMalfunction = false;
+    this.docked = null;
+    clearTimeout(this.completeTimer);
+    this.completeTimer = null;
+    clearTimeout(this.crashTimer);
+    this.crashTimer = null;
+    this.resultShown = false;
+    $('result').classList.add('hidden');
+    $('countdown').textContent = '';
+    $('btn-go').classList.add('hidden');
+    this.toggleTeleportModal(false);
+    if (this.map && this.map.visible) this.map.toggle(false);
+
+    this.warp = 1;
+    this.userWarp = 1;
+    this.reqWarpNext = null;
+    this.reqWarpPrev = 1;
+    this.smoke.clear();
+    this.fire.clear();
+
+    // Clear active aliens & supernovas from previous location, and bring deployed astronauts back aboard
+    this.clearDeployedAstronauts(true);
+    for (const a of (this.aliens || [])) {
+      if (a.mesh && a.mesh.parent) a.mesh.parent.remove(a.mesh);
+    }
+    this.aliens = [];
+    this.alienSpawnTimer = 1.2;
+    for (const sn of (this.supernovas || [])) {
+      if (sn.mesh && sn.mesh.parent) sn.mesh.parent.remove(sn.mesh);
+      if (sn.mesh?.userData?.dispose) sn.mesh.userData.dispose();
+    }
+    this.supernovas = [];
+
+    this.arms.forEach((a) => { a.target = 1; a.pivot.rotation.y = 1.3; });
+    this.clamps.forEach((c) => { c.visible = false; });
+    this.focus = P;
+    P.crashed = false;
+    P.dead = false;
+    if (P.root) P.root.visible = true;
+
+    const sunPhi = Math.atan2(SUN_ECI.x, SUN_ECI.y) - 0.35;
+
+    if (target === 'iss') {
+      const d = this.dockGeometry();
+      const backDist = 42;
+      P.s.x = d.portS.x + d.axisS.x * (d.L + backDist);
+      P.s.y = d.portS.y + d.axisS.y * (d.L + backDist);
+      P.s.z = d.portS.z || 0;
+      P.s.vx = d.velS.x;
+      P.s.vy = d.velS.y;
+      P.s.vz = d.velS.z || 0;
+      P.beta = d.beta;
+      P.omega = 0;
+      P.clamped = false;
+      P.landed = null;
+      P.updateFrame(this.simT);
+      P.syncDir3DFromBeta();
+      if (P.holdDir3D) P.holdDir3D.copy(P.dir3D);
+      this.holdBeta = P.beta;
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.lifted = true;
+      this.throttle = 0;
+      P.throttle = 0;
+      P.engineOn = false;
+      this.inAtmoBody = null;
+      this.setFlag('space');
+      this.setFlag('orbit');
+      this.setFlag('near');
+      this.milestone(
+        tr('🛰️ ĐÃ DỊCH CHUYỂN TỚI TRẠM ISS!', '🛰️ TELEPORTED TO ISS!'),
+        tr('Cách cổng ghép nối ISS ~42 m · Dùng phím I/K/J/L/H/N (RCS) để ghép nối', '~42 m from ISS docking port · Use RCS (I/K/J/L/H/N) to dock')
+      );
+      this.event(
+        tr('⚡🛰️ Đã dịch chuyển tức thời tới Trạm Vũ Trụ Quốc Tế (ISS)!', '⚡🛰️ Teleported directly to the International Space Station (ISS)!'),
+        'warn'
+      );
+    } else if (target === 'asteroid_belt' || target === 'kuiper_belt') {
+      const isK = target === 'kuiper_belt';
+      const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+      bodyState('sun', this.simT, bp, bv);
+      const r = isK
+        ? (KUIPER_BELT_INNER + KUIPER_BELT_OUTER) * 0.5
+        : (ASTEROID_BELT_INNER + ASTEROID_BELT_OUTER) * 0.5;
+      // Pick an orbital angle clear of Ceres / Kuiper dwarf planets' SOI
+      let beltAng = sunPhi + 0.92;
+      const checkKeys = isK ? ['pluto', 'haumea', 'makemake', 'eris'] : ['ceres'];
+      for (let guard = 0; guard < 8; guard++) {
+        const tx = bp.x + Math.sin(beltAng) * r;
+        const ty = bp.y + Math.cos(beltAng) * r;
+        const hitBody = checkKeys.some((bk) => {
+          const cp = bodyPos(bk, this.simT);
+          return Math.hypot(tx - cp.x, ty - cp.y) < ((BODIES[bk]?.soi || 5000e3) * 1.3);
+        });
+        if (!hitBody) break;
+        beltAng += 0.65;
+      }
+      const ux = Math.sin(beltAng), uy = Math.cos(beltAng);
+      const ex = uy, ey = -ux;
+      const vCirc = Math.sqrt(BODIES.sun.mu / r);
+      P.s.x = bp.x + ux * r;
+      P.s.y = bp.y + uy * r;
+      P.s.z = bp.z || 0;
+      P.s.vx = bv.x + ex * vCirc;
+      P.s.vy = bv.y + ey * vCirc;
+      P.s.vz = bv.z || 0;
+      P.beta = wrapPi(beltAng + Math.PI / 2);
+      P.omega = 0;
+      P.clamped = false;
+      P.landed = null;
+      P.updateFrame(this.simT);
+      P.syncDir3DFromBeta();
+      if (P.holdDir3D) P.holdDir3D.copy(P.dir3D);
+      this.holdBeta = P.beta;
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.lifted = true;
+      this.throttle = 0;
+      P.throttle = 0;
+      P.engineOn = false;
+      this.inAtmoBody = null;
+      this.setFlag('space');
+      if (isK) {
+        this.milestone(
+          tr('🧊 TIẾN VÀO VÀNH ĐAI KUIPER!', '🧊 ENTERED THE KUIPER BELT!'),
+          tr('Hàng ngàn tảng đá băng bay xung quanh · Nhấn V hoặc click vào đá để bắn vỡ!', 'Thousands of icy boulders all around · Press V or click on boulders to blast them!')
+        );
+        this.event(
+          tr('⚡🧊 Đã dịch chuyển vào Vành đai Kuiper! Nhấn V hoặc click chuột vào các cục đá băng để bắn nổ.', '⚡🧊 Teleported into the Kuiper Belt! Press V or click on icy boulders to shoot and shatter them.'),
+          'warn'
+        );
+      } else {
+        this.milestone(
+          tr('🪨 TIẾN VÀO VÀNH ĐAI TIỂU HÀNH TINH!', '🪨 ENTERED THE MAIN ASTEROID BELT!'),
+          tr('Vành đai đá giữa Sao Hỏa & Sao Mộc · Nhấn V hoặc click vào đá để bắn vỡ!', 'Rocky Asteroid Belt between Mars & Jupiter · Press V or click on rocks to blast them!')
+        );
+        this.event(
+          tr('⚡🪨 Đã dịch chuyển vào Vành đai đá giữa Sao Hỏa và Sao Mộc! Nhấn V hoặc click chuột vào các cục đá để bắn nổ.', '⚡🪨 Teleported into the Asteroid Belt between Mars and Jupiter! Press V or click on asteroids to shoot and shatter them.'),
+          'warn'
+        );
+      }
+    } else if (target === 'oort') {
+      const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+      bodyState('sun', this.simT, bp, bv);
+      const r = (OORT_CLOUD_INNER + OORT_CLOUD_OUTER) * 0.5;
+      const ux = Math.sin(sunPhi), uy = Math.cos(sunPhi);
+      const ex = uy, ey = -ux;
+      const vCirc = Math.sqrt(BODIES.sun.mu / r);
+      P.s.x = bp.x + ux * r;
+      P.s.y = bp.y + uy * r;
+      P.s.z = bp.z || 0;
+      P.s.vx = bv.x + ex * vCirc;
+      P.s.vy = bv.y + ey * vCirc;
+      P.s.vz = bv.z || 0;
+      P.beta = wrapPi(sunPhi + Math.PI / 2);
+      P.omega = 0;
+      P.clamped = false;
+      P.landed = null;
+      P.updateFrame(this.simT);
+      P.syncDir3DFromBeta();
+      if (P.holdDir3D) P.holdDir3D.copy(P.dir3D);
+      this.holdBeta = P.beta;
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.lifted = true;
+      this.throttle = 0;
+      P.throttle = 0;
+      P.engineOn = false;
+      this.inAtmoBody = null;
+      this.setFlag('space');
+      this.setFlag('oortCloud');
+      this.milestone(
+        tr('☄️ TIẾN VÀO ĐÁM MÂY OORT!', '☄️ ENTERED THE OORT CLOUD!'),
+        tr('Vỏ cầu sao chổi băng khổng lồ bao quanh rìa Hệ Mặt Trời (1.120.000 – 1.520.000 km)!', 'Giant 3D spherical shell of icy cometary nuclei surrounding the edge of the Solar System (1,120,000 – 1,520,000 km)!')
+      );
+      this.event(
+        tr('⚡☄️ Tàu đã dịch chuyển tới Đám mây Oort — vùng vỏ cầu sao chổi băng ở rìa Hệ Mặt Trời!', '⚡☄️ Teleported into the Oort Cloud — the spherical icy cometary shell at the edge of the Solar System!'),
+        'warn'
+      );
+    } else if (target === 'interstellar') {
+      const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+      bodyState('sun', this.simT, bp, bv);
+      const r = SUN_SOI * 1.06;
+      const ux = Math.sin(sunPhi), uy = Math.cos(sunPhi);
+      const ex = uy, ey = -ux;
+      const vInter = 16000;
+      P.s.x = bp.x + ux * r;
+      P.s.y = bp.y + uy * r;
+      P.s.z = bp.z || 0;
+      P.s.vx = bv.x + ux * vInter + ex * 2500;
+      P.s.vy = bv.y + uy * vInter + ey * 2500;
+      P.s.vz = bp.z || 0;
+      P.beta = wrapPi(sunPhi);
+      P.omega = 0;
+      P.clamped = false;
+      P.landed = null;
+      P.updateFrame(this.simT);
+      P.syncDir3DFromBeta();
+      if (P.holdDir3D) P.holdDir3D.copy(P.dir3D);
+      this.holdBeta = P.beta;
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.lifted = true;
+      this.throttle = 0;
+      P.throttle = 0;
+      P.engineOn = false;
+      this.inAtmoBody = null;
+      this.setFlag('space');
+      this.setFlag('interstellarSpace');
+      this.milestone(
+        tr('🌌 TIẾN VÀO KHÔNG GIAN LIÊN SAO!', '🌌 ENTERED INTERSTELLAR SPACE!'),
+        tr('Tàu đã vượt qua Đám mây Oort & rìa Hệ Mặt Trời (> 1.560.000 km) · Nơi các Siêu Tân Tinh (Supernova) thi thoảng bùng nổ!', 'Craft passed the Oort Cloud & Solar System boundary (> 1,560,000 km) · Deep space where Supernovas erupt periodically!')
+      );
+      this.event(
+        tr('🌌✨ Tàu đã dịch chuyển tới Không gian Liên sao ngoài Hệ Mặt Trời!', '🌌✨ Teleported into Interstellar Space beyond the Solar System!'),
+        'warn'
+      );
+      this.supernovaSpawnTimer = 900 + Math.random() * 600;
+      this.supernovaDistAcc = 0;
+    } else if (target === 'royal1b') {
+      const r = R_E + (this.startAlt || 0) + 1000000000 * 1000; // 1,000,000,000 km altitude
+      const ux = Math.sin(sunPhi), uy = Math.cos(sunPhi);
+      const ex = uy, ey = -ux;
+      const vInter = 18000;
+      P.s.x = ux * r;
+      P.s.y = uy * r;
+      P.s.z = 0;
+      P.s.vx = ux * vInter + ex * 1500;
+      P.s.vy = uy * vInter + ey * 1500;
+      P.s.vz = 0;
+      P.beta = wrapPi(sunPhi);
+      P.omega = 0;
+      P.clamped = false;
+      P.landed = null;
+      P.updateFrame(this.simT);
+      P.syncDir3DFromBeta();
+      if (P.holdDir3D) P.holdDir3D.copy(P.dir3D);
+      this.holdBeta = P.beta;
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.lifted = true;
+      this.throttle = 0;
+      P.throttle = 0;
+      P.engineOn = false;
+      this.inAtmoBody = null;
+      this.setFlag('space');
+      this.setFlag('interstellarSpace');
+      this.flags.royalAliens1B = false;
+      this.supernovaSpawnTimer = 900 + Math.random() * 600;
+      this.supernovaDistAcc = 0;
+    } else {
+      const isOlympusSummit = target === 'olympus';
+      const isEarthSnow = target === 'earth_snow';
+      const bodyKey = isOlympusSummit ? 'mars' : isEarthSnow ? 'earth' : target;
+      const B = BODIES[bodyKey] || BODIES.earth;
+      const hasAirportOpt = opts && opts.airportIdx !== undefined && !B.gasGiant;
+      const hasHarborOpt = opts && opts.harborIdx !== undefined;
+      const isOrbit = !isOlympusSummit && !isEarthSnow && !hasAirportOpt && !hasHarborOpt && (
+        P.isPlane
+          ? !!B.gasGiant
+          : (mode === 'orbit' || !!B.gasGiant || bodyKey === 'sun')
+      );
+
+      if (isOrbit) {
+        const orbAlt = P.isPlane
+          ? 12e3
+          : bodyKey === 'sun'
+            ? 2200e3
+            : B.gasGiant
+              ? 38e3
+              : bodyKey === 'earth'
+                ? 120e3
+                : Math.max(25e3, (B.atm || 0) + 15e3);
+        if (bodyKey === 'mars') {
+          BODIES.mars.rot0 = wrapPi(sunPhi - OLYMPUS_PSI - BODIES.mars.omega * this.simT);
+        }
+        const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+        bodyState(bodyKey, this.simT, bp, bv);
+        const r = B.R + orbAlt;
+        const vCirc = Math.sqrt(B.mu / r);
+        const ux = Math.sin(sunPhi), uy = Math.cos(sunPhi);
+        const ex = uy, ey = -ux;
+        P.s.x = bp.x + ux * r;
+        P.s.y = bp.y + uy * r;
+        P.s.z = bp.z || 0;
+        P.s.vx = bv.x + ex * vCirc;
+        P.s.vy = bv.y + ey * vCirc;
+        P.s.vz = bv.z || 0;
+        P.beta = wrapPi(sunPhi + Math.PI / 2);
+        P.omega = 0;
+        P.clamped = false;
+        P.landed = null;
+        P.updateFrame(this.simT);
+        P.syncDir3DFromBeta();
+        if (P.holdDir3D) P.holdDir3D.copy(P.dir3D);
+        this.holdBeta = P.beta;
+        this.phase = 'flight';
+        this.ignited = true;
+        this.released = true;
+        this.lifted = true;
+        this.throttle = P.isPlane ? 1 : 0;
+        P.throttle = P.isPlane ? 1 : 0;
+        P.engineOn = !!P.isPlane;
+        const hasAtm = (B.atm || 0) > 0 && bodyKey !== 'ceres' && !(B.parent && B.parent !== 'sun');
+        this.inAtmoBody = (hasAtm && orbAlt < B.atm) ? bodyKey : null;
+        this.moonPatchPsi = null;
+        this.moonPatchBody = null;
+        this.rocksFresh = false;
+        if (bodyKey === 'earth') {
+          this.setFlag('space');
+          this.setFlag('orbit');
+        } else {
+          this.setFlag(bodyKey + 'SOI');
+          this.setFlag(bodyKey === 'moon' ? 'lunarOrbit' : bodyKey + 'Orbit');
+        }
+        const orbKm = fmt(orbAlt / 1000, 0);
+        const parentB = B.parent && B.parent !== 'sun' ? BODIES[B.parent] : null;
+        const parentNoteVi = parentB ? ` · Thân chủ: ${parentB.label}` : '';
+        const parentNoteEn = parentB ? ` · Parent: ${parentB.label}` : '';
+        this.milestone(
+          `${B.icon} ${tr('ĐÃ DỊCH CHUYỂN TỚI', 'TELEPORTED TO')} ${B.label.toUpperCase()}!`,
+          tr(
+            `Đang bay trên quỹ đạo ${B.label}${parentNoteVi} (Độ cao ${orbKm} km · Vận tốc ${fmt(vCirc, 0)} m/s)`,
+            `In orbit around ${B.label}${parentNoteEn} (Altitude ${orbKm} km · Speed ${fmt(vCirc, 0)} m/s)`
+          )
+        );
+        this.event(
+          tr(
+            `⚡${B.icon} Đã dịch chuyển tức thời vào quỹ đạo ${B.label}${parentNoteVi} ở độ cao ${orbKm} km!`,
+            `⚡${B.icon} Teleported into ${B.label} orbit${parentNoteEn} at ${orbKm} km altitude!`
+          ),
+          'warn'
+        );
+      } else {
+        if (P.hasLegs()) {
+          P.legsT = 1;
+          P.legsTarget = 1;
+          P.updateMass();
+          for (const d of this.rocket.deployables) {
+            if (d.type === 'legs') {
+              for (const o of d.objs) if (o.userData.setDeploy) o.userData.setDeploy(1, true);
+            }
+          }
+        }
+        const aIdx = hasAirportOpt ? opts.airportIdx : (isEarthSnow && P.isPlane) ? 1 : (this.selectedAirportBody === bodyKey ? (this.selectedAirportIdx ?? 0) : 0);
+        const hIdx = hasHarborOpt ? opts.harborIdx : (isEarthSnow && P.isBoat) ? 1 : (this.selectedHarborIdx ?? 0);
+        if (bodyKey === 'earth') {
+          const toHarbor = hasHarborOpt || P.isBoat;
+          const toAirport = !toHarbor && (hasAirportOpt || P.isPlane);
+          const toSnowClearing = isEarthSnow && !toHarbor && !toAirport;
+          if (toAirport) {
+            this.selectedAirportBody = 'earth';
+            this.selectedAirportIdx = aIdx;
+          } else if (toSnowClearing) {
+            this.selectedAirportBody = null;
+          }
+          const hSite = toHarbor ? this.getHarborSite(hIdx) : null;
+          const apSite = toAirport ? this.getAirportSite('earth', aIdx) : null;
+          const sx = toHarbor
+            ? (P.isBoat ? hSite.berthX : P.isRover ? (hSite.coastX - 155) : hSite.seawallX)
+            : toAirport
+              ? apSite.sx
+              : toSnowClearing
+                ? -10500
+                : 0;
+          const sz = toHarbor
+            ? hSite.sz
+            : toAirport
+              ? apSite.sz
+              : toSnowClearing
+                ? -6200
+                : 0;
+          const landGroundH = (P.isRover || toSnowClearing) ? this.earthGroundWave(sx, sz, 0.0, toAirport ? 1.0 : 0.0) : 0;
+          const surfHBase = P.isBoat
+            ? -0.35
+            : (toHarbor && !P.isRover)
+              ? 1.5
+              : toAirport
+                ? 0.25
+                : (P.isRover || toSnowClearing)
+                  ? landGroundH
+                  : PAD_TOP;
+          const baseH = surfHBase + P.bottomOffset();
+          P.placeOnSurface('earth', sx, baseH, this.simT);
+          P.s.z = sz;
+          P.heading = toSnowClearing ? (Math.PI * 0.5) : 0;
+          if (P.isPlane) {
+            P.beta = P.phi + Math.PI / 2;
+          }
+          P.updateFrame(this.simT);
+          P.syncDir3DFromBeta();
+          P.clamped = false;
+          P.clampSpot = { body: 'earth', sx, sz, surfH: surfHBase, h: baseH };
+          P.landed = {
+            body: 'earth',
+            sx,
+            sz,
+            surfH: surfHBase,
+            h: baseH,
+            site: toHarbor ? (P.isRover ? 'land' : 'harbor') : toAirport ? 'runway' : (P.isRover || toSnowClearing) ? 'land' : 'pad',
+            how: P.isBoat ? 'boat' : P.isRover ? 'rover' : P.isPlane ? 'plane' : toSnowClearing ? 'landed' : 'pad',
+          };
+          P.landedLock = 0.5;
+          this.startAlt = P.alt;
+          this.inAtmoBody = 'earth';
+        } else {
+          let phiRot;
+          const toAirport = !isOlympusSummit && (hasAirportOpt || P.isPlane) && this.hasSurfaceAirports(bodyKey);
+          if (bodyKey === 'mars') {
+            const offsetM = isOlympusSummit ? 455 : (toAirport ? -2450 : 2260);
+            phiRot = OLYMPUS_PSI - offsetM / B.R;
+            BODIES.mars.rot0 = wrapPi(sunPhi - phiRot - BODIES.mars.omega * this.simT);
+          } else {
+            phiRot = wrapPi(sunPhi - bodyRotation(bodyKey, this.simT));
+          }
+          const baseSx = phiRot * B.R;
+          if (!this.planetAirportOrigins) this.planetAirportOrigins = {};
+          if (!isOlympusSummit && this.hasSurfaceAirports(bodyKey)) {
+            this.planetAirportOrigins[bodyKey] = toAirport ? baseSx : (baseSx + 190);
+          }
+          if (toAirport) {
+            this.selectedAirportBody = bodyKey;
+            this.selectedAirportIdx = aIdx;
+          }
+          const apSite = toAirport ? this.getAirportSite(bodyKey, aIdx) : null;
+          const sx = toAirport ? apSite.sx : baseSx;
+          const sz = toAirport ? apSite.sz : 0;
+          if (toAirport && bodyKey === 'mars') {
+            const apPhiRot = sx / B.R;
+            BODIES.mars.rot0 = wrapPi(sunPhi - apPhiRot - BODIES.mars.omega * this.simT);
+          }
+          const surfH = toAirport
+            ? apSite.h
+            : (B.gasGiant ? 0 : moonHeight(Math.sin(phiRot), Math.cos(phiRot), 0, bodyKey));
+          const h = surfH + (toAirport ? 0.25 : 0) + P.bottomOffset();
+          P.placeOnSurface(bodyKey, sx, h, this.simT);
+          P.s.z = sz;
+          P.heading = 0;
+          if (P.isPlane) {
+            P.beta = P.phi + Math.PI / 2;
+          }
+          P.updateFrame(this.simT);
+          P.syncDir3DFromBeta();
+          P.clamped = false;
+          P.clampSpot = { body: bodyKey, sx, sz, h };
+          P.landed = {
+            body: bodyKey,
+            sx,
+            sz,
+            h,
+            site: toAirport ? 'runway' : bodyKey,
+            how: P.isRover ? 'rover' : P.isPlane ? 'plane' : 'legs',
+          };
+          P.landedLock = 0.6;
+          const hasAtm = (B.atm || 0) > 0 && bodyKey !== 'ceres' && !(B.parent && B.parent !== 'sun');
+          this.inAtmoBody = hasAtm ? bodyKey : null;
+          this.moonPatchPsi = null;
+          this.moonPatchBody = null;
+          this.rocksFresh = false;
+          this.flagSpot = null;
+          this.flagObj.visible = false;
+          this.moonLandT = this.simT - 2.5;
+          this.setFlag(bodyKey + 'SOI');
+          this.setFlag(bodyKey + 'Landed');
+          if (isOlympusSummit) this.flags.olympusSummit = true;
+        }
+        this.holdBeta = P.beta;
+        if (P.holdDir3D && P.dir3D) P.holdDir3D.copy(P.dir3D);
+        this.phase = 'flight';
+        this.ignited = true;
+        this.released = true;
+        this.lifted = true;
+        this.throttle = 0;
+        P.throttle = 0;
+        P.engineOn = false;
+        if (P.isBoat) {
+          P.waterSpeed = 0;
+          this.leftHarborForVoyage = false;
+          const curHId = this.getCurrentHarborId(P) || `earth:${hIdx}`;
+          this.lastVisitedHarborId = curHId;
+          this.visitedHarborIds = new Set([...(this.harborsVisitedSet || []), curHId]);
+        }
+        if (P.isPlane) {
+          P.planeRollSpeed = 0;
+          this.wasAirborneForAirport = false;
+          const curApId = this.getCurrentAirportId(P) || `${bodyKey}:${aIdx}`;
+          this.lastLandedAirportId = curApId;
+          this.visitedAirportIds = new Set([...(this.airportsLandedSet || []), curApId]);
+        }
+        if (P.isRover) P.groundSpeed = 0;
+        this.resetSnowTrackWheelStates();
+        if (hasHarborOpt || (P.isBoat && bodyKey === 'earth')) {
+          this.milestone(
+            `⚓ ${tr(`ĐÃ TỚI CẢNG ${hIdx} — TRÁI ĐẤT!`, `ARRIVED AT HARBOR ${hIdx} — EARTH!`)}`,
+            tr(`Cảng ${hIdx} tại bờ biển Trái Đất · Nhấn W / Space để khởi hành!`, `Harbor ${hIdx} on Earth's coast · Press W / Space to set sail!`)
+          );
+          this.event(
+            tr(`⚓🚢 Đã dịch chuyển tới Cảng ${hIdx} trên Trái Đất!`, `⚓🚢 Teleported to Harbor ${hIdx} on Earth!`),
+            'warn'
+          );
+        } else if (hasAirportOpt || (P.isPlane && this.hasSurfaceAirports(bodyKey))) {
+          this.milestone(
+            `🛫 ${B.icon} ${tr(`ĐÃ TỚI SÂN BAY ${aIdx} — ${B.label.toUpperCase()}!`, `ARRIVED AT AIRPORT ${aIdx} — ${B.label.toUpperCase()}!`)}`,
+            tr(
+              `Sân bay ${aIdx} trên ${B.label} (g = ${B.g.toFixed(2)} m/s² · ρ₀ = ${B.rho0} kg/m³) · Nhấn Space / Shift để cất cánh!`,
+              `Airport ${aIdx} on ${B.label} (g = ${B.g.toFixed(2)} m/s² · ρ₀ = ${B.rho0} kg/m³) · Press Space / Shift to take off!`
+            )
+          );
+          this.event(
+            tr(
+              `🛫${B.icon} Đã dịch chuyển tới Sân bay ${aIdx} trên ${B.label}!`,
+              `🛫${B.icon} Teleported to Airport ${aIdx} on ${B.label}!`
+            ),
+            'warn'
+          );
+        } else if (isEarthSnow) {
+          this.milestone(
+            tr('❄️ ĐÃ ĐẾN KHU TUYẾT TRÁI ĐẤT!', '❄️ ARRIVED AT EARTH SNOW ZONE!'),
+            tr('Đồi tuyết trắng, rừng thông phủ tuyết, người tuyết & mưa tuyết rơi xung quanh!', 'Snowy alpine hills, snow-covered pine forests, snowmen & falling snowflakes all around!')
+          );
+          this.event(
+            tr('⚡❄️ Đã dịch chuyển tới Khu Tuyết trên Trái Đất! Lái xe hoặc bay khám phá rừng thông tuyết trắng.', '⚡❄️ Teleported to Earth\'s Snow Zone! Drive or fly across the snowy pine forest & alpine hills.'),
+            'warn'
+          );
+        } else if (isOlympusSummit) {
+          this.milestone(
+            tr('🌋 ĐÃ ĐÁP LÊN ĐỈNH OLYMPUS MONS (21,9 KM)!', '🌋 LANDED ON OLYMPUS MONS SUMMIT (21.9 KM)!'),
+            tr('Đỉnh núi lửa cao nhất Hệ Mặt Trời trên Sao Hỏa · Miệng núi lửa Caldera rực lửa ngay phía trước!', 'Tallest volcano in the Solar System on Mars · Glowing Caldera crater right ahead!')
+          );
+          this.event(
+            tr('⚡🌋 Đã dịch chuyển trực tiếp lên Đỉnh núi lửa Olympus Mons (21,9 km) trên Sao Hỏa!', '⚡🌋 Teleported directly onto the Summit Rim of Olympus Mons (21.9 km) on Mars!'),
+            'warn'
+          );
+        } else if (bodyKey === 'mars') {
+          this.milestone(
+            `${B.icon} ${tr('ĐÃ ĐÁP XUỐNG SAO HỎA — CHÂN NÚI OLYMPUS MONS!', 'LANDED ON MARS — OLYMPUS MONS BASE!')}`,
+            tr(
+              `Núi lửa Olympus Mons (cao 21,9 km) sừng sững ngay phía trước · Nhấn Space / Z hoặc lái xe lên đỉnh!`,
+              `Olympus Mons volcano (21.9 km tall) towers right ahead · Press Space / Z or drive up to the summit!`
+            )
+          );
+          this.event(
+            tr(
+              `⚡🌋 Đã đáp xuống chân núi lửa Olympus Mons trên Sao Hỏa (g = ${B.g.toFixed(2)} m/s²)! Ngọn núi lửa lớn nhất Hệ Mặt Trời đang ở ngay trước mặt bạn!`,
+              `⚡🌋 Landed at the base of Olympus Mons on Mars (g = ${B.g.toFixed(2)} m/s²)! The Solar System's largest volcano towers right ahead!`
+            ),
+            'warn'
+          );
+        } else {
+          const parentB = B.parent && B.parent !== 'sun' ? BODIES[B.parent] : null;
+          const parentNoteVi = parentB ? `Thân chủ: ${parentB.label} · ` : '';
+          const parentNoteEn = parentB ? `Parent: ${parentB.label} · ` : '';
+          this.milestone(
+            `${B.icon} ${tr('ĐÃ ĐÁP XUỐNG', 'LANDED ON')} ${B.label.toUpperCase()}!`,
+            tr(
+              `${parentNoteVi}Trọng lực bề mặt: ${B.g.toFixed(2)} m/s² · Nhấn Space / Z / Shift để cất cánh!`,
+              `${parentNoteEn}Surface gravity: ${B.g.toFixed(2)} m/s² · Press Space / Z / Shift to lift off!`
+            )
+          );
+          this.event(
+            tr(
+              `⚡${B.icon} Đã dịch chuyển tức thời tới bề mặt ${B.label} (${parentNoteVi}g = ${B.g.toFixed(2)} m/s²)! Nhấn Space hoặc Z để phóng lên!`,
+              `⚡${B.icon} Teleported to the surface of ${B.label} (${parentNoteEn}g = ${B.g.toFixed(2)} m/s²)! Press Space or Z to launch!`
+            ),
+            'warn'
+          );
+        }
+      }
+    }
+
+    const rh = this.rocketHeight || 20;
+    this.camMode = 0;
+    this.controls.enabled = true;
+    this.camera.fov = 50;
+    this.camera.updateProjectionMatrix();
+    if ((target === 'mars' || target === 'olympus') && mode !== 'orbit') {
+      // Frame the vessel with Olympus Mons (or its Summit Caldera) towering in the +X background!
+      if (P.isRover || P.isBoat) {
+        this.camera.position.set(-14, 4.8, 3.5);
+      } else if (P.isPlane) {
+        this.camera.position.set(-18, 5.2, 8);
+      } else {
+        this.camera.position.set(-(rh * 0.85 + 16), 5.5, rh * 0.55 + 10);
+      }
+    } else if (P.isRover || P.isBoat) {
+      this.camera.position.set(-13, 4.5, 0);
+    } else if (P.isPlane) {
+      this.camera.position.set(12, 4, 16);
+    } else if (target === 'royal1b') {
+      this.camera.position.set(rh * 0.8 + 52, 18, rh * 1.4 + 92);
+    } else {
+      this.camera.position.set(rh * 0.68 + 12, 3.5, rh * 1.18 + 20);
+    }
+    this.controls.target.set(0, 1.5, 0);
+    this.controls.update();
+    this.mapT = 0;
+    this.updateTeleportActiveButtons(target);
+
+    // Immediately populate an initial wave of Aliens proportional to distance from Earth (unless Aliens are disabled)
+    if (!this.aliensDisabled && !(P.ref === 'earth' && P.alt < ATM_TOP)) {
+      if (target === 'royal1b') {
+        this.setFlag('royalAliens1B');
+        const spawnedKing = this.spawnRoyalAlien('king');
+        const spawnedQueen = this.spawnRoyalAlien('queen');
+        if (spawnedKing || spawnedQueen) {
+          this.milestone(
+            tr('👑👸 ALIEN VUA & ALIEN HOÀNG HẬU XUẤT HIỆN!', '👑👸 ALIEN KING & ALIEN QUEEN HAVE APPEARED!'),
+            tr('Đạt độ cao 1.000.000.000 km! Hai siêu trùm khổng lồ Alien Vua (100.000 HP) và Alien Hoàng Hậu (90.500 HP) đã xuất hiện!', 'Reached 1,000,000,000 km altitude! Colossal Alien King (100,000 HP) & Alien Queen (90,500 HP) have emerged!')
+          );
+          this.event(
+            tr('👑👸🚨 Đạt độ cao 1.000.000.000 km! ALIEN VUA (100.000 HP) và ALIEN HOÀNG HẬU (90.500 HP) khổng lồ đã xuất hiện! Nhấn V hoặc click chuột để bắn!', '👑👸🚨 Reached 1,000,000,000 km altitude! Colossal ALIEN KING (100,000 HP) & ALIEN QUEEN (90,500 HP) have appeared! Press V or click to fire!'),
+            'warn'
+          );
+        } else {
+          this.event(
+            tr('👑👸 Đã tới độ cao 1.000.000.000 km (Alien Vua & Hoàng Hậu đã bị tiêu diệt vĩnh viễn).', '👑👸 Reached 1,000,000,000 km altitude (Alien King & Queen have already been permanently defeated).')
+          );
+        }
+      }
+      const density = this.getAlienDensityConfig();
+      const initialWave = Math.min(10, Math.max(1, Math.ceil(density.maxConcurrentAliens * 0.45)));
+      for (let i = 0; i < initialWave; i++) {
+        this.spawnAlien(density);
+      }
+      this.alienSpawnTimer = density.spawnInterval * 0.5;
+    }
+  }
+
+  setWarp(d) {
+    if (this.phase === 'crashed' || this.player?.crashed) return;
+    const cur = this.userWarp || this.warp || 1;
+    let i = WARPS.findIndex((w) => w >= cur);
+    if (i < 0) i = WARPS.length - 1;
+    i = Math.max(0, Math.min(WARPS.length - 1, i + d));
+    this.warp = WARPS[i];
+    this.userWarp = this.warp;
+    this.event(tr(`⏩ Tốc độ tua thời gian: ${fmt(this.warp)}×`, `⏩ Time Warp: ${fmt(this.warp)}×`));
+  }
+
+  cycleCam() {
+    if (this.camMode === 0) this.savedOffset = this.camera.position.clone();
+    this.camMode = (this.camMode + 1) % this.camModes.length;
+    this.controls.enabled = this.camMode === 0;
+    if (this.camMode === 0) {
+      this.camera.fov = 50; this.camera.updateProjectionMatrix();
+      this.camera.position.copy(this.savedOffset || new THREE.Vector3(30, 5, 60));
+    }
+    this.cineAngle = Math.atan2(this.camera.position.z, this.camera.position.x);
+  }
+
+  layoutEventsBox() {
+    const box = $('events');
+    if (!box) return;
+    const mp = $('mission-panel');
+    const hudLeft = document.querySelector('#launch-ui .hud-left');
+    if (window.innerWidth > 760 && window.innerHeight > 520 && mp) {
+      if (hudLeft && hudLeft.offsetHeight > 0) {
+        mp.style.top = `${hudLeft.offsetTop + hudLeft.offsetHeight + 8}px`;
+      } else {
+        mp.style.top = '';
+      }
+      const anchor = (!mp.classList.contains('hidden') && mp.offsetHeight > 0) ? mp : hudLeft;
+      const topBound = anchor && anchor.offsetHeight > 0
+        ? anchor.getBoundingClientRect().bottom + 10
+        : 320;
+      const bottomBound = window.innerHeight - 64;
+      const maxH = Math.max(0, bottomBound - topBound);
+      box.style.maxHeight = `${maxH}px`;
+      while (box.children.length > 0 && box.scrollHeight > maxH) {
+        box.lastChild.remove();
+      }
+    } else {
+      if (mp) mp.style.top = '';
+      box.style.maxHeight = '';
+    }
+  }
+
+  event(text, cls = '') {
+    const box = $('events');
+    const d = document.createElement('div');
+    d.className = 'ev ' + cls;
+    const t = this.met;
+    const s = `T${t < 0 ? '-' : '+'}${String(Math.floor(Math.abs(t) / 60)).padStart(2, '0')}:${String(Math.floor(Math.abs(t)) % 60).padStart(2, '0')}`;
+    d.innerHTML = `<span class="t">${s}</span>${text}`;
+    box.prepend(d);
+    while (box.children.length > 4) box.lastChild.remove();
+    this.layoutEventsBox();
+    setTimeout(() => {
+      if (d.parentNode) d.remove();
+    }, 8000);
+  }
+
+  milestone(big, small) {
+    const m = $('milestone');
+    m.innerHTML = `<div class="m1">${big}</div><div class="m2">${small || ''}</div>`;
+    m.classList.add('show');
+    clearTimeout(this.msTimer);
+    this.msTimer = setTimeout(() => m.classList.remove('show'), 4500);
+  }
+
+
+  // =================================================================== SITES (LZ, ship, ISS, flag)
+  initSites() {
+    this.lz = createLandingZone();
+    this.lz.position.set(LZ_X, 0, 0);
+    this.world.add(this.lz);
+    this.ship = createDroneShip();
+    this.ship.visible = false;
+    this.shipX = null;
+    this.world.add(this.ship);
+    this.flagObj = createFlag();
+    this.flagObj.visible = false;
+    this.scene.add(this.flagObj);
+    this.flagSpot = null;
+    this.olympusMons = createOlympusMonsLandmarks();
+    this.scene.add(this.olympusMons.group);
+    this.ceresBelt = createCeresAsteroidBelt();
+    this.scene.add(this.ceresBelt);
+    this.asteroidSpaceField = createBeltSpaceField('asteroid');
+    this.scene.add(this.asteroidSpaceField);
+    this.kuiperBelt = createKuiperBeltCanopy();
+    this.scene.add(this.kuiperBelt);
+    this.kuiperSpaceField = createBeltSpaceField('kuiper');
+    this.scene.add(this.kuiperSpaceField);
+    this.oortCloud = createOortCloudCanopy();
+    this.scene.add(this.oortCloud);
+    this.rockFragments = [];
+    this.issOrbit = new RailOrbit(ISS_R, -0.3);
+    this.iss = createISS();
+    this.iss.visible = false;
+    this.scene.add(this.iss);
+    this.issPortLocal = this.iss.userData.port.position.clone();
+    // static scenery bends with planetary curvature (same math as the ground shader)
+    this.worldStatic = this.world.children.filter((c) => c !== this.ground && c !== this.clouds && c !== this.snowTrackMesh);
+    const seen = new Set();
+    for (const c of this.worldStatic) c.traverse((o) => {
+      if (!o.material) return;
+      for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+        if (seen.has(m)) continue; seen.add(m);
+        const prev = m.onBeforeCompile;
+        m.onBeforeCompile = (sh, r) => {
+          if (prev) prev.call(m, sh, r);
+          sh.uniforms.uBend = this.groundUniforms.uBend;
+          sh.vertexShader = 'uniform float uBend;\n' + sh.vertexShader.replace('#include <project_vertex>', `
+            vec4 mvPosition = vec4( transformed, 1.0 );
+            #ifdef USE_INSTANCING
+              mvPosition = instanceMatrix * mvPosition;
+            #endif
+            vec4 wpB = modelMatrix * mvPosition;
+            wpB.y -= dot(wpB.xz, wpB.xz) * uBend;
+            mvPosition = viewMatrix * wpB;
+            gl_Position = projectionMatrix * mvPosition;`);
+        };
+        m.customProgramCacheKey = () => 'bend';
+      }
+    });
+  }
+
+  // =================================================================== PERSISTENT SPACE OBJECTS
+  isUfoKingName(name) {
+    if (!name || typeof name !== 'string') return false;
+    return /ufo\s*vua|king\s*ufo|đĩa\s*bay\s*ufo\s*vua/i.test(name.normalize('NFC'));
+  }
+
+  vesselHasUfoPart(v) {
+    if (!v || !v.ctx?.segs || !v.ctx?.stack) return false;
+    return (v.segIdx || []).some((k) => (v.ctx.segs[k] || []).some((idx) => isUfoPart(v.ctx.stack[idx]?.type)));
+  }
+
+  hasRoyalUfoEngine(v = this.player) {
+    if (!v || !v.ctx?.segs || !v.ctx?.stack) return false;
+    return (v.segIdx || []).some((k) => (v.ctx.segs[k] || []).some((idx) => {
+      const it = v.ctx.stack[idx];
+      return it && (isRoyalUfoPart(it.type) || (Array.isArray(it.attach) && it.attach.some(isRoyalUfoPart)));
+    }));
+  }
+
+  getUfoEngineMode(v = this.player) {
+    if (!v || !v.ctx?.segs || !v.ctx?.stack) return 'antigrav';
+    const actSeg = v.activeSeg;
+    if (v.ctx.segInfo?.[actSeg]?.hasRoyalUfo) {
+      return v.ctx.segInfo[actSeg].ufoEngineMode === 'laser' ? 'laser' : 'antigrav';
+    }
+    for (const k of (v.segIdx || [])) {
+      if (v.ctx.segInfo?.[k]?.hasRoyalUfo) {
+        return v.ctx.segInfo[k].ufoEngineMode === 'laser' ? 'laser' : 'antigrav';
+      }
+    }
+    return 'antigrav';
+  }
+
+  toggleUfoEngineMode() {
+    const P = this.player;
+    if (!P || P.dead || P.crashed || !this.hasRoyalUfoEngine(P)) return;
+    const nextMode = this.getUfoEngineMode(P) === 'laser' ? 'antigrav' : 'laser';
+    for (const it of (this.stack || [])) {
+      if (isRoyalUfoPart(it.type) || (Array.isArray(it.attach) && it.attach.some(isRoyalUfoPart))) {
+        it.ufoEngineMode = nextMode;
+      }
+    }
+    if (this.app?.build?.stack) {
+      let buildChanged = false;
+      for (const bit of this.app.build.stack) {
+        if (isRoyalUfoPart(bit.type) || (Array.isArray(bit.attach) && bit.attach.some(isRoyalUfoPart))) {
+          bit.ufoEngineMode = nextMode;
+          buildChanged = true;
+        }
+      }
+      if (buildChanged && this.app.build.saveStack) this.app.build.saveStack();
+    }
+    if (this.segs && this.segInfo) {
+      for (let k = 0; k < this.segs.length; k++) {
+        this.segInfo[k] = segmentInfo(this.stack, this.segs[k]);
+      }
+    }
+    if (this.rocket?.nozzles) {
+      for (const nz of this.rocket.nozzles) {
+        if (nz.switchableUfoEngine) applyNozzleUfoMode(nz, nextMode);
+      }
+    }
+    audio.beep(nextMode === 'laser' ? 1040 : 660, 0.14, 0.25);
+    this.hudTimer = 0;
+    this.updateHUD(0);
+  }
+
+  vesselIsUfoKing(v, fallbackName = '') {
+    if (v?.ctx?.segs && v?.ctx?.stack) {
+      const hasKingPart = (v.segIdx || []).some((k) => (v.ctx.segs[k] || []).some((idx) => v.ctx.stack[idx]?.type === 'ufoKing'));
+      if (hasKingPart) return true;
+    }
+    return this.isUfoKingName(fallbackName || v?.label || '');
+  }
+
+  /** Purge saved UFO Vua clones from persistent storage so there is only 1 King UFO on the map */
+  sanitizeSpaceObjectsForSingleUfoKing() {
+    if (!Array.isArray(this.spaceObjects) || !this.spaceObjects.length) return;
+    const before = this.spaceObjects.length;
+    this.spaceObjects = this.spaceObjects.filter((obj) => !obj?.isUfoKing && !this.isUfoKingName(obj?.name));
+    if (this.spaceObjects.length !== before) {
+      this.saveSpaceObjects();
+    }
+  }
+
+  saveSpaceObjects() {
+    try { localStorage.setItem('rf-space-objects', JSON.stringify(this.spaceObjects)); } catch { /* ignore */ }
+  }
+
+  /** Ensure a vessel in outer space has a non-decaying closed orbit around its reference body */
+  stabilizeSpaceVessel(v) {
+    const B = v.body || bodyInfo(v.ref);
+    const minSafeR = B.R + Math.max((B.atm || 0) + 12000, v.ref === 'earth' ? 78000 : 12000);
+    const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+    bodyState(v.ref, this.simT, bp, bv);
+    if (v.rRel.r < minSafeR) {
+      v.s.x = bp.x + v.up.x * minSafeR;
+      v.s.y = bp.y + v.up.y * minSafeR;
+      v.updateFrame(this.simT);
+    }
+    const el = vesselElements(v);
+    if (el.pe < minSafeR || el.e >= 0.92 || !isFinite(el.a)) {
+      const rNow = Math.max(v.rRel.r, minSafeR);
+      const vCirc = Math.sqrt(B.mu / rNow);
+      const sign = v.vOrb.e >= -15 ? 1 : -1;
+      v.s.vx = bv.x + v.east.x * vCirc * sign;
+      v.s.vy = bv.y + v.east.y * vCirc * sign;
+      v.updateFrame(this.simT);
+    }
+  }
+
+  /** Save any in-space rockets or separated stages to persistent orbital storage across launches */
+  archiveSpaceVessels() {
+    this.sanitizeSpaceObjectsForSingleUfoKing();
+    if (!this.vessels || !this.vessels.length) return;
+    let changed = false;
+    for (const v of this.vessels) {
+      if (!v || v.dead || v.crashed || v.archived || v.clamped) continue;
+      const inSpace = v.ref !== 'earth' || v.alt >= 45000 || v.orbitStabilized || v.destinedForSpace;
+      if (!inSpace) continue;
+      if (v === this.player && v.landed && v.ref === 'earth') continue;
+      v.archived = true;
+      const isPlayer = v === this.player;
+      const rawName = v.label || (isPlayer ? tr(`Tên lửa #${(this.launchCounter || 0) + 1}`, `Rocket #${(this.launchCounter || 0) + 1}`) : '');
+      // Never persist UFO Vua clones into spaceObjects so only 1 King UFO exists on the map
+      if (this.vesselIsUfoKing(v, rawName)) continue;
+      this.stabilizeSpaceVessel(v);
+      const el = vesselElements(v);
+      if (isPlayer) this.launchCounter = (this.launchCounter || 0) + 1;
+      const name = v.label || (isPlayer ? tr(`Tên lửa #${this.launchCounter}`, `Rocket #${this.launchCounter}`) : tr(`Tầng tách #${++this.stageCounter}`, `Separated Stage #${++this.stageCounter}`));
+      this.spaceObjects.push({
+        id: v.mapId || ('pers_' + Date.now() + '_' + Math.floor(Math.random() * 10000)),
+        name,
+        kind: isPlayer ? 'vessel' : 'stage',
+        isUfo: this.vesselHasUfoPart(v),
+        ref: v.ref || 'earth',
+        a: isFinite(el.a) && el.a > 0 ? el.a : v.rRel.r,
+        e: isFinite(el.e) && el.e < 0.85 ? el.e : 0.005,
+        argPe: isFinite(el.argPe) ? el.argPe : v.phi,
+        nu0: isFinite(el.nu) ? el.nu : 0,
+        hSign: el.h <= 0 ? 1 : -1,
+        t0: this.simT,
+        beta: v.beta,
+      });
+      changed = true;
+    }
+    if (changed) this.saveSpaceObjects();
+  }
+
+  /** Evaluate position, altitude, velocity & orbital elements of a persisted space object at time t */
+  evalSpaceObject(obj, t) {
+    const B = BODIES[obj.ref] || BODIES.earth;
+    const a = Math.max(obj.a || (B.R + 100e3), B.R + 20e3);
+    const e = clamp(obj.e || 0, 0, 0.88);
+    const period = Math.PI * 2 * Math.sqrt(a ** 3 / B.mu);
+    const n = (Math.PI * 2) / period;
+    const E0 = 2 * Math.atan(Math.sqrt((1 - e) / (1 + e)) * Math.tan((obj.nu0 || 0) / 2));
+    const M0 = E0 - e * Math.sin(E0);
+    const M = M0 + n * (t - (obj.t0 || 0));
+    let E = M;
+    for (let k = 0; k < 4; k++) {
+      E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+    }
+    const nu = 2 * Math.atan2(Math.sqrt(1 + e) * Math.sin(E / 2), Math.sqrt(1 - e) * Math.cos(E / 2));
+    const p = a * (1 - e * e);
+    const r = p / (1 + e * Math.cos(nu));
+    const hSign = obj.hSign || 1;
+    const th = (obj.argPe || 0) + hSign * nu;
+    const bp = bodyPos(obj.ref || 'earth', t);
+    const x = bp.x + r * Math.sin(th);
+    const y = bp.y + r * Math.cos(th);
+    const z = bp.z || 0;
+    const alt = r - B.R;
+    const speedOrb = Math.sqrt(Math.max(0, B.mu * (2 / r - 1 / a)));
+    const beta = th + (hSign > 0 ? Math.PI / 2 : -Math.PI / 2);
+    return {
+      x, y, z, alt, speedOrb, beta,
+      el: { a, e, argPe: obj.argPe || 0, pe: a * (1 - e), ap: a * (1 + e), period },
+    };
+  }
+
+  /** Delete a persistent or active space object by ID when requested by the player on the Map */
+  deleteSpaceObject(id) {
+    if (!id) return;
+    const idx = this.spaceObjects.findIndex((o) => o.id === id);
+    if (idx !== -1) {
+      const [removed] = this.spaceObjects.splice(idx, 1);
+      this.saveSpaceObjects();
+      this.event(tr(`🗑️ Đã xóa "${removed.name}" khỏi vũ trụ.`, `🗑️ Deleted "${removed.name}" from space.`));
+      if (this.map.visible) this.updateMap();
+      return;
+    }
+    const v = this.vessels.find((vv) => vv !== this.player && !vv.dead && (vv.mapId === id || ('live_' + vv.id) === id));
+    if (v) {
+      v.dead = true;
+      v.archived = true;
+      if (v.root && v.root.parent) v.root.parent.remove(v.root);
+      this.vessels = this.vessels.filter((vv) => vv !== v);
+      if (this.focus === v) this.focus = this.player;
+      this.event(tr(`🗑️ Đã xóa "${v.label || tr('Tầng tách', 'Separated Stage')}" khỏi vũ trụ.`, `🗑️ Deleted "${v.label || 'Separated Stage'}" from space.`));
+      if (this.map.visible) this.updateMap();
+      return;
+    }
+    if (id === 'vessel' && this.player && !this.player.clamped) {
+      this.player.archived = true;
+      this.event(tr('🗑️ Đã xóa tên lửa hiện tại khỏi vũ trụ.', '🗑️ Deleted current rocket from space.'));
+      this.map.toggle(false);
+      this.app.goBuild();
+    }
+  }
+
+  // =================================================================== SETUP
+  setup(stack, missionId) {
+    this.archiveSpaceVessels();
+    this.stack = stack;
+    this.mission = missionById(missionId || this.app.missionId || 'free');
+    // free GPU buffers of the previous rocket, its separated stages, plumes & debris (they leaked on every relaunch)
+    const freeGPU = (root) => {
+      if (!root) return;
+      root.traverse((o) => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material && o.material.isShaderMaterial) [].concat(o.material).forEach((m) => m.dispose());
+      });
+    };
+    const roots = new Set();
+    for (const v of this.vessels) if (v.root) roots.add(v.root);
+    if (this.rocket) roots.add(this.rocket.root);
+    for (const d of this.debris) if (d.obj) roots.add(d.obj);
+    for (const r of roots) { r.parent && r.parent.remove(r); freeGPU(r); }
+    for (const a of (this.aliens || [])) { if (a.mesh && a.mesh.parent) a.mesh.parent.remove(a.mesh); }
+    for (const b of (this.weaponBeams || [])) { if (b.mesh && b.mesh.parent) b.mesh.parent.remove(b.mesh); }
+    for (const rf of (this.rockFragments || [])) {
+      if (rf.mesh && rf.mesh.parent) rf.mesh.parent.remove(rf.mesh);
+    }
+    for (const sn of (this.supernovas || [])) {
+      if (sn.mesh && sn.mesh.parent) sn.mesh.parent.remove(sn.mesh);
+      if (sn.mesh?.userData?.dispose) sn.mesh.userData.dispose();
+    }
+    this.aliens = []; this.weaponBeams = []; this.rockFragments = []; this.supernovas = [];
+    this.lastClickedRock = null;
+    this.resetAllBeltRocks();
+    this.alienSpawnTimer = 1.0; this.weaponCooldown = 0; this.firingHeld = false;
+    this.supernovaSpawnTimer = 900 + Math.random() * 600;
+    this.supernovaDistAcc = 0;
+    this.supernovaDistNext = 2400 + Math.random() * 2800;
+    this.lastSupernovaRef = 'earth';
+    this.inAtmoBody = 'earth';
+    this.debris = []; this.vessels = [];
+    this.smoke.clear(); this.fire.clear();
+    $('events').innerHTML = '';
+    $('result').classList.add('hidden');
+
+    const isPlaneStack = stack.some((it) => it.type.includes('Plane') || it.attach.some((a) => a.includes('Plane')) || it.type === 'engJet');
+    if (isPlaneStack && !stack.some((it) => it.attach.includes('gearPlane'))) {
+      const target = stack.find((it) => it.type === 'fuselagePlane') || stack.find((it) => it.type === 'cockpitPlane') || stack[0];
+      if (target) target.attach.push('gearPlane');
+    }
+    const isBoatStack = stack.some((it) => it.type.includes('Boat') || it.attach.some((a) => a.includes('Boat')));
+    if (isBoatStack) {
+      for (const it of stack) {
+        if (Array.isArray(it.attach)) {
+          it.attach = it.attach.filter((a) => a !== 'gunLaser' && a !== 'waterCannon' && a !== 'gunAcid' && a !== 'gunElectric');
+        }
+      }
+      if (!stack.some((it) => it.attach.includes('solarPanel') || it.attach.includes('solarRover'))) {
+        const target = stack.find((it) => it.type === 'hullBoat' || it.type === 'hullSailBoat')
+          || stack.find((it) => it.type === 'cabinBoat' || it.type === 'cabinSailBoat')
+          || stack[0];
+        if (target) target.attach.push('solarPanel');
+      }
+    }
+    this.rocket = buildRocket(stack);
+    this.scene.add(this.rocket.root);
+    this.segs = segments(stack);
+    this.segInfo = this.segs.map((idx) => segmentInfo(stack, idx));
+    this.lay = layout(stack);
+    this.fuel = this.segInfo.map((s) => s.fuel);
+    this.fuelMax = this.segInfo.map((s) => s.fuel);
+    for (const b of this.rocket.boosters) b.fuelMax = b.fuel;
+    this.ctx = { stack, lay: this.lay, segs: this.segs, segInfo: this.segInfo, fuel: this.fuel, fuelMax: this.fuelMax, rocket: this.rocket };
+    this.plumes = this.rocket.nozzles.map((nz) => {
+      const p = createPlume(nz.r, nz.booster ? 1.3 : 1.0, Math.random(), nz.style || 'default', !!nz.switchableUfoEngine);
+      nz.node.add(p.group);
+      return { ...p, nz, heat: 0, prev: null };
+    });
+    this.rocketHeight = this.lay.height;
+    BoosterRecovery.steerSign = -1;
+
+    this.simT = this.simT || 0;
+    this.player = new Vessel(this.ctx, this.segs.map((_, k) => k), this.rocket.root, 'player');
+    this.player.label = this.app?.build?.getRocketName?.() || tr('Tên Lửa #1', 'Rocket #1');
+    if (this.app?.build?.syncRocketNameUI) this.app.build.syncRocketNameUI();
+    this.vessels = [this.player];
+    this.focus = this.player;
+
+    if (this.pad) this.pad.visible = !this.player.isPlane && !this.player.isRover;
+    if (this.airport) this.airport.visible = !!this.player.isPlane;
+    if (this.harbor) this.harbor.visible = !this.player.isPlane && !this.player.isRover;
+    if (this.groundUniforms) {
+      if (this.groundUniforms.uShowPad) this.groundUniforms.uShowPad.value = (this.player.isPlane || this.player.isRover) ? 0.0 : 1.0;
+      if (this.groundUniforms.uShowAirport) this.groundUniforms.uShowAirport.value = this.player.isPlane ? 1.0 : 0.0;
+    }
+    this.randomizeGroundWaves();
+    this.syncAirportFlatGround(!!this.player.isPlane);
+    this.updatePlaneTeleportUI();
+
+    const isUfoWithLegs = (stack || []).some((s) => isUfoPart(s.type)) && this.player.hasLegs();
+    if (this.player.isBoat) {
+      const harborX = COAST_X + 160;
+      this.player.heading = 0;
+      this.player.waterSpeed = 0;
+      this.player.boatDistTotal = 0;
+      this.player.boatDistByBody = {};
+      this.player.placeOnSurface('earth', harborX, this.player.bottomOffset() - 0.35, this.simT);
+      this.player.clamped = false;
+      this.player.clampSpot = { body: 'earth', sx: harborX, h: this.player.bottomOffset() - 0.35 };
+      this.player.landed = { body: 'earth', sx: harborX, h: this.player.bottomOffset() - 0.35, site: 'harbor', how: 'boat' };
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.met = 0;
+      const isSailBoatStack = stack.some((it) => it.type.includes('SailBoat') || it.attach.some((a) => a.includes('SailBoat')));
+      this.event(isSailBoatStack
+        ? tr('⛵⚡ Thuyền nhỏ đã xuất hiện tại Cảng 0 sẵn sàng xuất bến! Nhấn W/S hoặc tăng ga để lướt sóng ra khơi, A/D bẻ lái.', '⛵⚡ Small Boat moored at Harbor 0 ready to depart! Press W/S or throttle up to cruise out to sea, A/D to steer.')
+        : tr('🛥️⚓ Thuyền to đã xuất hiện tại Cảng 0 sẵn sàng xuất bến! Nhấn W/S hoặc tăng ga để rời Cảng 0 ra khơi, A/D bẻ lái.', '🛥️⚓ Big Boat moored at Harbor 0 ready to depart! Press W/S or throttle up to sail out of Harbor 0, A/D to steer.'));
+    } else if (this.player.isRover) {
+      const roverX = 0;
+      const surfH = this.earthGroundWave(roverX, 0, 0.0, 0.0) + this.player.bottomOffset();
+      this.player.heading = Math.PI;
+      this.player.groundSpeed = 0;
+      this.player.roverDistTotal = 0;
+      this.player.roverDistByBody = {};
+      this.player.placeOnSurface('earth', roverX, surfH, this.simT);
+      this.player.clamped = false;
+      this.player.clampSpot = { body: 'earth', sx: roverX, h: surfH };
+      this.player.landed = { body: 'earth', sx: roverX, h: surfH, site: 'land', how: 'rover' };
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.met = 0;
+      this.event(tr('🚙 Xe Rover đã sẵn sàng! Nhấn W/S để chạy tiến/lùi, A/D để quẹo trái/phải.', '🚙 Planetary Rover ready! Press W/S to drive forward/reverse, A/D to steer left/right.'));
+    } else if (this.player.isPlane) {
+      this.player.legsT = 1;
+      this.player.legsTarget = 1;
+      this.player.planeRollSpeed = 0;
+      this.player.planeDistTotal = 0;
+      this.player.planeDistByBody = {};
+      const ap0 = this.getAirportSite('earth', 0);
+      const rwyH = 0.25 + this.player.bottomOffset();
+      this.player.placeOnSurface('earth', ap0.sx, rwyH, this.simT);
+      this.player.s.z = ap0.sz;
+      this.player.beta = this.player.phi + Math.PI / 2;
+      this.player.updateFrame(this.simT);
+      this.player.syncDir3DFromBeta();
+      this.player.clamped = false;
+      this.player.clampSpot = { body: 'earth', sx: ap0.sx, sz: ap0.sz, h: rwyH };
+      this.player.landed = { body: 'earth', sx: ap0.sx, sz: ap0.sz, h: rwyH, site: 'runway', how: 'plane' };
+      this.phase = 'flight';
+      this.ignited = true;
+      this.released = true;
+      this.met = 0;
+      this.event(tr('✈️ Tiêm kích phản lực đã xuất hiện tại Sân bay 0! Bánh đáp đã bật sẵn — tăng ga bằng Shift / Z / Space để chạy đà, nhấn W để bay lên, S để bay xuống, A/D để quẹo trái/phải.', '✈️ Fighter Jet ready at Airport 0! Landing gear deployed — throttle up with Shift / Z / Space to roll, press W to pitch up, S to pitch down, A/D to turn left/right.'));
+    } else {
+      if (isUfoWithLegs) {
+        this.player.legsT = 1;
+        this.player.legsTarget = 1;
+      }
+      const padH = PAD_TOP + this.player.bottomOffset();
+      this.player.placeOnSurface('earth', 0, padH, this.simT);
+      this.player.clamped = true;
+      this.player.clampSpot = { body: 'earth', sx: 0, surfH: PAD_TOP, h: padH };
+      this.phase = 'ready';
+      this.met = -10;
+    }
+
+    const startThrottle = (this.player.isBoat || this.player.isPlane || this.player.isRover) ? 0 : 1;
+    this.player.engineOn = false; this.player.throttle = startThrottle;
+    this.startAlt = this.player.alt;
+    this.buildArms(this.rocketHeight);
+    if (this.player.isBoat || this.player.isRover || this.player.isPlane || isUfoWithLegs) {
+      this.arms.forEach((a) => (a.target = 1));
+      this.clamps.forEach((c) => { c.visible = false; });
+    }
+    for (const d of this.rocket.deployables) {
+      const initDeploy = ((this.player.isPlane || isUfoWithLegs) && d.type === 'legs') ? 1 : 0;
+      for (const o of d.objs) {
+        if (o.userData.setDeploy) {
+          o.userData._dt = initDeploy;
+          o.userData.setDeploy(initDeploy, true);
+        }
+      }
+    }
+
+    this.throttle = startThrottle; this.joyX = 0; this.joyY = 0; this.sas = true; this.sasMode = 0; this.warp = 1; this.userWarp = 1; this.autoWarp = 1;
+    this.reqWarpNext = null; this.reqWarpPrev = 1;
+    this.holdBeta = this.player.beta;
+    if (this.player.dir3D) this.player.holdDir3D.copy(this.player.dir3D);
+    this.program = null; this.programDone = false; this.autoShootAliens = false;
+    this.autopilotOutcomeRolled = false; this.autopilotWillFail = false;
+    this.autopilotActiveSec = 0; this.autopilotFailSec = 0; this.autopilotWarned = false;
+    this.player._autopilotMalfunction = false;
+    this.docked = null;
+    this.ignited = this.player.isBoat || this.player.isRover || this.player.isPlane;
+    this.released = this.player.isBoat || this.player.isRover || this.player.isPlane;
+    this.lifted = this.player.isBoat || this.player.isRover || this.player.isPlane;
+    this.maxAlt = 0; this.maxVel = 0; this.maxG = 1; this.maxQ = 0; this.maxQPassed = false;
+    this.flags = {};
+    this.missionCompletedMarked = false;
+    this.missionSuccessStopped = false;
+    this.missionStopAnchor = null;
+    this.aliensKilled = 0;
+    this.boosterReleased = false; this.mecoWarned = false; this.towerGone = false;
+    if (this.completeTimer) clearTimeout(this.completeTimer);
+    if (this.crashTimer) clearTimeout(this.crashTimer);
+    this.resultShown = false; this.completeTimer = null; this.crashTimer = null; this.lastCrashSnapshot = null;
+    this.flagSpot = null; this.flagObj.visible = false; this.moonLandT = null;
+    this.astronautsAboard = 0;
+    this.clearDeployedAstronauts(false);
+    this.ensurePadAstronautMeshes();
+    this.hatchOpenStartT = null;
+    this.hatchCloseStartT = null;
+    if (this.boardingHatch) this.boardingHatch.visible = false;
+    for (const m of this.padAstronautMeshes) {
+      m.visible = false;
+      if (m.userData) m.userData.boarding = false;
+    }
+    this.camMode = 0; this.controls.enabled = true;
+    this.camera.fov = 50; this.camera.updateProjectionMatrix();
+    const isSpecial = this.player.isBoat || this.player.isRover || this.player.isPlane;
+    const h = this.rocketHeight;
+    const padUfoR = (stack || []).reduce((mx, s) => {
+      const baseR = PARTS[s.type]?.ufoRadius || 0;
+      const wingExtra = (baseR > 0 && s.attach?.includes('solarUfo')) ? (1.8 * (PARTS[s.type]?.ufoScale || 1)) : 0;
+      return Math.max(mx, baseR + wingExtra);
+    }, 0);
+    if (this.player.isRover) {
+      this.camera.position.set(13, 4.5, 0);
+      this.controls.minDistance = 2;
+    } else if (this.player.isBoat) {
+      this.camera.position.set(-16, 5.8, -8);
+      this.controls.minDistance = 2;
+    } else if (this.player.isPlane) {
+      this.camera.position.set(-16, 4.5, 16);
+      this.controls.minDistance = 2;
+    } else if (padUfoR > 8) {
+      const camSpan = Math.max(h, padUfoR * 1.9);
+      this.camera.position.set(camSpan * 0.65 + 10, h * 0.35 + 4, camSpan * 1.12 + 16);
+      this.controls.minDistance = 10;
+    } else {
+      this.camera.position.set(h * 0.68 + 12, 1.5, h * 1.18 + 20);
+      this.controls.minDistance = 6;
+    }
+    this.controls.target.set(0, padUfoR > 8 ? h * 0.38 : 1.5, 0);
+    this.envBand = -1;
+    this.flash = 0;
+    this.pipKeep = 0;
+    this.clamps.forEach((c) => { c.rotation.set(0, 0, 0); });
+    this.ship.visible = false; this.shipX = null;
+    this.map.toggle(false);
+    this.toggleTeleportModal(false);
+    this.updateTeleportActiveButtons('earth');
+    this.airportsLandedSet = new Set();
+    this.visitedAirportIds = new Set(['earth:0']);
+    this.wasAirborneForAirport = false;
+    this.lastLandedAirportId = 'earth:0';
+    this.compassAirportTarget = 'auto';
+    this.harborsVisitedSet = new Set();
+    this.visitedHarborIds = new Set(['earth:0']);
+    this.leftHarborForVoyage = false;
+    this.lastVisitedHarborId = 'earth:0';
+    this.compassHarborTarget = 'auto';
+    if (isSpecial) {
+      $('btn-go').classList.add('hidden');
+    } else {
+      $('btn-go').classList.remove('hidden');
+      const rName = this.player.label || tr('Tên lửa', 'Rocket');
+      this.event(tr(`🚀 ${rName} đã lên bệ phóng. Sẵn sàng!`, `🚀 ${rName} is on the launchpad. Ready for launch!`));
+    }
+    $('countdown').textContent = '';
+    $('mission-panel').classList.toggle('hidden', !this.mission.objectives.length);
+    if (this.player.isRover && this.mission?.targetBody && this.mission.targetBody !== 'earth' && BODIES[this.mission.targetBody]) {
+      this.player.heading = 0;
+      this.teleportToBody(this.mission.targetBody, 'surface');
+      this.flags[`${this.mission.targetBody}OnSurface`] = true;
+      const tgtB = BODIES[this.mission.targetBody];
+      this.event(
+        tr(
+          `🚙 Nhiệm vụ: ${this.mission.name} – Xe Rover đã đáp xuống ${tgtB.label}! Nhấn giữ W để chạy, A/D để lái hoàn thành 1 vòng (${this.mission.targetDistKm} km – có thể nhấn phím . để tua thời gian)!`,
+          `🚙 Mission: ${this.mission.name} – Rover deployed on ${tgtB.label}! Hold W to drive, A/D to steer and complete 1 full lap (${this.mission.targetDistKm} km – press . for Time Warp)!`
+        ),
+        'warn'
+      );
+    } else if (this.mission?.category === 'rover') {
+      this.event(
+        tr(
+          `🚙 Nhiệm vụ: ${this.mission.name} – Không có Lái tự động! Nhấn giữ W/S để chạy và A/D để lái đạt đủ ${this.mission.targetDistKm} km (có thể nhấn phím . để tua thời gian hoặc Y để Dịch chuyển)!`,
+          `🚙 Mission: ${this.mission.name} – No Autopilot! Hold W/S to drive and A/D to steer for ${this.mission.targetDistKm} km (press . for Time Warp or Y to Teleport)!`
+        ),
+        'warn'
+      );
+    } else if (this.player.isPlane && this.mission?.category === 'plane') {
+      if (this.mission.targetAirports) {
+        this.event(
+          tr(
+            `🛫 Nhiệm vụ: ${this.mission.name} – Nhấn G để bật Lái tự động hoặc tự lái máy bay cất cánh và đáp an toàn lên ${this.mission.targetAirports} sân bay!`,
+            `🛫 Mission: ${this.mission.name} – Press G to enable Autopilot or fly manually to take off and land safely on ${this.mission.targetAirports} airport(s)!`
+          ),
+          'warn'
+        );
+      } else {
+        const tb = this.mission.targetBody || 'earth';
+        if (tb !== 'earth' && BODIES[tb]) {
+          this.teleportToBody(tb, 'surface');
+          if (BODIES[tb].gasGiant) {
+            this.flags[`${tb}InAtmoFlight`] = true;
+          }
+        }
+        const tgtB = BODIES[tb] || BODIES.earth;
+        this.event(
+          tr(
+            `✈️ Nhiệm vụ: ${this.mission.name} – Nhấn G để bật Lái tự động hoặc tự lái máy bay hoàn thành 1 vòng quanh ${tgtB.label} (${this.mission.targetDistKm} km – có thể nhấn . để tua thời gian)!`,
+            `✈️ Mission: ${this.mission.name} – Press G to enable Autopilot or fly manually to complete 1 full lap around ${tgtB.label} (${this.mission.targetDistKm} km – press . for Time Warp)!`
+          ),
+          'warn'
+        );
+      }
+    } else if (this.player.isBoat && this.mission?.category === 'boat' && this.mission.targetHarbors) {
+      this.event(
+        tr(
+          `⚓ Nhiệm vụ: ${this.mission.name} – Nhấn G để bật Lái tự động hoặc tự lái thuyền ghé thăm đủ ${this.mission.targetHarbors} cảng biển nằm rải rác trên Trái Đất!`,
+          `⚓ Mission: ${this.mission.name} – Press G to enable Autopilot or sail manually to visit ${this.mission.targetHarbors} scattered harbor(s) on Earth!`
+        ),
+        'warn'
+      );
+    }
+    this.renderMissionPanel(true);
+    this.sc = this.makeContext();
+    if (this.mission.id !== 'free' && !isSpecial) {
+      if (this.mission.noAutopilot) {
+        const targetCount = this.mission.id === 'alien5000' ? 5000 : this.mission.id === 'alien1500' ? 1500 : this.mission.id === 'alien500' ? 500 : 100;
+        this.event(tr(`Nhiệm vụ: ${this.mission.name} – Không có Lái tự động, hãy tự điều khiển tàu và nhấn V / click chuột để tiêu diệt ${targetCount} Alien${this.mission.id === 'alien5000' ? ' cùng Hoàng Hậu & Vua' : ''}!`, `Mission: ${this.mission.name} – No Autopilot, fly manually and press V / click to destroy ${targetCount} Aliens${this.mission.id === 'alien5000' ? ' plus the Queen & King' : ''}!`));
+      } else {
+        this.event(tr('Nhiệm vụ: ' + this.mission.name + ' – nhấn G để bật lái tự động.', 'Mission: ' + this.mission.name + ' – press G to enable Autopilot.'));
+      }
+    }
+  }
+
+  /** guidance context (see sim/guidance.js) */
+  makeContext() {
+    const self = this;
+    return {
+      get simT() { return self.simT; },
+      startAlt: this.startAlt, coastX: COAST_X, recoveryMode: 'auto',
+      event: (t, c) => self.event(t, c || ''),
+      requestWarp: (w) => { self.reqWarpNext = w; },
+      placeDroneShip: (x) => { self.shipX = x; self.ship.position.x = x; self.ship.visible = true; },
+      isRecoverable: (v) => v === self.player && !self.boosterReleased && v.segIdx.length > 1 && (self.mission.id === 'recover' || v.deployables('legs').some((d) => d.seg === v.activeSeg)),
+      autoStage: (v, mode) => self.autoStage(v, mode),
+      flag: (n) => self.setFlag(n),
+      jettisonToCapsule: (v) => self.jettisonToCapsule(v),
+      dockGeometry: () => self.dockGeometry(),
+      getAirportsLandedCount: () => (self.airportsLandedSet ? self.airportsLandedSet.size : 0),
+      getAirportAnchor: (bKey, sx) => self.getNearestAirportAnchor(bKey, sx),
+      getAirportSite: (bKey, idx) => self.getAirportSite(bKey, idx),
+      getNextAirportSite: (v) => self.getNextUnvisitedAirportSite(v),
+      getHarborsVisitedCount: () => (self.harborsVisitedSet ? self.harborsVisitedSet.size : 0),
+      getHarborSite: (idx) => self.getHarborSite(idx),
+      getNextHarborSite: (v) => self.getNextUnvisitedHarborSite(v),
+      getCoastX: (sz) => self.earthCoastX(sz),
+      get docked() { return self.docked; },
+    };
+  }
+
+  autoStage(v, mode) {
+    if (v.segIdx.length <= 1) return false;
+    if (mode === 'recover') {
+      this.stageVessel(v);
+      if (this.ignited) v.engineOn = true;
+      return true;
+    }
+    if (this.checkAutoStage(v)) return true;
+    this.stageVessel(v);
+    if (this.ignited) v.engineOn = true;
+    return true;
+  }
+
+  checkAutoStage(v = this.player) {
+    if (!v || v.crashed || v.dead || v.clamped) return false;
+    if (!(this.phase === 'flight' || (this.phase === 'countdown' && this.ignited))) return false;
+    let staged = false;
+    let guard = 0;
+    while (v.segIdx.length > 1 && guard++ < 12) {
+      const k = v.activeSeg;
+      const info = this.segInfo[k];
+      const fuelLeft = this.fuel[k] || 0;
+      const boosterFuel = v.boosters().reduce((s, b) => s + (b.seg === k ? b.fuel : 0), 0);
+      const hasPropulsion = (info && info.tVac > 0) || v.boosters().some((b) => b.seg === k);
+      const outOfFuel = fuelLeft <= 1e-4 && boosterFuel <= 1e-4;
+      const nextK = v.segIdx[v.segIdx.length - 2];
+      const nextInfo = this.segInfo[nextK];
+      const nextHasEngine = (nextInfo && nextInfo.tVac > 0 && (this.fuel[nextK] || 0) > 1e-4) ||
+        v.boosters().some((b) => b.seg === nextK && b.fuel > 1e-4);
+      const isReentry = v.ref === 'earth' && v.alt < 95000 && v.vSurf && v.vSurf.u < -5 && this.met > 30;
+      if ((!hasPropulsion || outOfFuel) && (nextHasEngine || isReentry || v.segIdx.length > 2)) {
+        this.stageVessel(v);
+        if (this.ignited) v.engineOn = true;
+        staged = true;
+      } else {
+        break;
+      }
+    }
+    return staged;
+  }
+
+  setFlag(n) { if (!this.flags[n]) { this.flags[n] = true; this.renderMissionPanel(); } }
+
+  jettisonToCapsule(v) {
+    let guard = 0;
+    while (v.segIdx.length > 1 && guard++ < 12) this.stageVessel(v, true);
+  }
+
+  // =================================================================== CONTROL FLOW
+  startCountdown() {
+    if (this.phase !== 'ready') return;
+    this.phase = 'countdown';
+    this.met = -10;
+    this.lastCount = 11;
+    $('btn-go').classList.add('hidden');
+    this.hudTimer = 0;
+    this.updateHUD(0);
+    this.event(tr('Bắt đầu đếm ngược!', 'Countdown started!'));
+  }
+
+  holdAttitude() {
+    this.holdBeta = this.player.beta;
+    if (this.player && this.player.dir3D) this.player.holdDir3D.copy(this.player.dir3D);
+  }
+
+  toggleAutopilot() {
+    if (!this.player || this.player.crashed || this.docked || this.missionSuccessStopped) return;
+    if (!this.mission || this.mission.id === 'free' || this.mission.noAutopilot) {
+      this.program = null;
+      this.autoShootAliens = false;
+      const targetCount = this.mission?.id === 'alien5000' ? 5000 : this.mission?.id === 'alien1500' ? 1500 : this.mission?.id === 'alien500' ? 500 : 100;
+      this.event(
+        this.mission?.category === 'rover'
+          ? tr(
+            '🚫 Nhiệm vụ Xe Rover không có chế độ Tự lái! Hãy tự điều khiển xe bằng phím W/S (tiến/lùi) và A/D (rẽ trái/phải).',
+            '🚫 Autopilot is disabled for Rover missions! Drive manually using W/S (forward/reverse) and A/D (steer left/right).'
+          )
+          : this.mission?.noAutopilot
+            ? tr(
+              `🚫 Nhiệm vụ Tiêu diệt ${targetCount} Alien không có chế độ Lái tự động! Hãy tự điều khiển tàu và nhấn V / click chuột để bắn Alien.`,
+              `🚫 Autopilot is disabled in the Eliminate ${targetCount} Aliens mission! Pilot the craft manually and press V / click to shoot Aliens.`
+            )
+            : tr(
+              '🚫 Chế độ Bay tự do không cho phép dùng Lái tự động! Hãy tự điều khiển hoặc chọn một Nhiệm vụ cụ thể.',
+              '🚫 Autopilot is disabled in Free Flight mode! Fly manually or select a specific Mission.'
+            ),
+        'warn'
+      );
+      return;
+    }
+    if (this.program || this.autoShootAliens) {
+      this.program = null;
+      this.autoShootAliens = false;
+      this.player._guidedTargetAlt = null;
+      this.player.ctl.targetBeta = null;
+      this.player.ctl.rcs = [0, 0, 0];
+      this.holdAttitude();
+      this.event(tr('Tắt lái tự động & tự động bắn Alien.', 'Autopilot & Auto-Turret OFF.'));
+      return;
+    }
+    const id = this.mission.id;
+    if (this.player.isBoat || this.mission.category === 'boat') {
+      this.throttle = 1;
+      this.player.throttle = 1;
+      this.player.engineOn = true;
+      if (this.mission.targetHarbors) {
+        this.program = new BoatHarborHopProgram(this.mission.targetHarbors);
+      } else {
+        this.program = new BoatCruiseProgram(this.mission.targetDistKm || 500);
+      }
+    } else if (this.player.isPlane || this.mission.category === 'plane') {
+      if (this.mission.targetAirports) {
+        this.throttle = 1;
+        this.player.throttle = 1;
+        this.player.engineOn = true;
+        this.program = new PlaneAirportHopProgram(this.mission.targetAirports);
+      } else {
+        const tb = this.mission.targetBody || 'earth';
+        if (this.player.ref !== tb && BODIES[tb] && this.canPlaneTeleportTo(tb)) {
+          this.teleportToBody(tb, 'surface');
+        }
+        this.throttle = 1;
+        this.player.throttle = 1;
+        this.player.engineOn = true;
+        this.program = new PlaneLoopProgram(this.player.ref || 'earth', this.mission.targetDistKm || 1000);
+      }
+    } else if (id === 'iss') this.program = new RendezvousProgram(this.issOrbit, 85e3);
+    else if (BODIES[id] && id !== 'earth' && id !== 'sun' && !BODIES[id].gasGiant) this.program = new MoonProgram(id);
+    else this.program = new AscentProgram(85e3, 'earth');
+    this.program.label = `${this.mission.icon} ${this.mission.name}`;
+    this.programDone = false;
+    this.autoShootAliens = true;
+    if (!this.autopilotOutcomeRolled) {
+      this.autopilotOutcomeRolled = true;
+      this.autopilotWillFail = Math.random() >= 0.85; // 85% mission success rate, 15% failure rate
+      this.autopilotActiveSec = 0;
+      this.autopilotFailSec = 10 + Math.random() * 14; // 10–24s of active autopilot flight before malfunction
+      this.autopilotWarned = false;
+    }
+    this.event(
+      tr(
+        '🤖 Bật lái tự động & tự động bắn Alien: ',
+        '🤖 Mission Autopilot & Auto-Turret ON: '
+      ) + this.program.label + '.'
+    );
+    if (this.phase === 'ready') {
+      this.startCountdown();
+    }
+  }
+
+  toggleBoosterFocus() {
+    const b = this.vessels.find((v) => v.kind === 'booster' && !v.crashed && !v.dead);
+    if (!b) return;
+    this.focus = this.focus === b ? this.player : b;
+    this.event(this.focus === b ? tr('Camera: tầng 1.', 'Camera: Stage 1.') : tr('Camera: tàu chính.', 'Camera: Main Craft.'));
+  }
+
+  toggleDeploy() {
+    const v = this.focus;
+    if (!v || v.crashed) return;
+    const on = !(v.legsTarget || v.chuteTarget || v.finsTarget);
+    if (v.hasLegs()) v.legsTarget = on ? 1 : 0;
+    if (v.hasGridFins()) v.finsTarget = on ? 1 : 0;
+    if (v.capsule() && (!v.hasLegs() || (!v.landed && !v.clamped))) v.chuteTarget = on ? 1 : 0;
+    this.event(on ? tr('Bung chân / cánh / dù.', 'Deploying legs / fins / chutes.') : tr('Thu chân / cánh / dù.', 'Retracting legs / fins / chutes.'));
+  }
+
+  stage() {
+    if (!this.player || this.player.crashed) return;
+    if (!(this.phase === 'flight' || this.phase === 'countdown' && this.ignited)) return;
+    if (this.player.segIdx.length <= 1) return;
+    this.stageVessel(this.player);
+  }
+
+  /** split the lowest stage off vessel v into its own vessel */
+  stageVessel(v, junk = false) {
+    if (v.segIdx.length <= 1) return null;
+    const T = this.simT;
+    const k = v.segIdx[v.segIdx.length - 1];
+    const ax = v.axis();
+    const oldCom = v.com.y;
+    v.segIdx.pop();
+    const root = new THREE.Group();
+    this.scene.add(root);
+    root.add(this.rocket.segGroups[k]);
+    const nv = new Vessel(this.ctx, [k], root, 'debris');
+    nv.s = { ...v.s }; nv.beta = v.beta; nv.omega = v.omega * 0.5;
+    if (v.dir3D) {
+      nv.dir3D.copy(v.dir3D);
+      nv.holdDir3D.copy(v.dir3D);
+    }
+    nv.updateMass(); v.updateMass();
+    nv.s.x += ax.x * (nv.com.y - oldCom); nv.s.y += ax.y * (nv.com.y - oldCom);
+    v.s.x += ax.x * (v.com.y - oldCom); v.s.y += ax.y * (v.com.y - oldCom);
+    nv.s.vx -= ax.x * 3; nv.s.vy -= ax.y * 3;
+    // If Titan IV fairing separates to reveal the final-stage Voyager probe, deploy Voyager's booms & clear the fairing
+    if (this.rocket && this.rocket.partObjs) {
+      const separatedFairing = this.rocket.partObjs.some((po) => po.seg === k && this.stack[po.index]?.type === 'titan4Fairing');
+      if (separatedFairing) {
+        nv.s.x -= ax.x * 7.5; nv.s.y -= ax.y * 7.5;
+        nv.s.vx -= ax.x * 6; nv.s.vy -= ax.y * 6;
+      }
+      const hasFairingLeft = this.rocket.partObjs.some((po) => v.owns(po.seg) && this.stack[po.index]?.type === 'titan4Fairing');
+      if (!hasFairingLeft) {
+        for (const po of this.rocket.partObjs) {
+          if (v.owns(po.seg) && po.obj.userData.voyagerBooms && !po.obj.userData.voyagerBooms.visible) {
+            po.obj.userData.voyagerBooms.visible = true;
+            if (v === this.player) {
+              this.event(tr('Tách chóp mũi Titan IV — Triển khai tàu thăm dò Voyager!', 'Titan IV fairing jettisoned — Voyager spacecraft deployed!'));
+            }
+          }
+        }
+      }
+    }
+    nv.landed = v.landed ? null : null;
+    nv.updateFrame(T); v.updateFrame(T);
+    nv.engineOn = false; nv.throttle = 0;
+    nv.ctl.targetBeta = null;
+    this.stageCounter = (this.stageCounter || 0) + 1;
+    nv.mapId = `stage_${Date.now()}_${this.stageCounter}`;
+    nv.label = tr(`Tầng ${this.segs.length - k} (#${this.stageCounter})`, `Stage ${this.segs.length - k} (#${this.stageCounter})`);
+    const nvEl = vesselElements(nv);
+    const inSpaceNow = nv.ref !== 'earth' || nv.alt >= 45000;
+    const goingToSpace = inSpaceNow || nv.alt >= 30000 || (nvEl && nvEl.ap > R_E + 65000);
+    const recoverable = !junk && !inSpaceNow && ((this.mission.id === 'recover' && !this.boosterReleased) || nv.deployables('legs').some((d) => d.seg === k)) && nv.info.tVac > 0 && this.fuel[k] > 0.3;
+    if (recoverable) {
+      nv.kind = 'booster';
+      nv.rec = new BoosterRecovery(nv, this.sc);
+      this.boosterReleased = true;
+      this.setFlag('sep');
+      this.event(tr('Tách tầng 1 – bắt đầu quy trình thu hồi.', 'Stage 1 separated – starting booster recovery sequence.'), 'warn');
+    } else {
+      nv.kind = 'stage';
+      if (goingToSpace) {
+        nv.destinedForSpace = true;
+        if (inSpaceNow) {
+          this.stabilizeSpaceVessel(nv);
+          nv.orbitStabilized = true;
+        }
+        this.event(tr(`Tách ${nv.label} – tiếp tục bay theo quỹ đạo vũ trụ!`, `${nv.label} separated – continuing in space orbit!`), 'warn');
+      } else {
+        this.event(tr(`Tách tầng ${this.segs.length - k}!`, `Stage ${this.segs.length - k} separated!`), 'warn');
+      }
+    }
+    this.vessels.push(nv);
+    if (v === this.player) {
+      this.player.ctl.rcs = [0, 0, 0];
+      if (!this.program) this.player.engineOn = this.ignited && this.throttle > 0;
+      if (!v.hasLegs()) { v.legsTarget = 0; v.legsT = 0; }
+      if (!v.hasGridFins()) { v.finsTarget = 0; v.finsT = 0; }
+    }
+    this.burstAt(nv, 40, 2.5);
+    audio.thunk(0.9);
+    return nv;
+  }
+
+  /** free-flying light debris (SRBs, escape tower, wreckage) simulated in ECI */
+  makeDebris(v, obj, pushSpeed, spin = 1) {
+    v.root.updateMatrixWorld(true);
+    obj.updateWorldMatrix(true, false);
+    const inv = new THREE.Matrix4().copy(v.root.matrixWorld).invert().multiply(obj.matrixWorld);
+    const p = new THREE.Vector3(), q = new THREE.Quaternion(), sc = new THREE.Vector3();
+    inv.decompose(p, q, sc);
+    const b = v.beta, ax = Math.sin(b), ay = Math.cos(b), ex = Math.cos(b), ey = -Math.sin(b);
+    const s = { x: v.s.x + ex * p.x + ax * p.y, y: v.s.y + ey * p.x + ay * p.y, z: (v.s.z || 0) + p.z, vx: v.s.vx, vy: v.s.vy, vz: v.s.vz || 0 };
+    let dx = p.x, dz = p.z;
+    let dl = Math.hypot(dx, dz);
+    if (dl < 0.25) {
+      const az = Math.random() * Math.PI * 2;
+      dx = Math.cos(az);
+      dz = Math.sin(az);
+      dl = 1;
+    }
+    const axialKick = (Math.random() - 0.35) * pushSpeed * 0.45;
+    s.vx += (ex * dx / dl) * pushSpeed + ax * axialKick;
+    s.vy += (ey * dx / dl) * pushSpeed + ay * axialKick;
+    s.vz += (dz / dl) * pushSpeed;
+    this.scene.add(obj);
+    obj.position.set(0, 0, 0); obj.quaternion.copy(q); obj.scale.copy(sc);
+    this.debris.push({ obj, s, beta: b, q0: q.clone(), av: new THREE.Vector3((Math.random() - 0.5) * 0.4 * spin, (Math.random() - 0.5) * 0.4 * spin, (Math.random() - 0.5) * 0.4 * spin + (dx > 0 ? -0.2 : 0.2) * spin), life: 0, landed: false, dq: new THREE.Quaternion() });
+    for (const pl of this.plumes) { let o = pl.nz.node; while (o) { if (o === obj) { pl.detached = true; break; } o = o.parent; } }
+    return this.debris[this.debris.length - 1];
+  }
+
+  jettisonBooster(v, b) {
+    b.attached = false;
+    const oldCom = v.com.y, ax = v.axis();
+    for (const o of b.objs) this.makeDebris(v, o, 6);
+    v.updateMass();
+    v.s.x += ax.x * (v.com.y - oldCom); v.s.y += ax.y * (v.com.y - oldCom);
+    audio.thunk(0.6);
+    if (v === this.player) this.event(tr('Tên lửa đẩy phụ cháy hết – tách ra!', 'Solid rocket boosters depleted – jettisoned!'), 'warn');
+  }
+
+  burstAt(v, n, size) {
+    const vB = BODIES[v.ref] || BODIES.earth;
+    const hasAtm = (vB.atm || 0) > 0 && (vB.rho0 || 0) > 0 && v.alt < vB.atm;
+    const k = hasAtm ? Math.exp(-Math.max(0, v.alt) / (vB.atmH || 5600)) : 0;
+    const x = v.sx || 0, y = v.ref === 'earth' ? Math.max(v.alt, 1) : (v.alt ?? 1), z = v.s.z || 0;
+    for (let i = 0; i < n; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(8 + Math.random() * 10);
+      this.smoke.emit(x, y, z, (v.vSurf?.e || 0) + d.x, (v.vSurf?.u || 0) + d.y, (v.vSurf?.z || 0) + d.z, { life: 3 + Math.random() * 2, size0: size, size1: size * (4 + 10 * (1 - k)), alpha: 0.5, drag: 0.6 * k + 0.02, buoy: 0, color: [0.9, 0.9, 0.9] });
+    }
+  }
+
+  explode(v, reason) {
+    if (v.dead) return;
+    const isPlayer = v === this.player;
+    if (isPlayer) {
+      const a = Math.abs(v.aoa || 0);
+      const offDeg = Math.round(Math.min(a, Math.PI - a) * 180 / Math.PI);
+      this.lastCrashSnapshot = {
+        reason,
+        qNow: v.qNow || 0,
+        offDeg,
+        activeFuel: this.fuel[v.activeSeg] || 0,
+        totalFuel: v.fuelTotal(),
+        segRemaining: v.segIdx.length,
+        activeStageNum: this.segs.length - v.activeSeg,
+        throttle: this.throttle,
+        wasEngineOn: v.engineOn,
+        details: v.crashDetails || null,
+        alt: v.alt - this.startAlt,
+        speedSurf: v.speedSurf || Math.hypot(v.vSurf?.e || 0, v.vSurf?.u || 0),
+        tiltDeg: Math.round(Math.abs(v.ang || 0) * 180 / Math.PI),
+      };
+      this.phase = 'crashed';
+      this.program = null;
+      this.warp = 1;
+      this.userWarp = 1;
+      this.autoWarp = 1;
+      this.reqWarpNext = null;
+      this.reqWarpPrev = 1;
+      if (this.docked) this.docked = null;
+      if (!v.crashAnchor) {
+        if (v.clamped || v.landed) {
+          const L = v.landed || v.clampSpot || {};
+          v.crashAnchor = {
+            mode: 'surface',
+            body: L.body || v.ref,
+            sx: L.sx ?? (v.sx || 0),
+            sz: L.sz ?? (v.s.z || 0),
+            h: L.h ?? v.alt,
+            betaOff: wrapPi(v.beta - v.phi),
+          };
+        } else {
+          v.crashAnchor = { mode: 'coast' };
+        }
+      }
+      if (this.camMode === 2) {
+        const h = v.height || this.rocketHeight || 20;
+        this.camMode = 0;
+        this.controls.enabled = true;
+        this.camera.fov = 50;
+        this.camera.updateProjectionMatrix();
+        this.camera.position.set(h * 0.7 + 14, h * 0.35 + 6, h * 1.15 + 22);
+        this.controls.target.set(0, 0, 0);
+      }
+    }
+    v.crashed = true; v.engineOn = false;
+    this.event('💥 ' + (isPlayer ? '' : (v.kind === 'booster' ? tr('Tầng 1: ', 'Stage 1: ') : tr('Tầng bỏ: ', 'Spent Stage: '))) + reason, 'bad');
+    const big = isPlayer || v.kind === 'booster';
+    const vB = BODIES[v.ref] || BODIES.earth;
+    const hasAtm = (vB.atm || 0) > 0 && (vB.rho0 || 0) > 0 && v.alt < vB.atm;
+    const air = hasAtm ? Math.exp(-Math.max(0, v.alt) / (vB.atmH || 5600)) : 0;
+    const onSurfCrash = v.crashAnchor?.mode === 'surface';
+    const carry = onSurfCrash ? 0 : 0.85;
+    const cvE = (v.vSurf?.e || 0) * carry;
+    const cvU = (v.vSurf?.u || 0) * carry;
+    const cvZ = (v.vSurf?.z || 0) * carry;
+    const x = v.sx || 0, y = v.ref === 'earth' ? Math.max(v.alt, 0.8) : (v.alt ?? 0.8), z = v.s.z || 0;
+    const nF = big ? 500 : 140, nS = big ? 260 : 70;
+    for (let i = 0; i < nF; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - (onSurfCrash ? 0.15 : 0.45), Math.random() - 0.5).normalize().multiplyScalar(Math.random() * 45);
+      this.fire.emit(x + d.x * 0.1, y + d.y * 0.1, z + d.z * 0.1, cvE + d.x, cvU + d.y, cvZ + d.z, { life: 0.9 + Math.random() * 1.6, size0: 5, size1: 22 + Math.random() * 20, alpha: 1, drag: 0.9 * air + 0.35, buoy: 3 * air, color: [6, 3, 1.2] });
+    }
+    for (let i = 0; i < nS; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - (onSurfCrash ? 0.1 : 0.45), Math.random() - 0.5).normalize().multiplyScalar(Math.random() * 30);
+      this.smoke.emit(x + d.x * 0.2, y + d.y * 0.2, z + d.z * 0.2, cvE + d.x, cvU + d.y, cvZ + d.z, { life: 8 + Math.random() * 8, size0: 8, size1: 45 + Math.random() * 40, alpha: 0.85, drag: 0.8 * air + 0.08, buoy: 2.5 * air, heat: 1.2, color: [0.28, 0.26, 0.25] });
+    }
+    const upX = v.up ? v.up.x : 0, upY = v.up ? v.up.y : 1;
+    for (const k of v.segIdx) {
+      const g = this.rocket.segGroups[k];
+      for (const child of [...g.children]) {
+        const d = this.makeDebris(v, child, 10 + Math.random() * 25, 12);
+        const upKick = onSurfCrash ? (6 + Math.random() * 16) : 0;
+        d.s.vx += (Math.random() - 0.5) * 8 + upX * upKick;
+        d.s.vy += (Math.random() - 0.5) * 8 + upY * upKick;
+        d.s.vz += (Math.random() - 0.5) * 8;
+      }
+    }
+    for (const d of this.rocket.deployables) {
+      if (v.owns(d.seg)) {
+        for (const o of d.objs) {
+          if (o.parent && o.parent !== this.scene) {
+            const db = this.makeDebris(v, o, 6, 8);
+            if (onSurfCrash) {
+              const upKick = 5 + Math.random() * 12;
+              db.s.vx += upX * upKick;
+              db.s.vy += upY * upKick;
+            }
+          }
+        }
+      }
+    }
+    v.dead = true;
+    if (v.root) v.root.visible = false;
+    if (big) { this.flash = 1; this.flashPos = { x: v.sx || 0, y: v.alt || 0, z: v.s.z || 0 }; this.shakeBoost = 3; audio.explosion(1); }
+    if (isPlayer) {
+      audio.silenceEngine();
+      clearTimeout(this.crashTimer);
+      this.crashTimer = setTimeout(() => this.showResult(false, reason), 3500);
+    }
+  }
+
+  // =================================================================== SURFACE MODEL
+  resolveBuildingCollision(v, sx, sz, alt = 0, rPad = 2.8) {
+    if (!v || !this.buildingColliders || !this.buildingColliders.length) {
+      return { sx, sz, hit: false, hitX: 0, hitZ: 0 };
+    }
+    const isEarth = v.ref === 'earth';
+    if (!isEarth && !this.hasSurfaceAirports(v.ref)) {
+      return { sx, sz, hit: false, hitX: 0, hitZ: 0 };
+    }
+    const isPlaneMode = !!(v.isPlane || (this.airport && this.airport.visible));
+    const isPadMode = !!(isEarth && this.pad && this.pad.visible);
+    const bottomAlt = (alt ?? v.alt ?? 0) - (v.bottomOffset ? v.bottomOffset() : 0);
+    let curX = sx;
+    let curZ = sz;
+    let hit = false;
+    let hitX = 0;
+    let hitZ = 0;
+    for (const b of this.buildingColliders) {
+      if (b.mode === 'plane' && !isPlaneMode) continue;
+      if (b.mode === 'pad' && !isPadMode) continue;
+      const apSite = b.mode === 'plane' ? this.getAirportSite(v.ref, b.aIdx || 0) : null;
+      const offX = apSite ? (isEarth ? apSite.sx : (curX - this.bodyDeltaX(v.ref, curX, apSite.sx))) : 0;
+      const offY = apSite ? apSite.h : 0;
+      const offZ = apSite ? apSite.sz : 0;
+      if (bottomAlt >= offY + b.maxY - 0.5) continue;
+      const minX = offX + b.minX - rPad;
+      const maxX = offX + b.maxX + rPad;
+      const minZ = offZ + b.minZ - rPad;
+      const maxZ = offZ + b.maxZ + rPad;
+      if (curX > minX && curX < maxX && curZ > minZ && curZ < maxZ) {
+        const dLeft = curX - minX;
+        const dRight = maxX - curX;
+        const dBack = curZ - minZ;
+        const dFront = maxZ - curZ;
+        const m = Math.min(dLeft, dRight, dBack, dFront);
+        if (m === dLeft) {
+          curX = minX;
+          hitX = -1;
+        } else if (m === dRight) {
+          curX = maxX;
+          hitX = 1;
+        } else if (m === dBack) {
+          curZ = minZ;
+          hitZ = -1;
+        } else {
+          curZ = maxZ;
+          hitZ = 1;
+        }
+        hit = true;
+      }
+    }
+    if (isEarth && this.treeGrid && (!this.trees || this.trees.visible !== false)) {
+      const TREE_CELL = 32;
+      const cgx = Math.floor(curX / TREE_CELL);
+      const cgz = Math.floor(curZ / TREE_CELL);
+      const vRad = rPad * 0.78;
+      for (let dxCell = -1; dxCell <= 1; dxCell++) {
+        for (let dzCell = -1; dzCell <= 1; dzCell++) {
+          const bucket = this.treeGrid.get(`${cgx + dxCell},${cgz + dzCell}`);
+          if (!bucket) continue;
+          for (let i = 0; i < bucket.length; i++) {
+            const t = bucket[i];
+            const treeTopY = (isPlaneMode ? 0 : t.ty) + t.h;
+            if (bottomAlt >= treeTopY - 0.3) continue;
+            const dx = curX - t.x;
+            const dz = curZ - t.z;
+            const minDist = t.r + vRad;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < minDist * minDist) {
+              const d = Math.sqrt(d2);
+              const nx = d > 1e-4 ? dx / d : 1;
+              const nz = d > 1e-4 ? dz / d : 0;
+              curX = t.x + nx * minDist;
+              curZ = t.z + nz * minDist;
+              hit = true;
+              if (Math.abs(nx) >= Math.abs(nz)) hitX = Math.sign(nx);
+              else hitZ = Math.sign(nz);
+            }
+          }
+        }
+      }
+    }
+    return { sx: curX, sz: curZ, hit, hitX, hitZ };
+  }
+
+  isPointOnSingleAirport(dx, dz) {
+    if (dx < -185 || dx > 2255 || dz < -122 || dz > 102) return null;
+    if (dx >= -170 && dx <= 2250 && Math.abs(dz) <= 22) return 0.25;
+    if (dx >= -125 && dx <= 820 && dz >= -110 && dz <= -18) return 0.20;
+    return 0.05;
+  }
+
+  getAirportSurfaceAt(bodyKey, sx, sz) {
+    if (!this.hasSurfaceAirports(bodyKey)) return null;
+    for (let i = 0; i < AIRPORT_SCATTER_OFFSETS.length; i++) {
+      const site = this.getAirportSite(bodyKey, i);
+      const rwyH = this.isPointOnSingleAirport(this.bodyDeltaX(bodyKey, sx, site.sx), sz - site.sz);
+      if (rwyH !== null) {
+        return { h: site.h + rwyH, aIdx: i };
+      }
+    }
+    return null;
+  }
+
+  surfaceAt(v) {
+    if (v.ref !== 'earth') {
+      const B = BODIES[v.ref] || BODIES.moon;
+      const sx = v.sx !== undefined ? v.sx : (v.phiRot || 0) * B.R;
+      const sz = v.s ? (v.s.z || 0) : 0;
+      if (this.hasSurfaceAirports(v.ref)) {
+        const apSurf = this.getAirportSurfaceAt(v.ref, sx, sz);
+        if (apSurf !== null) {
+          return { h: apSurf.h, water: false, site: 'runway' };
+        }
+      }
+      const psi = sx / B.R;
+      const uz = sz / B.R;
+      const zDrop = (sz * sz) / (2 * B.R);
+      return { h: B.gasGiant ? 0 : (moonHeight(Math.sin(psi), Math.cos(psi), uz, v.ref) - zDrop), water: false, site: v.ref };
+    }
+    const sx = v.sx, sz = v.s ? (v.s.z || 0) : 0;
+    if (this.buildingColliders && this.buildingColliders.length && v.alt !== undefined) {
+      const isPlaneMode = !!(v.isPlane || (this.airport && this.airport.visible));
+      const isPadMode = !!(this.pad && this.pad.visible);
+      const bottomAlt = v.alt - (v.bottomOffset ? v.bottomOffset() : 0);
+      for (const b of this.buildingColliders) {
+        if (b.mode === 'plane' && !isPlaneMode) continue;
+        if (b.mode === 'pad' && !isPadMode) continue;
+        const apSite = b.mode === 'plane' ? this.getAirportSite('earth', b.aIdx || 0) : null;
+        const offX = apSite ? apSite.sx : 0;
+        const offZ = apSite ? apSite.sz : 0;
+        if (sx >= offX + b.minX && sx <= offX + b.maxX && sz >= offZ + b.minZ && sz <= offZ + b.maxZ && bottomAlt >= b.maxY - 1.5) {
+          return { h: b.maxY, water: false, site: 'building' };
+        }
+      }
+    }
+    const isRoverMode = !!(v.isRover || (this.player && this.player.isRover));
+    const isBoatMode = !!(v.isBoat || (this.player && this.player.isBoat));
+    const isPlaneMode = !!(v.isPlane || (this.player && this.player.isPlane));
+    if (!isBoatMode) {
+      const apSurf = this.getAirportSurfaceAt('earth', sx, sz);
+      if (apSurf !== null && (isPlaneMode || Math.hypot(sx, sz) > PAD_RADIUS + 20)) {
+        return { h: apSurf.h, water: false, site: 'runway' };
+      }
+    }
+    const dynCoastBase = this.earthCoastX(sz) - 100;
+    if (isPlaneMode) {
+      if (this.shipX !== null && Math.abs(sx - this.shipX) < 44) return { h: 3.0, water: false, site: 'ship' };
+      if (sx > dynCoastBase || sx < -1482500) return { h: 0, water: true, site: 'sea' };
+      return { h: this.earthGroundWave(sx, sz, 0.0, 1.0), water: false, site: 'land' };
+    }
+    if (!isRoverMode && !isBoatMode) {
+      const dist = Math.hypot(sx, sz);
+      if (Math.abs(sx) < 7 && Math.abs(sz) < 7) return { h: PAD_TOP, water: false, site: 'pad' };
+      if (dist < PAD_RADIUS) return { h: 6, water: false, site: 'pad' };
+      if (dist < PAD_RADIUS + 22) return { h: 6 * (1 - (dist - PAD_RADIUS) / 22), water: false, site: 'pad' };
+    }
+    if (this.shipX !== null && Math.abs(sx - this.shipX) < 44 && Math.abs(sz) < 28) return { h: 3.0, water: false, site: 'ship' };
+    if (Math.hypot(sx - LZ_X, sz) < 44) return { h: 0.3, water: false, site: 'lz' };
+    let coastLimit = isRoverMode ? (dynCoastBase - 32) : isBoatMode ? (dynCoastBase + 22) : dynCoastBase;
+    if (isBoatMode) {
+      for (let i = 0; i < HARBOR_SCATTER_Z.length; i++) {
+        const hz = HARBOR_SCATTER_Z[i];
+        if (Math.abs(sz - hz) <= 156) {
+          const hs = this.getHarborSite(i);
+          coastLimit = Math.max(coastLimit, hs.seawallX + 3);
+          break;
+        }
+      }
+    }
+    if (sx > coastLimit || sx < (isRoverMode ? -1482350 : -1482500)) return { h: 0, water: true, site: 'sea' };
+    if (!isBoatMode && this.isLagoonWater(sx, sz)) return { h: 0, water: true, site: 'lagoon' };
+    return { h: this.earthGroundWave(sx, sz, isRoverMode ? 0.0 : 1.0, 0.0), water: false, site: 'land' };
+  }
+
+  // =================================================================== MISSION TRACKING
+  renderMissionPanel(force) {
+    const objs = this.mission.objectives;
+    if (!objs.length) return;
+    const kills = this.aliensKilled || 0;
+    const isAlienMission = this.mission.id === 'alien100' || this.mission.id === 'alien500' || this.mission.id === 'alien1500' || this.mission.id === 'alien5000';
+    const isRoverMission = this.mission.category === 'rover';
+    const isPlaneMission = this.mission.category === 'plane';
+    const isBoatMission = this.mission.category === 'boat';
+    const P = this.player;
+    const totalRoverKm = (P?.roverDistTotal || 0) / 1000;
+    const totalPlaneKm = (P?.planeDistTotal || 0) / 1000;
+    const totalBoatKm = (P?.boatDistTotal || 0) / 1000;
+    const tb = this.mission.targetBody;
+    const bodyRoverKm = tb ? (((P?.roverDistByBody && P.roverDistByBody[tb]) || 0) / 1000) : totalRoverKm;
+    const bodyPlaneKm = tb ? (((P?.planeDistByBody && P.planeDistByBody[tb]) || 0) / 1000) : totalPlaneKm;
+    const roverProgKm = tb ? bodyRoverKm : totalRoverKm;
+    const planeProgKm = tb ? bodyPlaneKm : totalPlaneKm;
+    const boatProgKm = totalBoatKm;
+    const airportsDone = this.airportsLandedSet ? this.airportsLandedSet.size : 0;
+    const harborsDone = this.harborsVisitedSet ? this.harborsVisitedSet.size : 0;
+    const sig = objs.map((o) => (this.flags[o.id] ? 1 : 0)).join('')
+      + (isAlienMission ? `_${kills}` : '')
+      + (isRoverMission ? `_${roverProgKm.toFixed(1)}` : '')
+      + (isPlaneMission ? `_${planeProgKm.toFixed(1)}_${airportsDone}` : '')
+      + (isBoatMission ? `_${boatProgKm.toFixed(1)}_${harborsDone}` : '');
+    if (!force && sig === this.missionSig) return;
+    this.missionSig = sig;
+    const doneMark = isMissionCompleted(this.mission.id) ? ' ✔' : '';
+    $('mp-title').textContent = this.mission.icon + ' ' + this.mission.name + doneMark;
+    $('mp-list').innerHTML = objs.map((o) => {
+      let label = o.text;
+      if (o.id === 'kill25') label = `${o.text} (${Math.min(25, kills)}/25)`;
+      else if (o.id === 'kill50') label = `${o.text} (${Math.min(50, kills)}/50)`;
+      else if (o.id === 'kill100') {
+        label = `${o.text} (${Math.min(100, kills)}/100)`;
+      } else if (o.id === 'kill250') {
+        label = `${o.text} (${Math.min(250, kills)}/250)`;
+      } else if (o.id === 'kill500') {
+        label = `${o.text} (${Math.min(500, kills)}/500)`;
+      } else if (o.id === 'kill300') {
+        label = `${o.text} (${Math.min(300, kills)}/300)`;
+      } else if (o.id === 'kill750') {
+        label = `${o.text} (${Math.min(750, kills)}/750)`;
+      } else if (o.id === 'kill1500') {
+        label = `${o.text} (${Math.min(1500, kills)}/1500)`;
+      } else if (o.id === 'kill1000') {
+        label = `${o.text} (${Math.min(1000, kills)}/1000)`;
+      } else if (o.id === 'kill2500') {
+        label = `${o.text} (${Math.min(2500, kills)}/2500)`;
+      } else if (o.id === 'kill5000') {
+        label = `${o.text} (${Math.min(5000, kills)}/5000)`;
+      } else if (o.id === 'killQueen') {
+        label = `${o.text} (${this.flags.killQueen ? 1 : 0}/1)`;
+      } else if (o.id === 'killKing') {
+        label = `${o.text} (${this.flags.killKing ? 1 : 0}/1)`;
+      } else if (o.targetAirports) {
+        const curAp = Math.min(o.targetAirports, airportsDone);
+        label = `${o.text} (${curAp}/${o.targetAirports})`;
+      } else if (o.targetHarbors) {
+        const curHb = Math.min(o.targetHarbors, harborsDone);
+        label = `${o.text} (${curHb}/${o.targetHarbors})`;
+      } else if (o.targetKm) {
+        const distMap = isPlaneMission ? P?.planeDistByBody : isBoatMission ? P?.boatDistByBody : P?.roverDistByBody;
+        const fallbackKm = isPlaneMission ? totalPlaneKm : isBoatMission ? totalBoatKm : totalRoverKm;
+        const curKm = Math.min(o.targetKm, o.body ? (((distMap && distMap[o.body]) || 0) / 1000) : fallbackKm);
+        const curStr = curKm >= 100 ? Math.floor(curKm) : curKm.toFixed(1);
+        label = `${o.text} (${curStr}/${o.targetKm} km)`;
+      }
+      return `<div class="mp-row ${this.flags[o.id] ? 'done' : ''}"><i>${this.flags[o.id] ? '✔' : '○'}</i>${label}</div>`;
+    }).join('');
+    this.layoutEventsBox();
+  }
+
+  checkObjectives() {
+    const v = this.player;
+    if (!v || this.phase === 'crashed') return;
+    const F = this.flags;
+    const kills = this.aliensKilled || 0;
+    const alienTarget = this.mission?.id === 'alien5000' ? 5000
+      : this.mission?.id === 'alien1500' ? 1500
+      : this.mission?.id === 'alien500' ? 500
+      : this.mission?.id === 'alien100' ? 100
+      : 0;
+    if (alienTarget > 0) {
+      if (kills >= 25 && !F.kill25) this.setFlag('kill25');
+      if (kills >= 50 && !F.kill50) this.setFlag('kill50');
+      if (kills >= 100 && !F.kill100 && alienTarget >= 100) this.setFlag('kill100');
+      if (kills >= 250 && !F.kill250 && alienTarget >= 500) this.setFlag('kill250');
+      if (kills >= 300 && !F.kill300 && alienTarget >= 1500) this.setFlag('kill300');
+      if (kills >= 500 && !F.kill500 && alienTarget >= 500) this.setFlag('kill500');
+      if (kills >= 750 && !F.kill750 && alienTarget >= 1500) this.setFlag('kill750');
+      if (kills >= 1000 && !F.kill1000 && alienTarget >= 5000) this.setFlag('kill1000');
+      if (kills >= 1500 && !F.kill1500 && alienTarget >= 1500) this.setFlag('kill1500');
+      if (kills >= 2500 && !F.kill2500 && alienTarget >= 5000) this.setFlag('kill2500');
+      if (kills >= 5000 && !F.kill5000 && alienTarget >= 5000) this.setFlag('kill5000');
+    }
+    if (v.ref === 'earth' && v.alt > ATM_TOP && !F.space) { this.setFlag('space'); this.setFlag('alt70'); }
+    if (v.ref === 'earth' && v.alt > ATM_TOP && !F.orbit) {
+      const el = vesselElements(v);
+      if (el.e < 1 && el.pe - R_E > ATM_TOP) {
+        this.setFlag('orbit');
+        this.milestone(
+          tr('VÀO QUỸ ĐẠO!', 'ORBIT ACHIEVED!'),
+          tr(`Cận điểm ${fmt((el.pe - R_E) / 1000)} km · viễn điểm ${fmt((el.ap - R_E) / 1000)} km`, `Periapsis ${fmt((el.pe - R_E) / 1000)} km · Apoapsis ${fmt((el.ap - R_E) / 1000)} km`)
+        );
+        this.event(tr('🛰 Đã vào quỹ đạo ổn định!', '🛰 Stable orbit achieved!'));
+      }
+    }
+    if (v.ref !== 'earth') {
+      const B = BODIES[v.ref] || BODIES.moon;
+      const soiKey = v.ref + 'SOI';
+      const orbKey = v.ref === 'moon' ? 'lunarOrbit' : v.ref + 'Orbit';
+      if (!F[soiKey]) { this.setFlag(soiKey); this.milestone(B.label.toUpperCase(), tr('Đã vào vùng hấp dẫn của ' + B.label, 'Entered ' + B.label + ' Sphere of Influence')); }
+      if (!F[orbKey] && v.alt > Math.max(10e3, B.atm)) {
+        const el = vesselElements(v);
+        if (el.e < 1 && el.pe - B.R > Math.max(8e3, B.atm)) this.setFlag(orbKey);
+      }
+    }
+    if (this.iss.visible || this.mission.id === 'iss') {
+      const d = this.issDistance();
+      if (d < 1000 && !F.near) { this.setFlag('near'); this.event(tr('Đã tiếp cận ISS (< 1 km).', 'Approached ISS (< 1 km).')); }
+    }
+    // Rover distance & planetary loop missions
+    if (v.isRover) {
+      const totalKm = (v.roverDistTotal || 0) / 1000;
+      const targetDistKm = this.mission?.targetDistKm || 500;
+      if (totalKm >= 100 && !F.roverDist100) {
+        this.setFlag('roverDist100');
+        if (this.mission?.id === 'rover_500km') {
+          this.milestone(
+            tr('🚙 ĐÃ CHẠY 100/500 KM!', '🚙 DROVE 100/500 KM!'),
+            tr('Tiếp tục giữ vững tay lái để chinh phục cột mốc 500 km!', 'Keep driving to conquer the 500 km milestone!')
+          );
+        }
+      }
+      if (totalKm >= 250 && !F.roverDist250) {
+        this.setFlag('roverDist250');
+        if (this.mission?.id === 'rover_500km' || this.mission?.id === 'rover_1000km') {
+          this.milestone(
+            tr(`🚙 ĐÃ CHẠY 250/${targetDistKm} KM!`, `🚙 DROVE 250/${targetDistKm} KM!`),
+            tr('Đã vượt cột mốc 250 km trên bề mặt!', 'Passed the 250 km surface driving milestone!')
+          );
+        }
+      }
+      if (totalKm >= 500 && !F.roverDist500) {
+        this.setFlag('roverDist500');
+        if (this.mission?.id === 'rover_500km') {
+          this.milestone(
+            tr('🏆🚙 HOÀN THÀNH 500 KM XE ROVER!', '🏆🚙 500 KM ROVER DRIVE COMPLETE!'),
+            tr('Xuất sắc! Bạn đã tự tay lái xe Rover vượt qua 500 km!', 'Awesome! You manually drove the Rover across 500 km!')
+          );
+        } else if (this.mission?.id === 'rover_1000km' || this.mission?.id === 'rover_2000km') {
+          this.milestone(
+            tr(`🚙 ĐÃ CHẠY 500/${targetDistKm} KM!`, `🚙 DROVE 500/${targetDistKm} KM!`),
+            tr('Tiếp tục hành trình xuyên lục địa!', 'Keep pushing on your cross-continental journey!')
+          );
+        }
+      }
+      if (totalKm >= 1000 && !F.roverDist1000) {
+        this.setFlag('roverDist1000');
+        if (this.mission?.id === 'rover_1000km') {
+          this.milestone(
+            tr('🏆🚙 HOÀN THÀNH 1000 KM XE ROVER!', '🏆🚙 1000 KM ROVER DRIVE COMPLETE!'),
+            tr('Kỳ tích! Bạn đã tự tay lái xe Rover chinh phục 1000 km!', 'Incredible feat! You manually drove the Rover for 1000 km!')
+          );
+        } else if (this.mission?.id === 'rover_2000km') {
+          this.milestone(
+            tr('🚙 ĐÃ CHẠY 1000/2000 KM!', '🚙 DROVE 1000/2000 KM!'),
+            tr('Đã hoàn thành 50% chặng đường 2000 km!', 'Halfway through the 2000 km endurance challenge!')
+          );
+        }
+      }
+      if (totalKm >= 2000 && !F.roverDist2000) {
+        this.setFlag('roverDist2000');
+        if (this.mission?.id === 'rover_2000km') {
+          this.milestone(
+            tr('👑🚙 HUYỀN THOẠI: ĐÃ CHẠY ĐỦ 2000 KM!', '👑🚙 LEGENDARY: 2000 KM ROVER DRIVE COMPLETE!'),
+            tr('Bậc thầy tay lái! Bạn đã tự tay điều khiển xe Rover vượt qua 2000 km!', 'Master driver! You manually drove the Rover across 2000 km!')
+          );
+        }
+      }
+      const tb = this.mission?.targetBody;
+      if (tb && v.landed && v.ref === tb) {
+        if (!F[`${tb}OnSurface`]) {
+          this.setFlag(`${tb}OnSurface`);
+        }
+        const bDistKm = ((v.roverDistByBody && v.roverDistByBody[tb]) || 0) / 1000;
+        const B = BODIES[tb] || BODIES.moon;
+        const halfKm = this.mission.halfDistKm || Math.round((Math.PI * B.R) / 1000);
+        const fullKm = this.mission.targetDistKm || Math.round((2 * Math.PI * B.R) / 1000);
+        if (bDistKm >= halfKm && !F[`${tb}HalfLoop`]) {
+          this.setFlag(`${tb}HalfLoop`);
+          this.milestone(
+            tr(`🚙 ĐÃ CHẠY NỬA VÒNG ${B.label.toUpperCase()}!`, `🚙 HALF LAP AROUND ${B.label.toUpperCase()}!`),
+            tr(`Đã đi được ${halfKm}/${fullKm} km (50% chu vi ${B.label})!`, `Driven ${halfKm}/${fullKm} km (50% of ${B.label}'s circumference)!`)
+          );
+        }
+        if (bDistKm >= fullKm && !F[`${tb}FullLoop`]) {
+          this.setFlag(`${tb}FullLoop`);
+          this.milestone(
+            tr(`👑🚙 ĐÃ CHẠY ĐỦ 1 VÒNG ${B.label.toUpperCase()}!`, `👑🚙 COMPLETED 1 FULL LAP AROUND ${B.label.toUpperCase()}!`),
+            tr(`Chinh phục trọn vẹn 1 vòng chu vi ${B.label} (${fullKm} km)!`, `Conquered a full circumference lap around ${B.label} (${fullKm} km)!`)
+          );
+        }
+      }
+      if (this.mission?.category === 'rover') {
+        this.renderMissionPanel();
+      }
+    }
+    // Airplane airport landing (1..5 airports) & planetary/lunar loop missions
+    if (v.isPlane) {
+      if (!v.landed && !v.clamped && (v.agl || 0) > 3.0) {
+        this.wasAirborneForAirport = true;
+      } else if (v.landed && !v.clamped) {
+        const apId = this.getCurrentAirportId(v);
+        if (apId && (this.wasAirborneForAirport || (apId !== this.lastLandedAirportId && (v.planeDistTotal || 0) > 40))) {
+          this.wasAirborneForAirport = false;
+          this.lastLandedAirportId = apId;
+          const arrivedApIdx = Number(String(apId).split(':')[1] || 0);
+          this.event(
+            tr(
+              `🛬 Đã hạ cánh an toàn xuống Sân bay ${arrivedApIdx}!`,
+              `🛬 Safely landed at Airport ${arrivedApIdx}!`
+            )
+          );
+          if (!this.visitedAirportIds) this.visitedAirportIds = new Set(['earth:0']);
+          this.visitedAirportIds.add(apId);
+          if (!this.airportsLandedSet) this.airportsLandedSet = new Set();
+          const keyToAdd = this.airportsLandedSet.has(apId)
+            ? `${apId}_flight_${this.airportsLandedSet.size + 1}`
+            : apId;
+          this.airportsLandedSet.add(keyToAdd);
+          const count = this.airportsLandedSet.size;
+          const targetAp = this.mission?.targetAirports || 0;
+          for (let k = 1; k <= 5; k++) {
+            if (count >= k && !F[`planeAirport${k}`]) {
+              this.setFlag(`planeAirport${k}`);
+              if (targetAp === k) {
+                this.milestone(
+                  tr(`🏆🛫 HOÀN THÀNH ĐÁP LÊN ${k} SÂN BAY!`, `🏆🛫 COMPLETED LANDING ON ${k} AIRPORT${k > 1 ? 'S' : ''}!`),
+                  tr(`Xuất sắc! Máy bay đã hạ cánh an toàn lên đủ ${k}/${k} sân bay!`, `Awesome! Aircraft landed safely on ${k}/${k} airport(s)!`)
+                );
+              } else if (targetAp > k) {
+                this.milestone(
+                  tr(`🛫 ĐÃ ĐÁP LÊN ${k}/${targetAp} SÂN BAY!`, `🛫 LANDED ON ${k}/${targetAp} AIRPORTS!`),
+                  tr(`Tiếp tục cất cánh và đáp lên sân bay tiếp theo (${k}/${targetAp})!`, `Take off and land on the next airport (${k}/${targetAp})!`)
+                );
+              }
+            }
+          }
+        }
+      }
+      const tb = this.mission?.targetBody;
+      if (tb && v.ref === tb) {
+        const bDistKm = ((v.planeDistByBody && v.planeDistByBody[tb]) || 0) / 1000;
+        if ((!v.landed && !v.clamped) || bDistKm >= 0.05) {
+          if (!F[`${tb}InAtmoFlight`]) {
+            this.setFlag(`${tb}InAtmoFlight`);
+          }
+        }
+        const B = BODIES[tb] || BODIES.earth;
+        const halfKm = this.mission.halfDistKm || Math.round((Math.PI * B.R) / 1000);
+        const fullKm = this.mission.targetDistKm || Math.round((2 * Math.PI * B.R) / 1000);
+        if (bDistKm >= halfKm && !F[`${tb}PlaneHalfLoop`]) {
+          this.setFlag(`${tb}PlaneHalfLoop`);
+          this.milestone(
+            tr(`✈️ ĐÃ BAY NỬA VÒNG ${B.label.toUpperCase()}!`, `✈️ HALF LAP FLOWN AROUND ${B.label.toUpperCase()}!`),
+            tr(`Đã bay được ${halfKm}/${fullKm} km (50% chu vi ${B.label})!`, `Flown ${halfKm}/${fullKm} km (50% of ${B.label}'s circumference)!`)
+          );
+        }
+        if (bDistKm >= fullKm && !F[`${tb}PlaneFullLoop`]) {
+          this.setFlag(`${tb}PlaneFullLoop`);
+          this.milestone(
+            tr(`👑✈️ ĐÃ BAY ĐỦ 1 VÒNG ${B.label.toUpperCase()}!`, `👑✈️ COMPLETED 1 FULL LAP AROUND ${B.label.toUpperCase()}!`),
+            tr(`Chinh phục trọn vẹn 1 vòng bầu khí quyển ${B.label} (${fullKm} km)!`, `Conquered a full atmospheric circumference lap around ${B.label} (${fullKm} km)!`)
+          );
+        }
+      }
+      if (this.mission?.category === 'plane') {
+        this.renderMissionPanel();
+      }
+    }
+    // Boat harbor-visiting (1..5 harbors) & distance missions (500 km, 1000 km, 2000 km)
+    if (v.isBoat) {
+      const hId = this.getCurrentHarborId(v);
+      if (!this.visitedHarborIds) this.visitedHarborIds = new Set(['earth:0']);
+      if (!this.harborsVisitedSet) this.harborsVisitedSet = new Set();
+      if (!hId) {
+        this.leftHarborForVoyage = true;
+      } else if (
+        hId !== this.lastVisitedHarborId &&
+        !this.visitedHarborIds.has(hId) &&
+        !this.harborsVisitedSet.has(hId) &&
+        (this.leftHarborForVoyage || (v.boatDistTotal || 0) > 40)
+      ) {
+        this.leftHarborForVoyage = false;
+        this.lastVisitedHarborId = hId;
+        this.visitedHarborIds.add(hId);
+        this.harborsVisitedSet.add(hId);
+        const arrivedHIdx = Number(hId.split(':')[1] || 0);
+        const count = this.harborsVisitedSet.size;
+        const targetHb = this.mission?.targetHarbors || 0;
+        this.event(
+          tr(`⚓ Đã cập Cảng ${arrivedHIdx} an toàn!`, `⚓ Safely docked at Harbor ${arrivedHIdx}!`),
+          'ok'
+        );
+        if (targetHb === 0) {
+          this.milestone(
+            tr(`⚓ ĐÃ CẬP CẢNG ${arrivedHIdx}!`, `⚓ DOCKED AT HARBOR ${arrivedHIdx}!`),
+            tr(`Thuyền đã cập bến Cảng ${arrivedHIdx} an toàn!`, `Boat safely moored at Harbor ${arrivedHIdx}!`)
+          );
+        }
+        for (let k = 1; k <= 5; k++) {
+          if (count >= k && !F[`boatHarbor${k}`]) {
+            this.setFlag(`boatHarbor${k}`);
+            if (targetHb === k) {
+              this.milestone(
+                tr(`🏆⚓ HOÀN THÀNH CẬP BẾN ${k} CẢNG BIỂN!`, `🏆⚓ COMPLETED VISITING ${k} HARBOR${k > 1 ? 'S' : ''}!`),
+                tr(`Xuất sắc! Thuyền đã cập Cảng ${arrivedHIdx} — hoàn thành đủ ${k}/${k} cảng biển!`, `Awesome! Boat docked at Harbor ${arrivedHIdx} — visited ${k}/${k} harbor(s)!`)
+              );
+            } else if (targetHb > k) {
+              this.milestone(
+                tr(`⚓ ĐÃ TỚI CẢNG ${arrivedHIdx} (${k}/${targetHb} CẢNG)!`, `⚓ ARRIVED AT HARBOR ${arrivedHIdx} (${k}/${targetHb} HARBORS)!`),
+                tr(`Tiếp tục lướt sóng tới cảng biển tiếp theo (${k}/${targetHb})!`, `Keep sailing to the next harbor (${k}/${targetHb})!`)
+              );
+            }
+          }
+        }
+      }
+      const totalKm = (v.boatDistTotal || 0) / 1000;
+      const targetDistKm = this.mission?.targetDistKm || 500;
+      if (totalKm >= 100 && !F.boatDist100) {
+        this.setFlag('boatDist100');
+        if (this.mission?.id === 'boat_500km') {
+          this.milestone(
+            tr('🛥️ ĐÃ ĐI 100/500 KM TRÊN BIỂN!', '🛥️ SAILED 100/500 KM AT SEA!'),
+            tr('Tiếp tục lướt sóng để chinh phục cột mốc hải trình 500 km!', 'Keep cruising to conquer the 500 km ocean milestone!')
+          );
+        }
+      }
+      if (totalKm >= 250 && !F.boatDist250) {
+        this.setFlag('boatDist250');
+        if (this.mission?.id === 'boat_500km' || this.mission?.id === 'boat_1000km') {
+          this.milestone(
+            tr(`🛥️ ĐÃ ĐI 250/${targetDistKm} KM TRÊN BIỂN!`, `🛥️ SAILED 250/${targetDistKm} KM AT SEA!`),
+            tr('Đã vượt cột mốc 250 km trên đại dương!', 'Passed the 250 km ocean voyage milestone!')
+          );
+        }
+      }
+      if (totalKm >= 500 && !F.boatDist500) {
+        this.setFlag('boatDist500');
+        if (this.mission?.id === 'boat_500km') {
+          this.milestone(
+            tr('🏆🛥️ HOÀN THÀNH 500 KM TRÊN BIỂN!', '🏆🛥️ 500 KM OCEAN VOYAGE COMPLETE!'),
+            tr('Xuất sắc! Bạn đã lái thuyền vượt qua 500 km trên biển!', 'Awesome! You sailed the boat across 500 km of open ocean!')
+          );
+        } else if (this.mission?.id === 'boat_1000km' || this.mission?.id === 'boat_2000km') {
+          this.milestone(
+            tr(`🛥️ ĐÃ ĐI 500/${targetDistKm} KM TRÊN BIỂN!`, `🛥️ SAILED 500/${targetDistKm} KM AT SEA!`),
+            tr('Tiếp tục hải trình viễn dương!', 'Keep pushing on your transoceanic voyage!')
+          );
+        }
+      }
+      if (totalKm >= 1000 && !F.boatDist1000) {
+        this.setFlag('boatDist1000');
+        if (this.mission?.id === 'boat_1000km') {
+          this.milestone(
+            tr('🏆🛥️ HOÀN THÀNH 1000 KM TRÊN BIỂN!', '🏆🛥️ 1000 KM OCEAN VOYAGE COMPLETE!'),
+            tr('Kỳ tích! Bạn đã lái thuyền chinh phục 1000 km trên đại dương!', 'Incredible feat! You sailed the boat for 1000 km across the ocean!')
+          );
+        } else if (this.mission?.id === 'boat_2000km') {
+          this.milestone(
+            tr('🛥️ ĐÃ ĐI 1000/2000 KM TRÊN BIỂN!', '🛥️ SAILED 1000/2000 KM AT SEA!'),
+            tr('Đã hoàn thành 50% hải trình 2000 km!', 'Halfway through the 2000 km ocean endurance challenge!')
+          );
+        }
+      }
+      if (totalKm >= 2000 && !F.boatDist2000) {
+        this.setFlag('boatDist2000');
+        if (this.mission?.id === 'boat_2000km') {
+          this.milestone(
+            tr('👑🛥️ HUYỀN THOẠI BIỂN KHƠI: ĐÃ ĐI ĐỦ 2000 KM!', '👑🛥️ OCEAN LEGEND: 2000 KM VOYAGE COMPLETE!'),
+            tr('Bậc thầy đại dương! Bạn đã điều khiển thuyền vượt qua 2000 km trên biển!', 'Master of the seas! You sailed the boat across 2000 km of ocean!')
+          );
+        }
+      }
+      if (this.mission?.category === 'boat') {
+        this.renderMissionPanel();
+      }
+    }
+    // mission completion
+    const objs = this.mission.objectives;
+    if (objs.length && objs.every((o) => F[o.id])) {
+      this.stopVesselOnMissionSuccess();
+      if (!this.missionCompletedMarked) {
+        this.missionCompletedMarked = true;
+        markMissionCompleted(this.mission.id);
+        this.renderMissionPanel(true);
+        if (this.app?.build?.renderMissionCards) this.app.build.renderMissionCards();
+      }
+      if (!this.completeTimer && !this.resultShown) {
+        this.completeTimer = setTimeout(() => this.showResult(true, tr('Hoàn thành nhiệm vụ: ' + this.mission.name + '!', 'Mission accomplished: ' + this.mission.name + '!')), 4500);
+        this.milestone(tr('NHIỆM VỤ HOÀN THÀNH', 'MISSION COMPLETE'), this.mission.name);
+      }
+    }
+    if (!objs.length && F.orbit && !this._freeOrbitNotified) {
+      this._freeOrbitNotified = true;
+      this.event(tr('🛰 Chúc mừng! Bạn có thể tự do điều khiển tàu trong quỹ đạo hoặc bấm menu để về xưởng.', '🛰 Congratulations! You can fly freely in orbit or open the menu to return to the VAB.'));
+    }
+  }
+
+  issDistance() {
+    const ip = this.issOrbit.pos(this.simT), s = this.player.s;
+    return Math.hypot(ip.x - s.x, ip.y - s.y, -s.z);
+  }
+
+  dockPortOffset() {
+    const dp = this.rocket.dockPort;
+    const v = this.player;
+    if (dp && v.owns(dp.seg)) {
+      const part = this.lay.parts.find((p) => p.item.type === 'dockPort');
+      const top = (part ? part.y : dp.obj.position.y) + (dp.obj.userData.port ? dp.obj.userData.port.position.y : 0.8);
+      return Math.max(top, v.com.maxY) - v.com.y;
+    }
+    return v.com.maxY - v.com.y;
+  }
+
+  dockGeometry() {
+    const t = this.simT, T = this.issOrbit, a = T.angle(t);
+    const ip = T.pos(t), iv = T.vel(t);
+    const ex = Math.cos(a), ey = -Math.sin(a), ux = Math.sin(a), uy = Math.cos(a);
+    const lx = this.issPortLocal.x, ly = this.issPortLocal.y;
+    const portS = { x: ip.x + ex * lx + ux * ly, y: ip.y + ey * lx + uy * ly, z: 0 };
+    const dxp = portS.x - ip.x, dyp = portS.y - ip.y;
+    const velS = { x: iv.x + dyp * T.n, y: iv.y - dxp * T.n, z: 0 };
+    const v = this.player, L = this.dockPortOffset();
+    const portV = { x: v.s.x + Math.sin(v.beta) * L, y: v.s.y + Math.cos(v.beta) * L, z: v.s.z };
+    return { portV, portS, axisS: { x: -ex, y: -ey }, velS, beta: angOf(ex, ey), L };
+  }
+
+  checkDocking() {
+    const v = this.player;
+    if (!v || this.docked || v.crashed || v.ref !== 'earth') return;
+    const d = this.dockGeometry();
+    const e = Math.hypot(d.portV.x - d.portS.x, d.portV.y - d.portS.y, d.portV.z - d.portS.z);
+    this.dockDist = e;
+    if (e > 25) return;
+    const rv = Math.hypot(v.s.vx - d.velS.x, v.s.vy - d.velS.y, v.s.vz - d.velS.z);
+    const att = Math.abs(wrapPi(v.beta - d.beta));
+    if (e < 0.95 && rv < 1.5 && att < 0.30) {
+      this.docked = { beta: d.beta, L: d.L };
+      this.throttle = 0;
+      if (this.program) {
+        if (this.program.phase !== undefined) this.program.phase = 'docked';
+        this.programDone = true;
+        this.program = null;
+      }
+      this.applyDockLock();
+      this.setFlag('docked');
+      this.event(tr('🛰 GHÉP NỐI THÀNH CÔNG! Tên lửa đã khóa chặt vào cổng ISS và bay cùng trạm.', '🛰 DOCKING SUCCESSFUL! Hard-docked with the ISS and orbiting together.'), '');
+      this.milestone(tr('GHÉP NỐI THÀNH CÔNG', 'DOCKING SUCCESSFUL'), tr('Tên lửa đã gắn vào ISS và bay cùng quỹ đạo trạm', 'Docked with the ISS and flying in station orbit'));
+      audio.thunk(0.5);
+    } else if (e < 0.95 && !this.dockWarned) { this.dockWarned = true; this.event(tr('Cổng đã chạm nhưng sai tư thế/vận tốc – giảm tốc độ!', 'Docking port touched at wrong angle/speed – slow down!'), 'warn'); }
+    else if (e > 1.5) this.dockWarned = false;
+  }
+
+  // =================================================================== LIFECYCLE
+  enter() {
+    this.active = true;
+    this.controls.enabled = this.camMode === 0;
+    $('launch-ui').classList.remove('hidden');
+    this.layoutEventsBox();
+  }
+
+  exit() {
+    this.archiveSpaceVessels();
+    this.aliensKilled = 0;
+    this.active = false;
+    this.controls.enabled = false;
+    $('launch-ui').classList.add('hidden');
+    $('result').classList.add('hidden');
+    this.toggleTeleportModal(false);
+    this.map.toggle(false);
+    audio.silenceEngine();
+    clearTimeout(this.completeTimer);
+    clearTimeout(this.crashTimer);
+    this.crashTimer = null;
+  }
+
+  onResize(w, h) {
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.layoutEventsBox();
+  }
+
+  buildFailureReasons(sub) {
+    const reasons = [];
+    const snap = this.lastCrashSnapshot;
+    const P = this.player;
+    const d = snap?.details || P?.crashDetails || null;
+
+    if (P?._autopilotMalfunction) {
+      reasons.push(tr(
+        'Máy tính Lái tự động (Autopilot) có tỷ lệ thành công 85% và 15% rủi ro gặp sự cố hệ thống dẫn đường.',
+        'The Autopilot guidance computer has an 85% mission success rate and a 15% risk of guidance system malfunction.'
+      ));
+      reasons.push(tr(
+        'Mẹo: Nhấn "Thử lại" để bay lại (85% cơ hội thành công với Tự lái) hoặc tự điều khiển thủ công để làm chủ 100% hành trình!',
+        'Tip: Click "Retry" to fly again (85% success chance with Autopilot) or pilot manually for 100% control!'
+      ));
+      return reasons;
+    }
+
+    if (!this.lifted && this.met > 35) {
+      const st0 = P ? this.segInfo[P.activeSeg] : null;
+      const twr = this.thrustTotalSL() / ((P?.com?.mass || 1) * G_E);
+      if (st0?.needsBattery) {
+        reasons.push(tr(
+          'Động cơ Lazer và Động cơ Phản Trọng Lực bắt buộc phải lắp Cục Pin Năng Lượng mới hoạt động được (không chạy bằng bồn nhiên liệu thường).',
+          'Laser and Anti-Gravity Engines require a Quantum Energy Battery to operate (they cannot run on regular fuel tanks).'
+        ));
+      } else if (st0?.needsChemFuel) {
+        reasons.push(tr(
+          'Động cơ thường bắt buộc phải lắp Bồn nhiên liệu (không thể dùng Cục Pin Năng Lượng).',
+          'Regular chemical engines require a standard Fuel Tank (they cannot run on a Quantum Energy Battery).'
+        ));
+      } else if (this.thrustTotalSL() <= 0) {
+        reasons.push(tr(
+          'Tầng dưới cùng chưa được lắp động cơ hoặc thiếu nhiên liệu tương thích nên không có lực đẩy khi phóng.',
+          'The bottom stage has no engine installed or lacks compatible fuel, producing zero liftoff thrust.'
+        ));
+      } else if (twr < 1) {
+        reasons.push(tr(
+          `Tỉ lệ Lực đẩy / Trọng lượng (TWR = ${twr.toFixed(2)}) nhỏ hơn 1.0 nên tên lửa quá nặng để nhấc khỏi bệ phóng.`,
+          `Thrust-to-Weight Ratio (TWR = ${twr.toFixed(2)}) is below 1.0, so the rocket is too heavy to lift off.`
+        ));
+      } else if (this.throttle < 0.5) {
+        reasons.push(tr(
+          `Mức ga (Throttle = ${Math.round(this.throttle * 100)}%) để quá thấp, chưa đủ lực nâng tên lửa.`,
+          `Throttle (${Math.round(this.throttle * 100)}%) was set too low to lift the rocket.`
+        ));
+      }
+      return reasons;
+    }
+
+    if (snap && (sub?.includes('áp suất khí động') || sub?.includes('lật nhào') || sub?.includes('dynamic pressure') || sub?.includes('tumbled'))) {
+      reasons.push(tr(
+        `Áp suất khí động đạt ${(snap.qNow / 1000).toFixed(1)} kPa kết hợp góc lệch hướng bay lớn (${snap.offDeg}°) vượt ngưỡng chịu lực làm gãy thân tên lửa.`,
+        `High dynamic pressure (${(snap.qNow / 1000).toFixed(1)} kPa) combined with a large angle of attack (${snap.offDeg}°) exceeded structural limits.`
+      ));
+      reasons.push(tr(
+        'Mẹo: Giữ mũi tên lửa bám sát hướng bay (chế độ SAS Prograde) hoặc giảm bớt ga khi vượt vùng Max-Q (độ cao 8–15 km).',
+        'Tip: Keep the nose aligned with Prograde or throttle down slightly through Max-Q (8–15 km altitude).'
+      ));
+      return reasons;
+    }
+
+    if (d) {
+      if (d.sp > d.vLim) {
+        reasons.push(tr(
+          `Vận tốc va chạm quá lớn: ${fmt(d.sp, 0)} m/s (giới hạn hạ cánh an toàn ≤ ${d.vLim} m/s).`,
+          `Impact speed was too high: ${fmt(d.sp, 0)} m/s (safe landing limit ≤ ${d.vLim} m/s).`
+        ));
+      }
+      if (d.where === 'water' && !P?.isBoat) {
+        if (!d.chuteOk) {
+          if (d.hasCapsule) {
+            reasons.push(tr(
+              'Chưa bung dù hạ cánh trước khi tiếp nước (nhấn phím P khi rơi xuống thấp để bung dù).',
+              'Parachutes were not deployed before splashdown (press P during descent to deploy parachutes).'
+            ));
+          } else {
+            reasons.push(tr(
+              'Tên lửa lao xuống biển mà không có khoang chỉ huy mang dù hạ cánh.',
+              'Rocket impacted the ocean without a crew capsule equipped with parachutes.'
+            ));
+          }
+        }
+      } else if (d.where === 'ground' && !P?.isRover && !P?.isPlane && !P?.isBoat) {
+        if (!d.chuteOk && !d.legsOk) {
+          if (d.hasCapsule || d.hasLegs) {
+            reasons.push(tr(
+              'Chưa bung dù hoặc chân đáp trước khi chạm đất (nhấn phím P để bung dù/chân hạ cánh).',
+              'Parachutes or landing legs were not deployed before touchdown (press P to deploy).'
+            ));
+          } else {
+            reasons.push(tr(
+              'Tầng chạm đất không có dù hạ cánh hoặc chân đáp giảm chấn.',
+              'The stage hit the ground without parachutes or landing legs.'
+            ));
+          }
+        }
+        if (d.sp <= d.vLim && d.horizSp >= 4) {
+          reasons.push(tr(
+            `Vận tốc trượt ngang khi tiếp đất quá cao (${fmt(d.horizSp, 1)} m/s, cần phanh ngang < 4 m/s).`,
+            `Horizontal speed at touchdown was too high (${fmt(d.horizSp, 1)} m/s, must be < 4 m/s).`
+          ));
+        }
+        if (d.tiltDeg > 25) {
+          reasons.push(tr(
+            `Góc nghiêng thân tàu khi chạm bề mặt quá lớn (${d.tiltDeg}° so với phương thẳng đứng).`,
+            `Vehicle tilt angle at impact was too steep (${d.tiltDeg}° from vertical).`
+          ));
+        }
+      }
+    }
+
+    if (snap) {
+      if (snap.activeFuel <= 0.02 && snap.segRemaining > 1) {
+        reasons.push(tr(
+          `Tầng ${snap.activeStageNum} đã cháy hết nhiên liệu nhưng chưa nhấn phím SPACE để tách tầng và kích hoạt tầng tiếp theo.`,
+          `Stage ${snap.activeStageNum} ran out of fuel, but SPACE was not pressed to stage and ignite the next stage.`
+        ));
+      } else if (snap.totalFuel <= 0.02) {
+        reasons.push(tr(
+          'Tên lửa đã đốt cạn toàn bộ nhiên liệu trước khi đạt đủ vận tốc quỹ đạo nên rơi trở lại.',
+          'All propellant was exhausted before reaching orbital velocity, causing the rocket to fall back down.'
+        ));
+      } else if ((!snap.wasEngineOn || snap.throttle < 0.1) && snap.totalFuel > 0.1 && this.maxAlt < 50000) {
+        reasons.push(tr(
+          'Động cơ bị tắt hoặc mức ga (Throttle) quá thấp khi chưa lên quỹ đạo khiến tên lửa mất sức nâng và rơi xuống.',
+          'Engines were shut off or throttled too low before reaching orbit, causing the rocket to fall.'
+        ));
+      } else if (this.maxAlt < 18000 && snap.tiltDeg > 55) {
+        reasons.push(tr(
+          `Tên lửa nghiêng mũi quá sớm (${snap.tiltDeg}°) khi còn ở độ cao thấp (${fmt(this.maxAlt, 0)} m) khiến quỹ đạo lao chúc xuống.`,
+          `Rocket pitched over too steeply (${snap.tiltDeg}°) at low altitude (${fmt(this.maxAlt, 0)} m), driving its trajectory downward.`
+        ));
+      }
+    }
+
+    if (!reasons.length && sub) {
+      reasons.push(tr(
+        `Sự cố: ${sub} Hãy kiểm tra lại lực đẩy, nhiên liệu các tầng hoặc nhấn phím G để bật Lái tự động.`,
+        `Incident: ${sub} Check stage thrust/fuel or press G to enable Autopilot.`
+      ));
+    }
+    return reasons;
+  }
+
+  stopVesselOnMissionSuccess() {
+    if (this.missionSuccessStopped) return;
+    const P = this.player;
+    if (!P || P.crashed || P.dead) return;
+    this.missionSuccessStopped = true;
+    this.program = null;
+    this.programDone = true;
+    this.autoShootAliens = false;
+    this.firingHeld = false;
+    this.throttle = 0;
+    this.userWarp = 1;
+    this.warp = 1;
+    this.reqWarpNext = 1;
+    this.reqWarpPrev = 1;
+    P._warp = 1;
+    P._guidedTargetAlt = null;
+    P.throttle = 0;
+    P.engineOn = false;
+    P.coreFiring = false;
+    P.boosterFiring = false;
+    P.thrustNow = 0;
+    P.accelNow = 0;
+    P.qNow = 0;
+    P.omega = 0;
+    P.turnYawRate = 0;
+    P.bank = 0;
+    P.groundSpeed = 0;
+    P.waterSpeed = 0;
+    P.planeRollSpeed = 0;
+    if (P.ctl) {
+      P.ctl.input = 0;
+      P.ctl.drive = 0;
+      P.ctl.rcs = [0, 0, 0];
+      P.ctl.targetBeta = null;
+    }
+    audio.silenceEngine();
+    if (this.docked) {
+      this.missionStopAnchor = null;
+      return;
+    }
+    if (P.landed || P.clamped) {
+      const L = P.landed || P.clampSpot;
+      if (L) {
+        P.placeOnSurface(L.body || P.ref, L.sx ?? P.sx, L.h ?? P.alt, this.simT, P.beta);
+        if (L.sz !== undefined) {
+          P.s.z = L.sz;
+          P.updateFrame(this.simT);
+        }
+      }
+      P.vSurf.e = 0;
+      P.vSurf.u = 0;
+      P.vSurf.z = 0;
+      P.speedSurf = 0;
+      this.missionStopAnchor = { mode: 'landed' };
+      return;
+    }
+    const B = P.body || bodyInfo(P.ref);
+    const inAtmOrPlane = P.isPlane || ((B.atm || 0) > 0 && P.alt < B.atm);
+    if (inAtmOrPlane) {
+      const keepZ = P.s.z || 0;
+      const keepBeta = P.isPlane ? wrapPi(P.phi + Math.PI / 2) : P.beta;
+      const betaOff = wrapPi(keepBeta - P.phi);
+      this.missionStopAnchor = {
+        mode: 'air',
+        body: P.ref,
+        sx: P.sx || 0,
+        sz: keepZ,
+        alt: P.alt,
+        betaOff,
+      };
+      P.placeOnSurface(P.ref, P.sx || 0, P.alt, this.simT, keepBeta);
+      if (keepZ) {
+        P.s.z = keepZ;
+        P.updateFrame(this.simT);
+      }
+      P.vSurf.e = 0;
+      P.vSurf.u = 0;
+      P.vSurf.z = 0;
+      P.speedSurf = 0;
+    } else {
+      const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+      bodyState(P.ref, this.simT, bp, bv);
+      this.missionStopAnchor = {
+        mode: 'space',
+        body: P.ref,
+        dx: P.s.x - bp.x,
+        dy: P.s.y - bp.y,
+        dz: (P.s.z || 0) - (bp.z || 0),
+        beta: P.beta,
+      };
+      P.s.vx = bv.x;
+      P.s.vy = bv.y;
+      P.s.vz = bv.z || 0;
+      P.updateFrame(this.simT);
+      P.vOrb.e = 0;
+      P.vOrb.u = 0;
+      P.vSurf.e = 0;
+      P.vSurf.u = 0;
+      P.vSurf.z = 0;
+      P.speedOrb = 0;
+      P.speedSurf = 0;
+    }
+    this.holdAttitude();
+  }
+
+  showResult(success, sub) {
+    if (success && this.mission && this.mission.id !== 'free') {
+      this.stopVesselOnMissionSuccess();
+    }
+    if (this.resultShown) return;
+    this.resultShown = true;
+    if (success && this.mission && this.mission.id !== 'free') {
+      markMissionCompleted(this.mission.id);
+      if (this.app?.build?.renderMissionCards) this.app.build.renderMissionCards();
+    }
+    const isSpecial = this.player && (this.player.isRover || this.player.isBoat || this.player.isPlane);
+    const alt = this.maxAlt;
+    let rank = 'F';
+    const objs = this.mission.objectives;
+    if (isSpecial) {
+      rank = success ? 'S' : 'A';
+    } else if (objs.length) {
+      const done = objs.filter((o) => this.flags[o.id]).length;
+      rank = done === objs.length ? 'S' : done / objs.length > 0.6 ? 'A' : done / objs.length > 0.3 ? 'B' : done > 0 ? 'C' : 'D';
+    } else if (this.flags.orbit) rank = 'S';
+    else if (alt >= 100000) rank = 'A';
+    else if (alt >= 50000) rank = 'B';
+    else if (alt >= 10000) rank = 'C';
+    else if (alt >= 1000) rank = 'D';
+    const title = success
+      ? tr('NHIỆM VỤ THÀNH CÔNG', 'MISSION ACCOMPLISHED')
+      : (this.player?.isRover
+        ? tr('KẾT THÚC LÁI XE', 'DRIVE ENDED')
+        : this.player?.isBoat
+          ? tr('KẾT THÚC LƯỚT SÓNG', 'CRUISE ENDED')
+          : tr('KẾT THÚC CHUYẾN BAY', 'FLIGHT ENDED'));
+    $('r-title').textContent = title;
+    $('r-rank').textContent = rank;
+    $('r-sub').textContent = sub || '';
+    const reasonEl = $('r-reason');
+    if (reasonEl) {
+      if (!success) {
+        const reasons = this.buildFailureReasons(sub);
+        if (reasons.length) {
+          reasonEl.innerHTML = `<div class="rr-title">⚠️ ${tr('Nguyên nhân chi tiết', 'Detailed Cause')}</div><ul>${reasons.map((r) => `<li>${r}</li>`).join('')}</ul>`;
+          reasonEl.classList.remove('hidden');
+        } else {
+          reasonEl.classList.add('hidden');
+        }
+      } else {
+        reasonEl.classList.add('hidden');
+      }
+    }
+    $('r-alt').textContent = alt >= 10000 ? fmt(alt / 1000, 1) + ' km' : fmt(alt) + ' m';
+    $('r-vel').textContent = fmt(this.maxVel) + ' m/s';
+    $('r-time').textContent = fmt(Math.max(0, this.met)) + ' s';
+    $('r-g').textContent = fmt(this.maxG, 1) + ' G';
+    const isExploded = !!(this.phase === 'crashed' || this.player?.crashed || this.player?.dead);
+    const btnContinue = $('btn-res-continue') || document.querySelector('#result [data-act="continue"]');
+    if (btnContinue) btnContinue.classList.toggle('hidden', isExploded);
+    $('result').classList.remove('hidden');
+  }
+
+  // =================================================================== SIMULATION
+  getAlienFuelDrainInfo(v) {
+    if (this.aliensDisabled || !v || v !== this.player || v.clamped || this.docked || this.missionSuccessStopped) {
+      return { count: 0, drainMul: 1.0 };
+    }
+    const list = this.aliens || [];
+    let count = 0;
+    let heavyBonus = 0;
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      if (!a || a.dead || a.hp <= 0) continue;
+      count++;
+      if (a.isRoyal) heavyBonus += 0.35;
+      else if (a.tier === 'boss') heavyBonus += 0.10;
+      else if (a.tier === 'warrior') heavyBonus += 0.05;
+    }
+    if (count === 0) return { count: 0, drainMul: 1.0 };
+    const drainMul = +(1.0 + count * 0.15 + heavyBonus).toFixed(2);
+    return { count, drainMul };
+  }
+
+  get env() {
+    return this._env || (this._env = {
+      surface: (v) => this.surfaceAt(v),
+      resolveBuilding: (v, sx, sz, alt, rPad) => this.resolveBuildingCollision(v, sx, sz, alt, rPad),
+      getAlienFuelDrain: (v) => this.getAlienFuelDrainInfo(v),
+    });
+  }
+
+  effectiveWarp() {
+    if (this.phase === 'crashed' || this.player?.crashed || this.missionSuccessStopped) return 1;
+    let w = this.program
+      ? (this.reqWarpPrev === 1 && this.player?.engineOn ? 1 : Math.max(this.reqWarpPrev || 1, this.userWarp || 1))
+      : this.userWarp;
+    if (this.phase === 'countdown') w = 1;
+    let cap = Infinity;
+    for (const v of this.vessels) {
+      if (v.dead || v.crashed) continue;
+      const atm = !v.isPlane && v.ref === 'earth' && v.alt < ATM_TOP && !v.clamped && !v.landed;
+      if (atm && (v.engineOn || v.coreFiring || v.boosterFiring)) cap = Math.min(cap, 10);
+      if (v.kind === 'booster' && v.rec && v.rec.phase !== 'done' && v.rec.phase !== 'lost') cap = Math.min(cap, 10);
+    }
+    if (this.player && this.mission.id === 'iss' && this.flags.orbit && !this.docked && this.issDistance() < 2500) cap = Math.min(cap, 10);
+    if (this.player && this.player.isRover && (this.player.ctl?.drive || Math.abs(this.player.groundSpeed || 0) > 0.02)) {
+      cap = Math.min(cap, 1000);
+    }
+    if (this.player && this.player.isBoat && (this.player.ctl?.drive || Math.abs(this.player.waterSpeed || 0) > 0.02)) {
+      cap = Math.min(cap, 1000);
+    }
+    if (this.player && this.player.isPlane) {
+      if ((this.player.landed || this.player.clamped) && this.player.engineOn && this.player.throttle > 0.01) {
+        cap = Math.min(cap, 10);
+      } else if (this.program instanceof PlaneAirportHopProgram) {
+        const tgt = this.program._targetSite;
+        if (tgt) {
+          const d = Math.hypot(
+            this.bodyDeltaX(this.player.ref, tgt.sx + 220, this.player.sx || 0),
+            (tgt.sz || 0) - (this.player.s?.z || 0)
+          );
+          cap = Math.min(cap, d > 60000 ? 1500 : d > 20000 ? 500 : d > 6000 ? 80 : d > 2000 ? 10 : 2);
+        } else {
+          cap = Math.min(cap, 10);
+        }
+      }
+    }
+    return Math.min(w, cap);
+  }
+
+  needsFine() {
+    if (this.player?.crashed && this.player?.crashAnchor?.mode === 'coast') {
+      const P = this.player;
+      if (P.ref === 'earth' && P.alt < ATM_TOP) return true;
+      if (P.ref !== 'earth' && P.alt < Math.max(50e3, (P.body?.atm || 0) + 15e3)) return true;
+    }
+    for (const v of this.vessels) {
+      if (v.dead) continue;
+      if (v.engineOn || (v.clamped && this.phase === 'countdown')) return true;
+      if (v.isRover && (v.ctl?.drive || v.ctl?.input || Math.abs(v.groundSpeed || 0) > 0.02)) return true;
+      if (v.isBoat && (v.ctl?.drive || v.ctl?.input || Math.abs(v.waterSpeed || 0) > 0.02)) return true;
+      if (v.ref === 'earth' && !v.clamped && !v.landed && v.alt < ATM_TOP) return true;
+      if (v.ref !== 'earth' && !v.landed && v.alt < Math.max(50e3, (v.body?.atm || 0) + 15e3)) return true;
+      const r = v.ctl.rcs; if (r[0] || r[1] || r[2]) return true;
+    }
+    if (this.mission.id === 'iss' && this.flags.orbit && !this.docked && this.issDistance() < 800) return true;
+    return false;
+  }
+
+  applyControls(h) {
+    const v = this.player;
+    if (!v || v.crashed) return;
+    if (this.missionSuccessStopped) {
+      v.ctl.input = 0;
+      v.ctl.drive = 0;
+      v.ctl.rcs = [0, 0, 0];
+      v.ctl.targetBeta = null;
+      this.throttle = 0;
+      v.throttle = 0;
+      v.engineOn = false;
+      return;
+    }
+    const kb = this.keys;
+    const isSpecial = v.isSpecial;
+    const kbInput = (kb['d'] || kb['arrowright'] ? 1 : 0) - (kb['a'] || kb['arrowleft'] ? 1 : 0);
+    const kbDrive = (kb['w'] || kb['arrowup'] ? 1 : 0) - (kb['s'] || kb['arrowdown'] ? 1 : 0);
+    const jx = isSpecial ? (this.joyX || 0) : 0;
+    const jy = isSpecial ? (this.joyY || 0) : 0;
+    const hasJoy = Math.abs(jx) > 0.001 || Math.abs(jy) > 0.001;
+    const input = hasJoy ? THREE.MathUtils.clamp(kbInput + jx, -1, 1) : kbInput;
+    const drive = hasJoy ? THREE.MathUtils.clamp(kbDrive + jy, -1, 1) : kbDrive;
+    v.ctl.input = input;
+    v.ctl.drive = drive;
+    if (hasJoy && v.isPlane && v.landed && !this.missionSuccessStopped) {
+      if (jy > 0.22 && this.throttle < jy) {
+        this.ignited = true;
+        this.throttle = Math.min(1, this.throttle + jy * 1.4 * h);
+      } else if (jy < -0.30) {
+        this.throttle = Math.max(0, this.throttle + jy * 2.2 * h);
+        v.planeRollSpeed = Math.max(0, (v.planeRollSpeed || 0) - 28 * Math.abs(jy) * h);
+      }
+    }
+    // Special vehicles (Rover, Boat, Plane) or non-flight phases use specialized 2D controls
+
+    if (!isSpecial && this.phase === 'flight') {
+      if (!this.program) v.ctl.targetBeta = null;
+      const screenRight = input;
+      const screenAway = drive;
+
+      if (screenRight !== 0 || screenAway !== 0) {
+        if (this.program) this.toggleAutopilot();
+
+        const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+        const camForward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+
+        const steer = new THREE.Vector3();
+        if (screenRight !== 0) steer.addScaledVector(camRight, screenRight);
+        if (screenAway !== 0) steer.addScaledVector(camForward, screenAway);
+        steer.normalize();
+
+        if (!v.dir3D) v.dir3D = new THREE.Vector3(0, 1, 0);
+        const dot = v.dir3D.dot(steer);
+        let tangent = steer.clone().sub(v.dir3D.clone().multiplyScalar(dot));
+        if (tangent.lengthSq() > 1e-6) {
+          tangent.normalize();
+        } else {
+          tangent = camRight.clone().sub(v.dir3D.clone().multiplyScalar(v.dir3D.dot(camRight))).normalize();
+        }
+
+        const thrust = v.thrustNow || 0;
+        const gimbal = thrust > 0 ? 0.35 : 0;
+        const finAuth = (v.finsT || 0) * Math.min(0.8, (v.qNow || 0) / 15000);
+        const rcsAuth = (v.ctl.rcs[0] || v.ctl.rcs[1] || v.ctl.rcs[2]) ? 0.25 : 0.05;
+        const auth = (0.28 + gimbal + finAuth + rcsAuth) * Math.min(1.5, Math.max(0.35, 35 / v.mass));
+        const turnRate = THREE.MathUtils.clamp(auth * 0.6, 0.22, 0.75);
+
+        v.dir3D.addScaledVector(tangent, turnRate * h).normalize();
+        if (v.holdDir3D) v.holdDir3D.copy(v.dir3D);
+        v.syncBetaFromDir3D();
+        this.holdBeta = v.beta;
+      } else if (this.sas && !this.program) {
+        let targetDir = null;
+        if (this.sasMode === 0) {
+          targetDir = v.holdDir3D || v.dir3D;
+        } else if (this.sasMode === 1 || this.sasMode === 2) {
+          const vs = v.vSurf;
+          const low = v.ref === 'earth' && v.alt < 40000;
+          let vel = low ? new THREE.Vector3(vs.e, vs.u, vs.z) : new THREE.Vector3(v.vOrb.e, v.vOrb.u, v.s.vz);
+          if (vel.length() > 0.5) {
+            targetDir = vel.normalize();
+            if (this.sasMode === 2) targetDir.negate();
+          }
+        } else if (this.sasMode === 3) {
+          targetDir = new THREE.Vector3(0, 1, 0);
+        } else if (this.sasMode === 4) {
+          targetDir = new THREE.Vector3(0, -1, 0);
+        } else if (this.sasMode === 5 || this.sasMode === 6) {
+          const ip = this.issOrbit.pos(this.simT);
+          const E = v.east, U = v.up, S = v.s;
+          const dx = ip.x - S.x, dy = ip.y - S.y, dz = (ip.z || 0) - S.z;
+          const tDir = new THREE.Vector3(dx * E.x + dy * E.y, dx * U.x + dy * U.y, dz);
+          if (tDir.length() > 1) {
+            targetDir = tDir.normalize();
+            if (this.sasMode === 6) targetDir.negate();
+          }
+        }
+
+        if (targetDir) {
+          const d = THREE.MathUtils.clamp(v.dir3D.dot(targetDir), -1, 1);
+          if (d < 0.9999) {
+            const tangent = targetDir.clone().sub(v.dir3D.clone().multiplyScalar(d)).normalize();
+            const alignRate = Math.min(1.2, Math.acos(d) * 1.8);
+            v.dir3D.addScaledVector(tangent, alignRate * h).normalize();
+            if (this.sasMode === 0 && v.holdDir3D) v.holdDir3D.copy(v.dir3D);
+            v.syncBetaFromDir3D();
+            this.holdBeta = v.beta;
+          }
+        }
+      }
+    } else {
+      if (input !== 0 || ((v.isPlane || v.isBoat) && drive !== 0)) {
+        this.holdBeta = v.beta;
+        if (this.program && this.phase === 'flight') this.toggleAutopilot();
+      }
+      // manual flight for rover/boat/plane
+      if (this.sas && input === 0 && this.phase !== 'ready') {
+        v.ctl.targetBeta = this.sasTarget(v);
+        v.ctl.kp = 2.2;
+        v.ctl.kd = 2.8;
+      } else {
+        v.ctl.targetBeta = null;
+      }
+      v.syncDir3DFromBeta();
+      if (v.holdDir3D) v.holdDir3D.copy(v.dir3D);
+    }
+
+    // RCS
+    const dockAuto = this.program && this.program.phase && (this.program.phase === 'approach' || this.program.phase === 'final');
+    if (!dockAuto && !this.docked) {
+      const rf = (kb['i'] ? 1 : 0) - (kb['k'] ? 1 : 0), rn = (kb['l'] ? 1 : 0) - (kb['j'] ? 1 : 0), rz = (kb['h'] ? 1 : 0) - (kb['n'] ? 1 : 0);
+      if (!this.program || rf || rn || rz) v.ctl.rcs = [rf, rn, rz];
+    }
+    if (this.program && this.phase === 'flight') return;
+
+    if (this.phase === 'flight' || this.phase === 'countdown') {
+      v.throttle = this.throttle;
+      let on = this.ignited && this.throttle > 0;
+      const k = v.activeSeg;
+      if (on && v.segIdx.length > 1 && !this.boosterReleased && v.deployables('legs').some((d) => d.seg === k)) {
+        const reserve = this.segInfo[k].dry * (Math.exp(600 / 2900) - 1);
+        if (this.fuel[k] <= reserve + 1e-3) {
+          on = false;
+          if (!this.mecoWarned) { this.mecoWarned = true; this.event(tr('Tầng 1 dừng ở mức nhiên liệu dự trữ để hạ cánh – nhấn SPACE để tách tầng.', 'Stage 1 cutoff at landing fuel reserve – press SPACE to stage.'), 'warn'); }
+        }
+      }
+      v.engineOn = on;
+    }
+  }
+
+  sasTarget(v) {
+    switch (this.sasMode) {
+      case 1: return v.ref === 'earth' && v.alt < 40000 ? v.phi + Math.atan2(v.vSurf.e, v.vSurf.u) : progradeBeta(v);
+      case 2: return (v.ref === 'earth' && v.alt < 40000 ? v.phi + Math.atan2(v.vSurf.e, v.vSurf.u) : progradeBeta(v)) + Math.PI;
+      case 3: return v.phi;
+      case 4: return v.phi + Math.PI;
+      case 5: case 6: {
+        const ip = this.issOrbit.pos(this.simT);
+        const a = angOf(ip.x - v.s.x, ip.y - v.s.y);
+        return this.sasMode === 5 ? a : a + Math.PI;
+      }
+      default: return this.holdBeta;
+    }
+  }
+
+  handleEvents(v) {
+    for (const e of v.events.splice(0)) {
+      const type = e[0];
+      if (type === 'fuelOut') {
+        if (v === this.player) {
+          if (!this.fuelNote?.[e[1]]) {
+            (this.fuelNote ||= {})[e[1]] = true;
+            this.event(tr(`Tầng ${this.segs.length - e[1]} hết nhiên liệu.`, `Stage ${this.segs.length - e[1]} out of fuel.`), 'warn');
+          }
+          if (this.program) this.checkAutoStage(v);
+        }
+      } else if (type === 'boosterOut') this.jettisonBooster(v, e[1]);
+      else if (type === 'liftoff') {
+        if (v === this.player) {
+          if (!this.lifted) { this.lifted = true; this.event(tr('🚀 CẤT CÁNH!', '🚀 LIFTOFF!')); }
+          else if (v.ref === 'moon' && this.flags.moonLanded) { this.setFlag('moonLeft'); this.event(tr('Cất cánh khỏi Mặt Trăng!', 'Liftoff from the Moon!')); }
+        }
+      } else if (type === 'landed') this.onLanded(v, e[1], e[2]);
+      else if (type === 'atmCeiling') {
+        if (v === this.player) {
+          const curB = BODIES[v.ref] || BODIES.earth;
+          this.event(
+            tr(
+              `✈️ Máy bay đã chạm trần bầu khí quyển của ${curB.label} — Không thể bay ra ngoài không gian vũ trụ!`,
+              `✈️ Aircraft reached ${curB.label}'s atmospheric ceiling — Cannot fly out into outer space!`
+            ),
+            'warn'
+          );
+        }
+      } else if (type === 'crash') this.explode(v, e[1]);
+    }
+  }
+
+  onLanded(v, how, site) {
+    if (v === this.player) {
+      if (v.ref !== 'earth') {
+        const B = BODIES[v.ref] || BODIES.moon;
+        this.event(tr('Hạ cánh xuống ' + B.label + ' an toàn!', 'Landed safely on ' + B.label + '!'));
+        this.setFlag(v.ref + 'Landed');
+        this.milestone(tr('MỘT BƯỚC NHỎ', 'ONE SMALL STEP'), tr('Hạ cánh thành công xuống ' + B.label + '!', 'Successfully landed on ' + B.label + '!'));
+        this.moonLandT = this.simT;
+      } else if (this.lifted && this.simT - (this.launchT || 0) > 30) {
+        this.event(how === 'splash' ? tr('Hạ thủy an toàn!', 'Safe splashdown!') : tr('Hạ cánh an toàn!', 'Safe touchdown!'));
+        if (this.mission.id === 'moon' && this.flags.moonLeft) { this.setFlag('home'); this.milestone(tr('VỀ NHÀ', 'WELCOME HOME'), tr('Trở về Trái Đất an toàn!', 'Returned safely to Earth!')); }
+        else if (this.mission.id === 'orbit' && !v.isPlane && !v.isRover && !v.isBoat) setTimeout(() => this.showResult(this.maxAlt > 1000, tr('Tên lửa đã hạ xuống an toàn.', 'Rocket has landed safely.')), 2500);
+      }
+    } else if (v.kind === 'booster') {
+      this.setFlag('boosterLanded');
+      this.pipKeep = 9;
+      this.event(site === 'ship' ? tr('🚢 Tầng 1 hạ cánh trên sà lan!', '🚢 Stage 1 landed on the drone ship!') : site === 'lz' ? tr('🎯 Tầng 1 hạ cánh trên bãi đáp LZ-1!', '🎯 Stage 1 landed at LZ-1!') : tr('Tầng 1 hạ cánh (ngoài bãi đáp).', 'Stage 1 landed (off-pad).'));
+      this.milestone(tr('TẦNG 1 ĐÃ HẠ CÁNH', 'STAGE 1 LANDED'), site === 'ship' ? tr('Sà lan "Dĩ nhiên tôi vẫn yêu bạn"', 'Drone Ship "Of Course I Still Love You"') : tr('Sẵn sàng tái sử dụng!', 'Ready for reuse!'));
+    }
+  }
+
+  applyDockLock() {
+    const v = this.player;
+    if (!v || !this.docked) return;
+    const d = this.dockGeometry();
+    const L = this.dockPortOffset();
+    this.docked.L = L;
+    this.docked.beta = d.beta;
+    v.beta = d.beta;
+    v.omega = 0;
+    v.s.x = d.portS.x + d.axisS.x * L;
+    v.s.y = d.portS.y + d.axisS.y * L;
+    v.s.z = d.portS.z || 0;
+    v.s.vx = d.velS.x;
+    v.s.vy = d.velS.y;
+    v.s.vz = d.velS.z || 0;
+    v.ctl.rcs = [0, 0, 0];
+    v.ctl.input = 0;
+    v.ctl.drive = 0;
+    v.ctl.targetBeta = d.beta;
+    v.engineOn = false;
+    v.coreFiring = false;
+    v.boosterFiring = false;
+    v.thrustNow = 0;
+    v.qNow = 0;
+    v.accelNow = 0;
+    v.updateFrame(this.simT);
+    v.syncDir3DFromBeta();
+    if (v.holdDir3D && v.dir3D) v.holdDir3D.copy(v.dir3D);
+    this.holdBeta = v.beta;
+  }
+
+  frameOf(s, t) {
+    const ref = refBody(s.x, s.y, s.z, t), B = bodyInfo(ref);
+    const bp = { x: 0, y: 0, z: 0 };
+    bodyState(ref, t, bp, { x: 0, y: 0, z: 0 });
+    const dx = s.x - bp.x, dy = s.y - bp.y, r = Math.hypot(dx, dy);
+    return { ref, B, dx, dy, r, alt: Math.hypot(dx, dy, s.z - bp.z) - B.R, phi: angOf(dx, dy), phiRot: wrapPi(angOf(dx, dy) - bodyRotation(ref, t)) };
+  }
+
+  stepDebris(d, h) {
+    const T = this.simT;
+    const fr = this.frameOf(d.s, T);
+    d.life += h;
+    if (d.landed) {
+      if (d.life - d.landT > 120) d.dead = true;
+      return;
+    }
+    let ax = 0, ay = 0, az = 0;
+    const hasAtm = (fr.B.atm || 0) > 0 && (fr.B.rho0 || 0) > 0 && fr.alt < fr.B.atm;
+    if (hasAtm) {
+      const rho = (fr.B.rho0 || 1.225) * Math.exp(-Math.max(0, fr.alt) / (fr.B.atmH || 5600));
+      const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+      bodyState(fr.ref, T, bp, bv);
+      const w = fr.B.omega !== undefined ? fr.B.omega : (fr.ref === 'earth' ? OMEGA_E : 0);
+      const vrx = (d.s.vx - bv.x) - w * fr.dy;
+      const vry = (d.s.vy - bv.y) + w * fr.dx;
+      const vrz = (d.s.vz || 0) - (bv.z || 0);
+      const sp = Math.hypot(vrx, vry, vrz);
+      const k = 0.5 * rho * sp * 0.006;
+      ax = -k * vrx; ay = -k * vry; az = -k * vrz;
+    }
+    const nsub = Math.min(80, Math.max(1, Math.ceil(h / 0.1)));
+    const hs = h / nsub;
+    for (let i = 0; i < nsub; i++) rk4(d.s, T + i * hs, hs, ax, ay, az);
+    d.dq.setFromEuler(new THREE.Euler(d.av.x * h, d.av.y * h, d.av.z * h));
+    d.q0.multiply(d.dq);
+    const fr2 = this.frameOf(d.s, T + h);
+    if (fr2.ref !== 'sun' && !fr2.B.gasGiant) {
+      const surf = this.surfaceAt({ ref: fr2.ref, sx: fr2.phiRot * fr2.B.R, phiRot: fr2.phiRot, s: d.s });
+      if (fr2.alt < surf.h + 0.8 && !d.landed) {
+        const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+        bodyState(fr2.ref, T + h, bp, bv);
+        const sp = Math.hypot(d.s.vx - bv.x, d.s.vy - bv.y, (d.s.vz || 0) - (bv.z || 0));
+        d.landed = true;
+        d.landT = d.life;
+        d.av.set(0, 0, 0);
+        d.landSx = fr2.phiRot * fr2.B.R;
+        d.landSz = (d.s.z || 0) - (bp.z || 0);
+        d.landRef = fr2.ref;
+        d.landWater = !!surf.water;
+        d.landH = surf.water ? (Math.max(0, surf.h) + 0.15) : (surf.h + 0.6);
+        this.pinDebris(d, T + h);
+        if (sp > 35) this.puffAtDebris(fr2, surf.h, d.s.z || 0);
+        return;
+      }
+    }
+    if (d.life > 300 || (fr2.ref === 'sun' && fr2.alt < -50000)) d.dead = true;
+  }
+
+  puffAtDebris(fr, h, sz = 0) {
+    const x = fr.phiRot * fr.B.R;
+    for (let j = 0; j < 14; j++) this.fire.emit(x, h + 1, sz, (Math.random() - 0.5) * 25, Math.random() * 18, (Math.random() - 0.5) * 25, { life: 1, size0: 3, size1: 11, alpha: 0.9, drag: 1.2, buoy: 3, color: [6, 3, 1] });
+    for (let j = 0; j < 14; j++) this.smoke.emit(x, h + 1.5, sz, (Math.random() - 0.5) * 12, Math.random() * 8, (Math.random() - 0.5) * 12, { life: 8, size0: 5, size1: 24, alpha: 0.6, drag: 0.5, buoy: 1.5, color: [0.3, 0.28, 0.26], heat: 0.5 });
+  }
+
+  /** fix landed debris onto the rotating surface */
+  pinDebris(d, T = this.simT) {
+    const B = bodyInfo(d.landRef), bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+    bodyState(d.landRef, T, bp, bv);
+    const bob = d.landWater ? Math.sin(this.time * 2.2 + (d.landSx || 0)) * 0.18 : 0;
+    const psi = d.landSx / B.R + bodyRotation(d.landRef, T), r = B.R + d.landH + bob;
+    d.s.x = bp.x + Math.sin(psi) * r;
+    d.s.y = bp.y + Math.cos(psi) * r;
+    d.s.z = (bp.z || 0) + (d.landSz || 0);
+    d.s.vx = bv.x; d.s.vy = bv.y; d.s.vz = bv.z || 0;
+  }
+
+  /** keep a destroyed player's reference frame co-moving with its crash site or orbital debris cloud */
+  stepCrashedPlayer(v, h) {
+    const T = this.simT;
+    const ca = v.crashAnchor;
+    if (ca && ca.mode === 'surface') {
+      const B = bodyInfo(ca.body);
+      const psi = ca.sx / B.R + bodyRotation(ca.body, T + h);
+      v.placeOnSurface(ca.body, ca.sx, ca.h, T + h, psi + (ca.betaOff || 0));
+      if (ca.sz) {
+        v.s.z = ca.sz;
+        v.updateFrame(T + h);
+      }
+      v.agl = 0;
+      return;
+    }
+    v.updateFrame(T);
+    const B = v.body || bodyInfo(v.ref);
+    let ax = 0, ay = 0, az = 0;
+    const hasAtm = (B.atm || 0) > 0 && (B.rho0 || 0) > 0 && v.alt < B.atm;
+    if (hasAtm) {
+      const rho = (B.rho0 || 1.225) * Math.exp(-Math.max(0, v.alt) / (B.atmH || 5600));
+      const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+      bodyState(v.ref, T, bp, bv);
+      const w = B.omega !== undefined ? B.omega : (v.ref === 'earth' ? OMEGA_E : 0);
+      const dx = v.s.x - bp.x, dy = v.s.y - bp.y;
+      const vrx = (v.s.vx - bv.x) - w * dy;
+      const vry = (v.s.vy - bv.y) + w * dx;
+      const vrz = (v.s.vz || 0) - (bv.z || 0);
+      const sp = Math.hypot(vrx, vry, vrz);
+      const k = 0.5 * rho * sp * 0.006;
+      ax = -k * vrx; ay = -k * vry; az = -k * vrz;
+    }
+    const maxSafe = Math.max(0.05, coastStep(v.s.x, v.s.y, v.s.z, T) * 2.5);
+    const nsub = Math.min(80, Math.max(1, Math.ceil(h / Math.min(0.25, maxSafe))));
+    const hs = h / nsub;
+    for (let i = 0; i < nsub; i++) {
+      rk4(v.s, T + i * hs, hs, ax, ay, az);
+    }
+    v.updateFrame(T + h);
+    if (v.ref !== 'sun' && !B.gasGiant) {
+      const surf = this.surfaceAt(v);
+      if (v.alt <= surf.h + 1.5) {
+        const landH = (surf.water ? Math.max(0, surf.h) : surf.h) + 1.5;
+        const keepZ = v.s.z || 0;
+        const betaOff = wrapPi(v.beta - v.phi);
+        v.crashAnchor = { mode: 'surface', body: v.ref, sx: v.sx, sz: keepZ, h: landH, betaOff };
+        v.placeOnSurface(v.ref, v.sx, landH, T + h, v.beta);
+        if (keepZ) {
+          v.s.z = keepZ;
+          v.updateFrame(T + h);
+        }
+        v.agl = 0;
+      } else {
+        v.agl = v.alt - surf.h;
+      }
+    } else {
+      v.agl = v.alt;
+    }
+  }
+
+  simStep(h) {
+    const T = this.simT;
+    if (!this.docked) this.applyControls(h);
+    const P = this.player;
+    if (!this.docked && this.program && (this.phase === 'flight' || (this.phase === 'countdown' && this.ignited)) && !P.crashed) {
+      this.checkAutoStage(P);
+      if (this.phase === 'flight') {
+        const k = P.activeSeg;
+        if (P.segIdx.length === 1 && this.fuelMax[k] > 0 && this.fuel[k] < this.fuelMax[k] * 0.15) {
+          this.fuel[k] = this.fuelMax[k] * 0.15;
+        }
+        const r = this.program.update(P, this.sc, h);
+        if (P.isPlane && this.program && r !== 'done' && !P.landed && !P.clamped && this.program.phase !== 'land' && !this.program._approachingGear && (P.agl === undefined || P.agl > 2.0)) {
+          P.legsTarget = 0;
+        }
+        this.checkAutoStage(P);
+        if (r === 'done' && !this.programDone) {
+          this.programDone = true; this.program = null; P._guidedTargetAlt = null; P.ctl.targetBeta = null; this.holdAttitude();
+          if (!P.isPlane) {
+            P.engineOn = false;
+            if (P.isBoat) { this.throttle = 0; P.throttle = 0; }
+          }
+          this.event(tr('Lái tự động hoàn tất nhiệm vụ.', 'Autopilot mission completed.'));
+        }
+      }
+    }
+    for (const v of this.vessels) if (v.rec && !v.crashed && !v.dead) v.rec.update(h);
+    for (const v of this.vessels.slice()) {
+      if (v.dead) {
+        if (v === P && v.crashed) this.stepCrashedPlayer(v, h);
+        continue;
+      }
+      if (v === P && this.docked) {
+        const dRate = h * 0.6;
+        v.legsT += THREE.MathUtils.clamp(v.legsTarget - v.legsT, -dRate, dRate);
+        v.finsT += THREE.MathUtils.clamp(v.finsTarget - v.finsT, -h * 1.5, h * 1.5);
+        continue;
+      }
+      if (v === P && this.missionSuccessStopped && !v.crashed) {
+        v.throttle = 0;
+        v.engineOn = false;
+        v.coreFiring = false;
+        v.boosterFiring = false;
+        v.thrustNow = 0;
+        v.accelNow = 0;
+        v.qNow = 0;
+        v.omega = 0;
+        v.turnYawRate = 0;
+        v.bank = 0;
+        v.groundSpeed = 0;
+        v.waterSpeed = 0;
+        v.planeRollSpeed = 0;
+        const anc = this.missionStopAnchor;
+        if (!v.landed && !v.clamped && anc && anc.mode === 'air') {
+          const dRate = h * 0.6;
+          v.legsT += THREE.MathUtils.clamp(v.legsTarget - v.legsT, -dRate, dRate);
+          v.finsT += THREE.MathUtils.clamp(v.finsTarget - v.finsT, -h * 1.5, h * 1.5);
+          const B = bodyInfo(anc.body);
+          const psi = anc.sx / B.R + bodyRotation(anc.body, T + h);
+          v.placeOnSurface(anc.body, anc.sx, anc.alt, T + h, wrapPi(psi + (anc.betaOff || 0)));
+          if (anc.sz) {
+            v.s.z = anc.sz;
+            v.updateFrame(T + h);
+          }
+          v.vSurf.e = 0;
+          v.vSurf.u = 0;
+          v.vSurf.z = 0;
+          v.speedSurf = 0;
+          continue;
+        }
+        if (!v.landed && !v.clamped && anc && anc.mode === 'space') {
+          const dRate = h * 0.6;
+          v.legsT += THREE.MathUtils.clamp(v.legsTarget - v.legsT, -dRate, dRate);
+          v.finsT += THREE.MathUtils.clamp(v.finsTarget - v.finsT, -h * 1.5, h * 1.5);
+          const bp = { x: 0, y: 0, z: 0 }, bv = { x: 0, y: 0, z: 0 };
+          bodyState(anc.body, T + h, bp, bv);
+          v.s.x = bp.x + anc.dx;
+          v.s.y = bp.y + anc.dy;
+          v.s.z = (bp.z || 0) + anc.dz;
+          v.s.vx = bv.x;
+          v.s.vy = bv.y;
+          v.s.vz = bv.z || 0;
+          v.beta = anc.beta;
+          v.updateFrame(T + h);
+          v.syncDir3DFromBeta();
+          v.vOrb.e = 0;
+          v.vOrb.u = 0;
+          v.vSurf.e = 0;
+          v.vSurf.u = 0;
+          v.vSurf.z = 0;
+          v.speedOrb = 0;
+          v.speedSurf = 0;
+          continue;
+        }
+      }
+      v.step(h, T, this.env);
+      if (v !== P && !v.rec && !v.crashed && !v.landed) {
+        if (v.ref !== 'earth' || v.alt >= 45000 || (v.destinedForSpace && v.vSurf.u <= 0 && v.alt >= 25000)) {
+          if (!v.orbitStabilized) {
+            this.stabilizeSpaceVessel(v);
+            v.orbitStabilized = true;
+          }
+        }
+      }
+      this.handleEvents(v);
+    }
+    for (const d of this.debris) { if (d.landed && d.landRef) this.pinDebris(d, T + h); else this.stepDebris(d, h); }
+    this.simT += h;
+    if (this.phase !== 'ready') this.met += h;
+    if (this.docked) this.applyDockLock();
+    else this.checkDocking();
+  }
+
+  update(dt) {
+    this.time += dt;
+    const t = this.time;
+    if (!this.rocket || !this.player) return;
+    const kb = this.keys;
+    if (!this.docked && !this.missionSuccessStopped) {
+      if (kb['shift'] || (this.player?.isPlane && this.player?.landed && (kb['w'] || kb['arrowup']))) {
+        this.throttle = Math.min(1, this.throttle + dt * 0.8);
+      }
+      if (kb['control'] || (this.player?.isPlane && this.player?.landed && (this.player?.planeRollSpeed || 0) < 10 && (kb['s'] || kb['arrowdown']))) {
+        this.throttle = Math.max(0, this.throttle - dt * 0.8);
+      }
+    }
+    const P = this.player;
+
+    // countdown & release
+    if (this.phase === 'countdown') {
+      const n = Math.ceil(-this.met);
+      if (n !== this.lastCount && n >= 0) {
+        this.lastCount = n;
+        const cd = $('countdown');
+        cd.textContent = n > 0 ? n : tr('PHÓNG!', 'LIFTOFF!');
+        cd.classList.remove('pop'); void cd.offsetWidth; cd.classList.add('pop');
+        audio.beep(n > 0 ? 880 : 1320, n > 0 ? 0.12 : 0.5, 0.25);
+        if (n === 8) { this.event(tr('Thu cần tiếp nhiên liệu.', 'Retracting umbilical swing arms.')); this.arms.forEach((a) => (a.target = 1)); }
+        if (n === 6) this.event(tr('Hệ thống phun nước giảm thanh kích hoạt.', 'Sound suppression water deluge activated.'));
+      }
+      if (this.met >= -3 && !this.ignited) {
+        const st = this.segInfo[P.activeSeg];
+        if (st.tVac > 0 || this.rocket.boosters.some((b) => b.seg === P.activeSeg)) { this.ignited = true; P.engineOn = true; P.throttle = this.throttle; this.event(tr('Đánh lửa động cơ chính!', 'Main engine ignition!'), 'warn'); }
+        else if (!this.flags.noEngine) {
+          this.flags.noEngine = true;
+          if (st.needsBattery) this.event(tr('Động cơ Lazer / Phản Trọng Lực cần Cục Pin Năng Lượng (không dùng nhiên liệu thường)!', 'Laser / Anti-Gravity Engine requires a Quantum Energy Battery!'), 'bad');
+          else if (st.needsChemFuel) this.event(tr('Động cơ thường cần Bồn nhiên liệu (không chạy bằng Pin)!', 'Regular engines require a Fuel Tank (cannot run on Battery)!'), 'bad');
+          else this.event(tr('Không có động cơ hoặc nhiên liệu ở tầng 1!', 'No engine or fuel on Stage 1!'), 'bad');
+        }
+      }
+      if (this.met >= 0) {
+        this.phase = 'flight'; this.released = true; this.launchT = this.simT;
+        P.clamped = false;
+        P.landed = { body: 'earth', sx: 0, h: P.clampSpot.h, site: 'pad', how: 'pad' }; P.landedLock = 0;
+        this.clamps.forEach((c, i) => { c.rotation.z = (i % 2 ? 1 : -1) * 0.9; });
+        this.event(tr('Nhả kẹp giữ!', 'Hold-down clamps released!'));
+        setTimeout(() => { $('countdown').textContent = ''; }, 900);
+        const w = this.thrustTotalSL() / (P.com.mass * G_E);
+        if (w < 1) this.event(tr('Lực đẩy không đủ để cất cánh (TWR < 1)!', 'Insufficient thrust for liftoff (TWR < 1)!'), 'bad');
+      }
+    }
+
+    // time warp
+    const eff = this.effectiveWarp();
+    this.warp = eff;
+    P._warp = eff;
+    let remaining = dt * eff;
+    let guard = 0;
+    const fine = this.needsFine();
+    const isRoverOrBoatActive = (P.isRover && (Math.abs(P.groundSpeed || 0) > 0.02 || P.ctl?.input)) || (P.isBoat && (Math.abs(P.waterSpeed || 0) > 0.02 || P.ctl?.input));
+    const isSurfaceIdle = (P.clamped && this.phase !== 'countdown') || (P.landed && !P.engineOn && !(P.ctl && P.ctl.drive) && !isRoverOrBoatActive);
+    const minStepForWarp = remaining / 320;
+    while (remaining > 1e-9 && guard++ < 700) {
+      let h;
+      if (isSurfaceIdle) {
+        h = Math.max(0.02, remaining / 4);
+      } else if (fine) {
+        h = Math.max(0.02, minStepForWarp);
+      } else {
+        h = Math.max(coastStep(P.s.x, P.s.y, P.s.z, this.simT) * 2.5, minStepForWarp);
+      }
+      h = Math.min(h, remaining);
+      this.simStep(h);
+      remaining -= h;
+      if (this.phase === 'flight' && !P.crashed && !this.missionSuccessStopped && eff >= 50) {
+        this.checkObjectives();
+        if (this.missionSuccessStopped) break;
+      }
+    }
+    const simDt = dt * eff;
+    this.reqWarpPrev = this.reqWarpNext || 1; this.reqWarpNext = null;
+    this.vessels = this.vessels.filter((v) => !v.dead || v === this.player);
+    this.debris = this.debris.filter((d) => { if (d.dead) { d.obj.parent && d.obj.parent.remove(d.obj); return false; } return true; });
+    if (this.focus.dead) this.focus = P;
+    if (!this.docked) this.checkDocking();
+
+    // Autopilot 85% mission success rate check (15% chance of guidance malfunction during mission)
+    if (this.program && this.phase === 'flight' && this.lifted && !P.crashed && !this.resultShown && !this.missionCompletedMarked) {
+      this.autopilotActiveSec = (this.autopilotActiveSec || 0) + Math.min(dt, 0.1);
+      if (this.autopilotWillFail) {
+        const nearFinalTarget =
+          (P.isPlane && this.program.phase === 'land' && P.agl < 25) ||
+          (P.isBoat && this.program.phase === 'dock');
+        if (!this.autopilotWarned && (this.autopilotActiveSec >= this.autopilotFailSec - 2.5 || nearFinalTarget)) {
+          this.autopilotWarned = true;
+          this.event(
+            tr(
+              '⚠️🤖 CẢNH BÁO: Máy tính Lái tự động (Autopilot) đang gặp nhiễu tín hiệu điều khiển!',
+              '⚠️🤖 WARNING: Autopilot guidance computer is experiencing control signal instability!'
+            ),
+            'warn'
+          );
+        }
+        if (this.autopilotActiveSec >= this.autopilotFailSec || nearFinalTarget) {
+          this.program = null;
+          this.autoShootAliens = false;
+          P._autopilotMalfunction = true;
+          this.milestone(tr('💥🤖 LỖI LÁI TỰ ĐỘNG (15% RỦI RO)!', '💥🤖 AUTOPILOT MALFUNCTION (15% RISK)!'));
+          this.explode(
+            P,
+            tr(
+              'Hệ thống Lái tự động (Autopilot) gặp sự cố mất kiểm soát (tỷ lệ thành công 85%)!',
+              'Autopilot guidance system suffered a critical malfunction (85% success rate)!'
+            )
+          );
+        }
+      }
+    }
+
+    // structural & atmospheric friction thermal limits
+    for (const v of this.vessels) {
+      if (v.dead || v.crashed || v.chuteT > 0.05 || v.isPlane || v.isRover || v.isBoat) continue;
+      const vB = BODIES[v.ref] || BODIES.earth;
+      const hasAtm = (vB.atm || 0) > 0 && (vB.rho0 || 0) > 0 && v.alt < vB.atm;
+      if (!hasAtm) continue;
+      if (v === P && v.heatFlux >= 0.45 && v.vSurf.u < -12) {
+        if (v.hasHeatShield()) {
+          if (!this._heatShieldNote) {
+            this._heatShieldNote = true;
+            this.event(
+              tr(
+                `🛡️🔥 Lực ma sát không khí cao (${Math.round(v.reentryTemp || 450)}°C) — Khiên chống nhiệt vàng đậm đang hấp thụ nhiệt ma sát & phanh khí động!`,
+                `🛡️🔥 High atmospheric friction (${Math.round(v.reentryTemp || 450)}°C) — Dark-yellow Heat Shield is absorbing reentry heat & aerobraking!`
+              ),
+              'warn'
+            );
+            setTimeout(() => { this._heatShieldNote = false; }, 6500);
+          }
+        } else if (v.heatLoad > 0.32 && !this._heatWarn) {
+          this._heatWarn = true;
+          this.event(
+            tr(
+              `⚠️🔥 CẢNH BÁO MA SÁT KHÍ QUYỂN (${Math.round(v.reentryTemp || 750)}°C): Tàu đang nóng đỏ do rơi vào khí quyển mà không có Khiên Chống Nhiệt!`,
+              `⚠️🔥 ATMOSPHERIC FRICTION WARNING (${Math.round(v.reentryTemp || 750)}°C): Craft is overheating during atmospheric descent without a Heat Shield!`
+            ),
+            'bad'
+          );
+          setTimeout(() => { this._heatWarn = false; }, 4500);
+        }
+      }
+      const isUfoVessel = isUfoPart(v.topType());
+      if (!v.hasHeatShield() && (v.heatLoad || 0) >= 1.0 && !isUfoVessel) {
+        this.explode(
+          v,
+          tr(
+            'Bốc cháy và nổ tung do rơi xuống bầu khí quyển tốc độ quá cao mà không có Khiên Chống Nhiệt che chắn!',
+            'Burned up and exploded from falling through the atmosphere at high speed without a Heat Shield!'
+          )
+        );
+        continue;
+      }
+      if (isUfoVessel) continue;
+      if (v.ref !== 'earth') continue;
+      if (v.hasHeatShield() && v.vSurf.u < 0) continue;
+      const a = Math.abs(v.aoa || 0), off = Math.min(a, Math.PI - a);
+      if (v.qNow > 50000 && off > 0.75) this.explode(v, tr('Vỡ cấu trúc do bẻ lái gắt ở áp suất khí động cao!', 'Structural failure from high angle of attack at high dynamic pressure!'));
+      else if (v.qNow > 18000 && off > 1.4) this.explode(v, tr('Tên lửa lật nhào và vỡ tung!', 'Rocket tumbled and broke apart!'));
+      else if (v.qNow > 22000 && off > 0.45 && !this._qWarn) {
+        this._qWarn = true;
+        this.event(tr('⚠️ CẢNH BÁO: Áp suất khí động cao (Max-Q), hãy giữ hướng ổn định!', '⚠️ WARNING: High dynamic pressure (Max-Q), hold attitude steady!'), 'warn');
+        setTimeout(() => { this._qWarn = false; }, 3500);
+      }
+    }
+    // escape tower
+    if (!this.towerGone && this.rocket.capsule && P.owns(this.rocket.capsule.seg) && P.alt > 25000 && this.rocket.capsule.obj.userData.tower && this.rocket.capsule.obj.userData.tower.visible) {
+      this.towerGone = true;
+      this.makeDebris(P, this.rocket.capsule.obj.userData.tower, 8, 1);
+      this.event(tr('Thả tháp thoát hiểm.', 'Launch escape tower jettisoned.'));
+    }
+
+    // statistics
+    if (this.phase === 'flight' && !P.crashed) {
+      const alt = P.ref === 'earth' ? P.alt - this.startAlt : P.alt;
+      this.maxAlt = Math.max(this.maxAlt, P.ref === 'earth' ? alt : 0, P.ref === 'moon' ? this.maxAlt : 0);
+      this.maxVel = Math.max(this.maxVel, P.speedOrb);
+      this.maxG = Math.max(this.maxG, P.accelNow || 1);
+      if (P.qNow > this.maxQ) this.maxQ = P.qNow;
+      else if (!this.maxQPassed && this.maxQ > 8000 && P.qNow < this.maxQ * 0.9) { this.maxQPassed = true; this.event(tr(`Vượt Max Q (${fmt(this.maxQ / 1000, 1)} kPa).`, `Passed Max-Q (${fmt(this.maxQ / 1000, 1)} kPa).`)); }
+      const ms = [[1000, '1 km', null], [10000, '10 km', tr('Vượt tầng đối lưu', 'Leaving the troposphere')], [30000, '30 km', tr('Bầu trời tối dần', 'Sky darkening into space')]];
+      for (const [hh, big, small] of ms) {
+        if (P.ref === 'earth' && alt >= hh && !this.flags['alt' + hh]) {
+          this.flags['alt' + hh] = true;
+          this.event(tr(`Đạt độ cao ${big}.`, `Reached ${big} altitude.`));
+          if (small) this.milestone(big, small);
+        }
+      }
+      // Notify whenever the rocket completely exits the atmosphere of a planet that has an atmosphere (moons & Ceres have no atmosphere)
+      const curB = BODIES[P.ref] || BODIES.earth;
+      const curHasAtm = (curB.atm || 0) > 0 && P.ref !== 'ceres' && !(curB.parent && curB.parent !== 'sun');
+      const atmLimit = curHasAtm ? curB.atm : 0;
+      if (curHasAtm && (P.clamped || P.landed || P.alt < atmLimit - 1500)) {
+        this.inAtmoBody = P.ref;
+      } else if (this.inAtmoBody) {
+        const exitBody = BODIES[this.inAtmoBody] || curB;
+        const exitHasAtm = (exitBody.atm || 0) > 0 && this.inAtmoBody !== 'ceres' && !(exitBody.parent && exitBody.parent !== 'sun');
+        if (!exitHasAtm || P.isPlane) {
+          this.inAtmoBody = P.isPlane ? P.ref : null;
+        } else if (P.ref !== this.inAtmoBody || P.alt >= exitBody.atm) {
+          const exitKm = fmt(exitBody.atm / 1000, 0);
+          if (this.inAtmoBody === 'earth') this.flags.alt70000 = true;
+          this.inAtmoBody = null;
+          this.milestone(
+            tr('🌌 ĐÃ THOÁT KHỎI KHÍ QUYỂN!', '🌌 ATMOSPHERE EXITED!'),
+            tr(
+              `Tên lửa đã thoát hoàn toàn khỏi bầu khí quyển của ${exitBody.label} (${exitKm} km) — Tiến vào không gian vũ trụ!`,
+              `Rocket has completely exited ${exitBody.label}'s atmosphere (${exitKm} km) — Entering outer space!`
+            )
+          );
+          this.event(
+            tr(
+              `🚀🌌 Tên lửa đã thoát hoàn toàn khỏi bầu khí quyển của ${exitBody.label} (vượt mốc ${exitKm} km) — Đã ra ngoài không gian vũ trụ!`,
+              `🚀🌌 Rocket has completely exited ${exitBody.label}'s atmosphere (above ${exitKm} km) — Now in deep outer space!`
+            ),
+            'warn'
+          );
+        }
+      }
+      if (this.moonLandT !== null && !this.flagSpot && this.simT - this.moonLandT > 4 && P.landed && P.ref !== 'earth') {
+        const B = BODIES[P.ref] || BODIES.moon;
+        const psi = P.phiRot + 14 / B.R;
+        const uz = (P.s?.z || 0) / B.R;
+        this.flagSpot = { body: P.ref, psi, h: moonHeight(Math.sin(psi), Math.cos(psi), uz, P.ref) };
+        this.event(tr('🇻🇳 Cắm cờ Việt Nam trên ' + B.label + '!', '🇻🇳 Planted flag on ' + B.label + '!'));
+        this.milestone(tr('CẮM CỜ', 'FLAG PLANTED'), tr('Lá cờ Việt Nam đã tung bay trên ' + B.label, 'Flag is flying proudly on ' + B.label));
+      }
+      if (P.ref === 'mars' && !this.flags.olympusSummit) {
+        const dxOm = wrapPi(P.phiRot - OLYMPUS_PSI) * BODIES.mars.R;
+        const dzOm = P.s?.z || 0;
+        const distOm = Math.hypot(dxOm, dzOm);
+        if (distOm < 560 && P.alt > 1020 && P.alt < 1750) {
+          this.flags.olympusSummit = true;
+          this.milestone(
+            tr('🌋 ĐỈNH OLYMPUS MONS (21,9 KM)!', '🌋 OLYMPUS MONS SUMMIT (21.9 KM)!'),
+            tr('Bạn đã chinh phục ngọn núi lửa lớn nhất Hệ Mặt Trời trên Sao Hỏa!', 'You have conquered the tallest volcano in the Solar System on Mars!')
+          );
+          this.event(
+            tr('🌋🏆 Chúc mừng! Tàu đã đặt chân lên Đỉnh & Miệng núi lửa Olympus Mons (21,9 km) trên Sao Hỏa!', '🌋🏆 Congratulations! Reached the Summit & Caldera of Olympus Mons (21.9 km) on Mars!'),
+            'warn'
+          );
+        }
+      }
+      this.checkObjectives();
+    }
+    if (this.phase === 'flight' && !this.lifted && this.met > 8 && !this._padWarn && !P.crashed && !P.isRover && !P.isBoat && !P.isPlane) {
+      this._padWarn = true;
+      this.event(tr('⚠️ Tên lửa chưa rời bệ: Bấm Shift để tăng ga hoặc kiểm tra lực đẩy động cơ!', '⚠️ Rocket has not lifted off: Press Shift to throttle up or check engine thrust!'), 'warn');
+    }
+    if (this.phase === 'flight' && !this.lifted && this.met > 40 && !this.resultShown && !P.crashed && !P.isRover && !P.isBoat && !P.isPlane) {
+      P.engineOn = false;
+      this.showResult(false, tr('Tên lửa không đủ lực đẩy để rời bệ phóng sau 40 giây.', 'Rocket lacked sufficient thrust to leave the launchpad after 40 seconds.'));
+    }
+    if (this.phase === 'crashed' && !this.resultShown && !this.flagSpot) { /* result scheduled by explode() */ }
+
+    // scene animation
+    for (const a of this.arms) a.pivot.rotation.y += ((a.target ? 1.3 : 0) - a.pivot.rotation.y) * (1 - Math.exp(-dt * 0.8));
+    this.animateParts();
+    this.placeScene(this.focus);
+    this.scene.updateMatrixWorld(true);
+    this.updateAliensAndWeapons(dt);
+    this.updateCamera(dt);
+    const F = this.focus;
+    const camAlt = Math.max(0, F.alt + this.camera.position.y);
+    if (F.ref === 'earth') this.updateAtmosphere(camAlt); else this.spaceLighting();
+    this.updateNightSiteLighting(F);
+    this.envForView(this.camera, F);
+    this.updateEffects(dt, simDt);
+    const pOrigin = this._pOrigin || (this._pOrigin = { x: 0, y: 0, z: 0 });
+    pOrigin.x = F.sx || 0;
+    pOrigin.y = F.alt || 0;
+    pOrigin.z = F.s?.z || 0;
+    const particleGroundY = F.ref === 'earth' ? 0 : -Infinity;
+    const pdt = Math.min(simDt, 1);
+    this.smoke.update(pdt, this.camera.position, particleGroundY, pOrigin);
+    this.fire.update(pdt, this.camera.position, particleGroundY, pOrigin);
+    this.smoke.mesh.position.set(0, 0, 0);
+    this.fire.mesh.position.set(0, 0, 0);
+    for (const c of this.clamps) c.visible = this.phase === 'ready' || this.phase === 'countdown' || this.simT < (this.launchT || 0) + 4;
+    this.groundUniforms.uTime.value = t;
+    this.cloudMat.uniforms.uTime.value = t;
+    this.beacons[0].material.emissiveIntensity = Math.sin(t * 3) > 0.6 ? 20 : 0.5;
+    if (this.iss.userData.update) this.iss.userData.update(this.simT);
+    if (this.ship.userData.update) this.ship.userData.update(t);
+    if (this.olympusMons && this.olympusMons.group.visible) {
+      this.olympusMons.update(t);
+      const calSx = OLYMPUS_PSI * BODIES.mars.R;
+      const dxCal = calSx - F.sx;
+      if (Math.abs(dxCal) < 6500 && F.alt < 18000 && Math.random() < 0.55) {
+        const curveDrop = (dxCal * dxCal) / (2 * BODIES.mars.R);
+        const ventY = this.olympusMons.calH - curveDrop + 2;
+        const jx = (Math.random() - 0.5) * 58;
+        const jz = (Math.random() - 0.5) * 58;
+        this.smoke.emit(
+          calSx + jx, ventY, jz,
+          (Math.random() - 0.5) * 8, 14 + Math.random() * 18, (Math.random() - 0.5) * 8,
+          { life: 6 + Math.random() * 5, size0: 12, size1: 55, alpha: 0.42, drag: 0.25, buoy: 2.2, color: [0.42, 0.26, 0.20], heat: 0.45 }
+        );
+        if (Math.random() < 0.45) {
+          this.fire.emit(
+            calSx + jx * 0.5, ventY, jz * 0.5,
+            (Math.random() - 0.5) * 16, 18 + Math.random() * 26, (Math.random() - 0.5) * 16,
+            { life: 1.2 + Math.random() * 1.4, size0: 6, size1: 22, alpha: 0.9, drag: 0.5, buoy: 1.5, color: [7.5, 2.4, 0.4] }
+          );
+        }
+      }
+    }
+    if (this.flagObj.userData.update && this.flagObj.visible && Math.floor(t * 10) % 3 === 0) this.flagObj.userData.update(t);
+    this.flash = Math.max(0, this.flash - dt * 1.5);
+    this.flashLight.intensity = this.flash * 4e6;
+    if (this.flashPos) {
+      this.flashLight.position.set(
+        this.flashPos.x - (F.sx || 0),
+        this.flashPos.y - (F.alt || 0),
+        (this.flashPos.z || 0) - (F.s?.z || 0)
+      );
+    }
+    this.updateHUD(dt);
+  }
+
+  thrustTotalSL() {
+    const v = this.player, k = v.activeSeg;
+    let T = this.segInfo[k].tSL;
+    for (const b of v.boosters()) if (b.seg === k) T += PARTS.booster.thrustSL * b.count;
+    return T;
+  }
+
+  // =================================================================== ALIEN INVADERS & WEAPONS (LASER GUN + 1,000,000 PSI WATER CANNON)
+  clearAllAliens() {
+    if (this.aliens && this.aliens.length) {
+      for (const a of this.aliens) {
+        if (a.mesh && a.mesh.parent) a.mesh.parent.remove(a.mesh);
+      }
+      this.aliens = [];
+    }
+  }
+
+  syncAlienToggleUI() {
+    const off = !!this.aliensDisabled;
+    const btn = $('btn-toggle-aliens');
+    if (btn) {
+      btn.classList.toggle('aliens-off', off);
+      btn.innerHTML = off
+        ? `🚫👽 ${tr('Đã tắt Alien', 'Aliens OFF')} <kbd>U</kbd>`
+        : `👽 ${tr('Tắt Alien', 'No Aliens')} <kbd>U</kbd>`;
+      btn.title = off
+        ? tr('Đang tắt hoàn toàn Alien (không xuất hiện Alien) · Bấm hoặc nhấn U để bật lại Alien', 'Aliens are completely disabled · Click or press U to enable Aliens again')
+        : tr('Alien đang bật · Bấm hoặc nhấn U để tắt hoàn toàn Alien', 'Aliens are enabled · Click or press U to disable all Aliens');
+    }
+    document.querySelectorAll('[data-aliens-mode]').forEach((el) => {
+      const isOffBtn = el.dataset.aliensMode === 'off';
+      el.classList.toggle('on', isOffBtn ? off : !off);
+    });
+  }
+
+  setAliensDisabled(disabled, announce = true) {
+    const next = !!disabled;
+    this.aliensDisabled = next;
+    try {
+      localStorage.setItem('rf-no-aliens', next ? '1' : '0');
+    } catch { /* ignore */ }
+    if (next) {
+      this.clearAllAliens();
+    } else if (this.active && this.player && !this.player.crashed && !(this.player.ref === 'earth' && this.player.alt < ATM_TOP)) {
+      this.alienSpawnTimer = 0.25;
+    }
+    this.syncAlienToggleUI();
+    if (announce) {
+      this.event(
+        next
+          ? tr('🚫👽 Đã tắt Alien! Sẽ không có Alien nào xuất hiện.', '🚫👽 Aliens disabled! No Aliens will spawn.')
+          : tr('👽⚡ Đã bật lại Alien! Alien sẽ xuất hiện ngoài vũ trụ.', '👽⚡ Aliens enabled! Aliens will spawn in outer space.'),
+        'warn'
+      );
+    }
+  }
+
+  toggleAliens() {
+    this.setAliensDisabled(!this.aliensDisabled, true);
+  }
+
+  getActivePlayerWeapons() {
+    if (!this.rocket || !this.rocket.weapons || !this.player || this.player.dead || this.player.crashed) return [];
+    const ownedHasGunBat = Array.isArray(this.segs) && this.segs.some((_, k) => this.player.owns(k) && this.segInfo?.[k]?.hasGunBattery);
+    return this.rocket.weapons.filter((w) => {
+      if (!this.player.owns(w.seg)) return false;
+      if (w.hasGunBattery || ownedHasGunBat) return true;
+      if (w.usesBigBattery) {
+        return !this.fuelMax || this.fuelMax[w.seg] <= 0 || this.fuel[w.seg] > 0;
+      }
+      return !!w.powered;
+    });
+  }
+
+  /** Minimum allowed Y offset (relative to player root) at horizontal offset (tx, tz) so an Alien never clips into terrain */
+  alienFloorRelY(tx, tz, tier = 'warrior') {
+    const P = this.player;
+    if (!P || P.ref === 'sun' || BODIES[P.ref]?.gasGiant) return -35;
+    const B = BODIES[P.ref] || BODIES.moon;
+    const bodyR = B.R || R_M;
+    const s2 = tx * tx + tz * tz;
+    const curveDrop = s2 / (2 * bodyR);
+    let groundRelY;
+    if (P.ref === 'earth') {
+      const surfH = this.surfaceAt({ ref: 'earth', sx: (P.sx || 0) + tx, s: { z: (P.s?.z || 0) + tz } }).h;
+      groundRelY = (surfH - P.alt) - curveDrop;
+    } else {
+      const alienPsi = (P.phiRot || 0) + tx / bodyR;
+      const uz = ((P.s?.z || 0) + tz) / bodyR;
+      const surfH = moonHeight(Math.sin(alienPsi), Math.cos(alienPsi), uz, P.ref);
+      groundRelY = (surfH - P.alt) - curveDrop;
+      if (this.moonPatch && this.moonPatch.visible && this.moonPatch.userData?.localHeight) {
+        const pWorld = P.root ? P.root.position : { x: 0, y: 0, z: 0 };
+        const mpPos = this.moonPatch.position;
+        const th = -this.moonPatch.rotation.z;
+        const wx = pWorld.x + tx;
+        const wz = pWorld.z + tz;
+        const lx = (wx - mpPos.x) * Math.cos(th);
+        const lz = wz - mpPos.z;
+        const ly = this.moonPatch.userData.localHeight(lx, lz);
+        const patchWorldY = mpPos.y + ly * Math.cos(th) - lx * Math.sin(th);
+        groundRelY = Math.max(groundRelY, patchWorldY - pWorld.y);
+      }
+    }
+    const clearance = (tier === 'king' || tier === 'queen') ? 26.0 : tier === 'boss' ? 10.5 : (tier === 'warrior' ? 8.0 : 6.5);
+    return Math.max(-35, groundRelY + clearance);
+  }
+
+  /**
+   * Computes Alien spawn density based on distance from Earth:
+   * the further from Earth (LEO -> Moon -> Mars/Venus -> Asteroid Belt -> Jupiter -> Saturn -> Uranus -> Neptune -> Pluto -> Interstellar),
+   * the more Aliens spawn concurrently, the faster they appear, and the higher the proportion of Warrior/Boss UFOs.
+   */
+  getAlienDensityConfig() {
+    const P = this.player;
+    if (!P) return { distKm: 0, factor: 0, maxConcurrentAliens: 3, spawnInterval: 2.6, batchSize: 1 };
+    const directDist = Math.max(0, Math.hypot(P.s.x, P.s.y, P.s.z || 0) - R_E);
+    const earthA = BODIES.earth.a || 52000e3;
+    let refDist = 0;
+    const B = BODIES[P.ref];
+    if (B && P.ref !== 'earth') {
+      if (P.ref === 'moon') {
+        refDist = B.a || 5600e3;
+      } else if (P.ref === 'sun') {
+        refDist = earthA;
+      } else {
+        const topB = (B.parent && B.parent !== 'sun' && BODIES[B.parent]) ? BODIES[B.parent] : B;
+        refDist = Math.abs((topB.a || 0) - earthA) + (B.parent && B.parent !== 'sun' ? (B.a || 0) : 0);
+      }
+    }
+    const effDist = Math.max(directDist, refDist);
+    const distKm = effDist / 1000;
+    const logProg = Math.max(0, Math.log10(Math.max(70, distKm)) - Math.log10(70)); // 0 at 70 km .. ~4.0 at Pluto/Interstellar
+    const outerProg = Math.min(14, distKm / 55000);                                 // 0 near Earth .. 14 at Pluto/Interstellar
+    const missionBonus = this.mission?.id === 'alien5000' ? 10 : (this.mission?.id === 'alien1500' ? 6 : (this.mission?.id === 'alien500' ? 4 : (this.mission?.id === 'alien100' ? 2 : 0)));
+    const maxConcurrentAliens = Math.min(36, Math.max(2, Math.round(2 + logProg * 2.2 + outerProg) + missionBonus));
+    const factor = Math.min(1, logProg / 4.0);
+
+    const baseInterval = Math.max(0.32, 2.6 - logProg * 0.45 - outerProg * 0.04);
+    const missionMul = this.mission?.id === 'alien5000' ? 0.32 : (this.mission?.id === 'alien1500' ? 0.42 : (this.mission?.id === 'alien500' ? 0.55 : (this.mission?.id === 'alien100' ? 0.72 : 1.0)));
+    const spawnInterval = Math.max(0.20, baseInterval * missionMul);
+    const deficit = maxConcurrentAliens - (this.aliens ? this.aliens.length : 0);
+    const batchSize = deficit >= 12 ? 3 : (deficit >= 5 ? 2 : 1);
+
+    return { distKm, factor, maxConcurrentAliens, spawnInterval, batchSize };
+  }
+
+  spawnAlien(density = this.getAlienDensityConfig()) {
+    if (this.aliensDisabled) return;
+    if (!this.player || this.player.crashed) return;
+    // Never spawn Aliens on Earth (only in outer space >= ATM_TOP or on other planets/moons)
+    if (this.player.ref === 'earth' && this.player.alt < ATM_TOP) return;
+    if (!this.aliens) this.aliens = [];
+
+    const factor = density?.factor ?? 0;
+    const bossThreshold = 0.78 - factor * 0.20;    // 22% near Earth -> 42% in deep space
+    const warriorThreshold = 0.42 - factor * 0.22; // 42% Scout near Earth -> 20% Scout in deep space
+
+    // All Aliens are peaceful toward each other (no Alien-on-Alien brawling)
+    const roll = Math.random();
+    let tier = 'scout';
+    let maxHp = 250; // Alien Trinh Sát: 250 HP
+    let speedMul = 1.35;
+    let radiusBase = 22;
+    let labelVi = 'Alien Trinh Sát';
+    let labelEn = 'Scout Alien';
+    let mapColor = '#4ade80';
+    const canFight = false;
+
+    if (roll > bossThreshold) {
+      tier = 'boss';
+      maxHp = 1000; // Tàu Mẹ Alien: 1000 HP
+      speedMul = 0.65;
+      radiusBase = 36;
+      labelVi = 'Tàu Mẹ Alien Hạng Nặng (Nhiều máu)';
+      labelEn = 'Heavy Boss Alien (High HP)';
+      mapColor = '#fb7185';
+    } else if (roll > warriorThreshold) {
+      tier = 'warrior';
+      maxHp = 500; // Alien Chiến Binh: 500 HP
+      speedMul = 0.95;
+      radiusBase = 28;
+      labelVi = 'Alien Chiến Binh';
+      labelEn = 'Warrior Alien';
+      mapColor = '#c084fc';
+    }
+
+    const mesh = createAlienMesh(tier);
+    this.scene.add(mesh);
+
+    const spreadExtra = Math.max(0, (this.aliens.length - 4) * 2.4);
+    const orbitAngle = Math.random() * Math.PI * 2;
+    const orbitRadius = radiusBase + Math.random() * (32 + spreadExtra);
+    const orbitSpeed = (Math.random() < 0.5 ? 1 : -1) * (0.35 + Math.random() * 0.42) * speedMul;
+    const tx0 = Math.cos(orbitAngle) * orbitRadius;
+    const tz0 = Math.sin(orbitAngle) * orbitRadius;
+    const floorY = this.alienFloorRelY(tx0, tz0, tier);
+    const bobAmp = 3.5 + Math.random() * 5.5;
+    const rawBaseY = -10 + Math.random() * 34;
+    const baseY = Math.max(rawBaseY, floorY + bobAmp + 4.0);
+    const relPos = new THREE.Vector3(tx0, baseY, tz0);
+    mesh.position.copy(this.player.root.position).add(relPos);
+
+    const alien = {
+      id: 'alien_' + Date.now() + '_' + Math.floor(Math.random() * 9999),
+      mesh,
+      tier,
+      isRoyal: false,
+      canFight,
+      fightCooldown: 999,
+      labelVi,
+      labelEn,
+      mapColor,
+      hp: maxHp,
+      maxHp,
+      regenRate: 10,
+      hitFlash: 0,
+      orbitAngle,
+      orbitRadius,
+      orbitSpeed,
+      baseY,
+      bobPhase: Math.random() * Math.PI * 2,
+      bobAmp,
+      relPos,
+      pushOffset: new THREE.Vector3(),
+      vel: new THREE.Vector3(),
+    };
+    this.aliens.push(alien);
+  }
+
+  /**
+   * Spawn the colossal Alien King ('king') or Alien Queen ('queen') when reaching 1,000,000,000 km altitude
+   */
+  spawnRoyalAlien(role = 'king') {
+    if (this.aliensDisabled) return null;
+    if (!this.player || this.player.crashed) return null;
+    if (!this.aliens) this.aliens = [];
+    const isKing = role === 'king';
+    // Once killed, Alien King or Alien Queen never spawns again
+    if (isKing && this.flags?.killKing) return null;
+    if (!isKing && this.flags?.killQueen) return null;
+    // Prevent duplicate live King or Queen
+    if (this.aliens.some((a) => !a.dead && a.tier === role)) return null;
+
+    const tier = isKing ? 'king' : 'queen';
+    const maxHp = isKing ? 100000 : 90500;
+    const labelVi = isKing
+      ? '👑 ALIEN VUA KHỔNG LỒ (Siêu Trùm 1 Tỷ km)'
+      : '👸 ALIEN HOÀNG HẬU KHỔNG LỒ (Siêu Trùm 1 Tỷ km)';
+    const labelEn = isKing
+      ? '👑 COLOSSAL ALIEN KING (1 Billion km Mega-Boss)'
+      : '👸 COLOSSAL ALIEN QUEEN (1 Billion km Mega-Boss)';
+    const mapColor = isKing ? '#facc15' : '#f472b6';
+
+    const mesh = createAlienMesh(tier);
+    this.scene.add(mesh);
+
+    const orbitAngle = isKing ? 0.52 : -0.52;
+    const orbitRadius = isKing ? 66 : 70;
+    const orbitSpeed = isKing ? 0.16 : -0.16;
+    const tx0 = Math.cos(orbitAngle) * orbitRadius;
+    const tz0 = Math.sin(orbitAngle) * orbitRadius;
+    const floorY = this.alienFloorRelY(tx0, tz0, tier);
+    const bobAmp = 4.5;
+    const baseY = Math.max(isKing ? 12 : 16, floorY + bobAmp + 6.0);
+    const relPos = new THREE.Vector3(tx0, baseY, tz0);
+    mesh.position.copy(this.player.root.position).add(relPos);
+
+    const alien = {
+      id: `alien_${tier}_${Date.now()}_${Math.floor(Math.random() * 9999)}`,
+      mesh,
+      tier,
+      isRoyal: true,
+      canFight: false,
+      fightCooldown: 999,
+      labelVi,
+      labelEn,
+      mapColor,
+      hp: maxHp,
+      maxHp,
+      regenRate: 10,
+      hitFlash: 0,
+      orbitAngle,
+      orbitRadius,
+      orbitSpeed,
+      baseY,
+      bobPhase: isKing ? 0 : Math.PI,
+      bobAmp,
+      relPos,
+      pushOffset: new THREE.Vector3(),
+      vel: new THREE.Vector3(),
+    };
+    this.aliens.unshift(alien);
+    return alien;
+  }
+
+  /**
+   * More astronauts aboard = faster weapon fire rate!
+   * 0 astronauts -> 1.0x (0.18s cooldown)
+   * Each astronaut aboard adds +40% fire rate -> 10 astronauts = 5.0x fire rate (0.036s cooldown)
+   */
+  getCrewFireRateMultiplier() {
+    const crew = Math.max(0, this.astronautsAboard || 0);
+    return +(1 + crew * 0.4).toFixed(2);
+  }
+
+  getWeaponCooldown() {
+    const baseCooldown = 0.18;
+    return baseCooldown / this.getCrewFireRateMultiplier();
+  }
+
+  resetAllBeltRocks() {
+    resetBeltRocksInGroup(this.ceresBelt);
+    resetBeltRocksInGroup(this.asteroidSpaceField);
+    resetBeltRocksInGroup(this.kuiperBelt);
+    resetBeltRocksInGroup(this.kuiperSpaceField);
+    resetBeltRocksInGroup(this.oortCloud);
+    const ud = this.sunSphere?.userData;
+    if (ud) {
+      resetBeltRocksInGroup(ud.asteroidBelt);
+      resetBeltRocksInGroup(ud.kuiperBelt);
+      resetBeltRocksInGroup(ud.oortCloud);
+    }
+  }
+
+  getVisibleLocalBeltMeshes() {
+    const out = [];
+    const groups = [this.ceresBelt, this.asteroidSpaceField, this.kuiperBelt, this.kuiperSpaceField, this.oortCloud];
+    for (const grp of groups) {
+      if (!grp || !grp.visible) continue;
+      grp.updateMatrixWorld(true);
+      for (const ch of grp.children) {
+        if (ch && ch.isInstancedMesh && ch.userData?.beltRocks) out.push(ch);
+      }
+    }
+    return out;
+  }
+
+  getVisibleMacroBeltMeshes() {
+    const out = [];
+    const F = this.focus || this.player;
+    if (!F || (F.ref === 'earth' && F.alt < 25e3)) return out;
+    const ud = this.sunSphere?.userData;
+    if (!ud) return out;
+    this.sunSphere.updateMatrixWorld(true);
+    for (const im of [ud.asteroidBelt, ud.kuiperBelt, ud.oortCloud]) {
+      if (im && im.visible && im.isInstancedMesh && im.userData?.beltRocks) out.push(im);
+    }
+    return out;
+  }
+
+  isRockTargetAlive(rt) {
+    if (!rt || !rt.im) return false;
+    const meta = rt.im.userData?.beltRocks;
+    return !!(meta && rt.index >= 0 && rt.index < meta.count && meta.alive[rt.index]);
+  }
+
+  getBeltRockWorldPos(rt, out = new THREE.Vector3()) {
+    const meta = rt?.im?.userData?.beltRocks;
+    if (!meta) return out.set(0, 0, 0);
+    const idx3 = rt.index * 3;
+    out.set(meta.localPos[idx3], meta.localPos[idx3 + 1], meta.localPos[idx3 + 2]);
+    return out.applyMatrix4(rt.im.matrixWorld);
+  }
+
+  pickBeltRockByRay(ray) {
+    const localMeshes = this.getVisibleLocalBeltMeshes();
+    if (localMeshes.length) {
+      const hits = ray.intersectObjects(localMeshes, false);
+      for (const h of hits) {
+        const meta = h.object?.userData?.beltRocks;
+        const idx = h.instanceId;
+        if (meta && idx !== undefined && meta.alive[idx]) {
+          return {
+            im: h.object,
+            index: idx,
+            radius: meta.radii[idx] || 24,
+            beltKind: meta.beltKind,
+            isMacro: !!meta.isMacro,
+          };
+        }
+      }
+      // Generous ray-cone assist for small/moving rocks
+      const tmp = this._tmpRockPos || (this._tmpRockPos = new THREE.Vector3());
+      const diff = this._tmpRockDiff || (this._tmpRockDiff = new THREE.Vector3());
+      let best = null;
+      let bestScore = Infinity;
+      for (const im of localMeshes) {
+        const meta = im.userData.beltRocks;
+        for (let i = 0; i < meta.count; i++) {
+          if (!meta.alive[i]) continue;
+          const i3 = i * 3;
+          tmp.set(meta.localPos[i3], meta.localPos[i3 + 1], meta.localPos[i3 + 2]).applyMatrix4(im.matrixWorld);
+          diff.subVectors(tmp, ray.origin);
+          const tRay = diff.dot(ray.direction);
+          if (tRay <= 1) continue;
+          const perpSq = Math.max(0, diff.lengthSq() - tRay * tRay);
+          const rad = meta.radii[i] || 20;
+          const allowR = rad * 1.45 + tRay * 0.032;
+          if (perpSq <= allowR * allowR) {
+            const sc = Math.sqrt(perpSq) + tRay * 0.015;
+            if (sc < bestScore) {
+              bestScore = sc;
+              best = { im, index: i, radius: rad, beltKind: meta.beltKind, isMacro: false };
+            }
+          }
+        }
+      }
+      if (best) return best;
+    }
+
+    // Also allow clicking distant macro belt boulders (Asteroid Belt, Kuiper Belt, Oort Cloud)
+    const macroMeshes = this.getVisibleMacroBeltMeshes();
+    if (macroMeshes.length) {
+      const tmp = this._tmpRockPos || (this._tmpRockPos = new THREE.Vector3());
+      const diff = this._tmpRockDiff || (this._tmpRockDiff = new THREE.Vector3());
+      let best = null;
+      let bestScore = Infinity;
+      for (const im of macroMeshes) {
+        const meta = im.userData.beltRocks;
+        for (let i = 0; i < meta.count; i++) {
+          if (!meta.alive[i]) continue;
+          const i3 = i * 3;
+          tmp.set(meta.localPos[i3], meta.localPos[i3 + 1], meta.localPos[i3 + 2]).applyMatrix4(im.matrixWorld);
+          diff.subVectors(tmp, ray.origin);
+          const tRay = diff.dot(ray.direction);
+          if (tRay <= 100 || tRay > 4.5e8) continue;
+          const perpSq = Math.max(0, diff.lengthSq() - tRay * tRay);
+          const rad = meta.radii[i] || 80e3;
+          const allowR = rad * 1.35 + tRay * 0.018;
+          if (perpSq <= allowR * allowR) {
+            const sc = Math.sqrt(perpSq) / Math.max(1, allowR) + tRay * 1e-9;
+            if (sc < bestScore) {
+              bestScore = sc;
+              best = { im, index: i, radius: rad, beltKind: meta.beltKind, isMacro: true };
+            }
+          }
+        }
+      }
+      if (best) return best;
+    }
+    return null;
+  }
+
+  findAutoTargetBeltRock() {
+    const P = this.player;
+    if (!P) return null;
+    const localMeshes = this.getVisibleLocalBeltMeshes();
+    if (!localMeshes.length) return null;
+    const pWorld = P.root.position;
+    const tmp = this._tmpRockPos || (this._tmpRockPos = new THREE.Vector3());
+    const ndc = this._tmpRockNdc || (this._tmpRockNdc = new THREE.Vector3());
+    let bestInView = null;
+    let bestInViewScore = Infinity;
+    let bestAny = null;
+    let bestAnyDist = Infinity;
+
+    this.camera.updateMatrixWorld();
+    for (const im of localMeshes) {
+      const meta = im.userData.beltRocks;
+      for (let i = 0; i < meta.count; i++) {
+        if (!meta.alive[i]) continue;
+        const i3 = i * 3;
+        tmp.set(meta.localPos[i3], meta.localPos[i3 + 1], meta.localPos[i3 + 2]).applyMatrix4(im.matrixWorld);
+        const dist = tmp.distanceTo(pWorld);
+        if (dist < 8 || dist > 180000) continue;
+        if (dist < bestAnyDist) {
+          bestAnyDist = dist;
+          bestAny = { im, index: i, radius: meta.radii[i] || 24, beltKind: meta.beltKind, isMacro: false };
+        }
+        ndc.copy(tmp).project(this.camera);
+        if (ndc.z > 0 && ndc.z < 1 && Math.abs(ndc.x) <= 0.94 && Math.abs(ndc.y) <= 0.94) {
+          const offCenter = Math.hypot(ndc.x, ndc.y);
+          const score = dist * (0.42 + 0.90 * offCenter);
+          if (score < bestInViewScore) {
+            bestInViewScore = score;
+            bestInView = { im, index: i, radius: meta.radii[i] || 24, beltKind: meta.beltKind, isMacro: false };
+          }
+        }
+      }
+    }
+    return bestInView || bestAny;
+  }
+
+  ensureRockShardAssets() {
+    if (this._rockShardMats) return;
+    this._rockShardGeos = [
+      createRockShardGeometry(2.3),
+      createRockShardGeometry(5.7),
+      createRockShardGeometry(8.9),
+    ];
+    this._rockShardMats = {
+      asteroid: new THREE.MeshStandardMaterial({
+        color: 0xa8a29e,
+        emissive: 0xea580c,
+        emissiveIntensity: 0.75,
+        roughness: 0.85,
+        flatShading: true,
+      }),
+      kuiper: new THREE.MeshStandardMaterial({
+        color: 0xbae6fd,
+        emissive: 0x0284c7,
+        emissiveIntensity: 0.85,
+        roughness: 0.42,
+        flatShading: true,
+      }),
+      oort: new THREE.MeshStandardMaterial({
+        color: 0xe0f2fe,
+        emissive: 0x6366f1,
+        emissiveIntensity: 0.95,
+        roughness: 0.38,
+        flatShading: true,
+      }),
+    };
+  }
+
+  damageBeltRock(rt, dmg, weaponType, beamHitPos) {
+    if (!this.isRockTargetAlive(rt)) return false;
+    const meta = rt.im.userData.beltRocks;
+    const idx = rt.index;
+    meta.hp[idx] -= dmg;
+    if (meta.hp[idx] <= 0) {
+      this.destroyBeltRock(rt, weaponType, beamHitPos);
+      return true;
+    }
+    // Flash hot/cracked tint on surviving heavy boulder
+    if (rt.im.instanceColor) {
+      const cCol = this._tmpCrackCol || (this._tmpCrackCol = new THREE.Color());
+      if (meta.beltKind === 'asteroid') cCol.setRGB(1.0, 0.52, 0.18);
+      else if (meta.beltKind === 'kuiper') cCol.setRGB(0.45, 0.95, 1.0);
+      else cCol.setRGB(0.75, 0.85, 1.0);
+      rt.im.setColorAt(idx, cCol);
+      rt.im.instanceColor.needsUpdate = true;
+    }
+    return false;
+  }
+
+  destroyBeltRock(rt, weaponType, beamHitPos) {
+    if (!this.isRockTargetAlive(rt)) return;
+    const meta = rt.im.userData.beltRocks;
+    const idx = rt.index;
+    meta.alive[idx] = 0;
+    meta.hp[idx] = 0;
+    const zeroM = this._zeroMat4 || (this._zeroMat4 = new THREE.Matrix4().makeScale(0, 0, 0));
+    rt.im.setMatrixAt(idx, zeroM);
+    rt.im.instanceMatrix.needsUpdate = true;
+    if (this.lastClickedRock && this.lastClickedRock.im === rt.im && this.lastClickedRock.index === idx) {
+      this.lastClickedRock = null;
+    }
+
+    const P = this.player;
+    const pWorld = P ? P.root.position : new THREE.Vector3();
+    const rawPos = this.getBeltRockWorldPos(rt, new THREE.Vector3());
+    const hitPos = beamHitPos ? beamHitPos.clone() : rawPos;
+    const distFromShip = Math.max(10, hitPos.distanceTo(pWorld));
+    const effRadius = rt.isMacro
+      ? THREE.MathUtils.clamp(distFromShip * 0.045, 18, 220)
+      : THREE.MathUtils.clamp(rt.radius || 24, 8, 220);
+
+    const hitX = (P ? P.sx : 0) + (hitPos.x - pWorld.x);
+    const hitY = (P ? P.alt : 0) + (hitPos.y - pWorld.y);
+    const hitZ = (P ? (P.s.z || 0) : 0) + (hitPos.z - pWorld.z);
+    const pScale = THREE.MathUtils.clamp(Math.max(effRadius * 0.28, distFromShip * 0.012), 2.5, 95);
+    const spdScale = THREE.MathUtils.clamp(effRadius * 0.85, 14, 140);
+
+    const isAst = meta.beltKind === 'asteroid';
+    const isKuiper = meta.beltKind === 'kuiper';
+    for (let i = 0; i < 42; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize()
+        .multiplyScalar((0.35 + Math.random() * 0.95) * spdScale);
+      const col = isAst
+        ? (i % 2 === 0 ? [6.8, 3.1, 0.7] : [4.2, 2.4, 1.2])
+        : isKuiper
+          ? (i % 3 === 0 ? [5.8, 1.8, 1.4] : [1.1, 5.4, 7.6])
+          : (i % 2 === 0 ? [1.4, 5.8, 8.2] : [4.6, 2.4, 7.8]);
+      this.fire.emit(
+        hitX, hitY, hitZ,
+        (P?.vSurf?.e || 0) + d.x, (P?.vSurf?.u || 0) + d.y, d.z,
+        { life: 0.5 + Math.random() * 0.65, size0: pScale * 0.45, size1: pScale * 1.9, alpha: 0.95, drag: 0.85, buoy: 0, color: col }
+      );
+    }
+    for (let i = 0; i < 24; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize()
+        .multiplyScalar((0.25 + Math.random() * 0.7) * spdScale);
+      const sCol = isAst ? [0.62, 0.55, 0.48] : isKuiper ? [0.72, 0.90, 0.98] : [0.80, 0.88, 1.0];
+      this.smoke.emit(
+        hitX, hitY, hitZ,
+        (P?.vSurf?.e || 0) + d.x, (P?.vSurf?.u || 0) + d.y, d.z,
+        { life: 1.6 + Math.random() * 1.6, size0: pScale * 0.6, size1: pScale * 2.4, alpha: 0.65, drag: 0.35, buoy: 0, color: sCol }
+      );
+    }
+
+    // Spawn 8 tumbling 3D rock/ice shard meshes
+    this.ensureRockShardAssets();
+    if (!this.rockFragments) this.rockFragments = [];
+    if (this.rockFragments.length < 96) {
+      const shardMat = this._rockShardMats[meta.beltKind] || this._rockShardMats.asteroid;
+      for (let s = 0; s < 8; s++) {
+        const geo = this._rockShardGeos[s % this._rockShardGeos.length];
+        const m = new THREE.Mesh(geo, shardMat);
+        const shScale = Math.max(1.4, effRadius * (0.16 + Math.random() * 0.18));
+        m.scale.set(shScale * (0.8 + Math.random() * 0.5), shScale * (0.6 + Math.random() * 0.5), shScale * (0.8 + Math.random() * 0.5));
+        m.rotation.set(Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28);
+        const relPos = hitPos.clone().sub(pWorld);
+        m.position.copy(hitPos);
+        this.scene.add(m);
+        const vel = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+          .normalize()
+          .multiplyScalar((0.45 + Math.random() * 0.9) * spdScale);
+        this.rockFragments.push({
+          mesh: m,
+          relPos,
+          vel,
+          rotVel: new THREE.Vector3((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6),
+          baseScale: m.scale.clone(),
+          life: 1.25 + Math.random() * 0.55,
+          maxLife: 1.8,
+        });
+      }
+    }
+
+    this.rocksDestroyed = (this.rocksDestroyed || 0) + 1;
+    audio.alienBoom(0.52);
+    this.flash = Math.max(this.flash || 0, 0.32);
+    this.flashPos = { x: hitX, y: hitY, z: hitZ };
+  }
+
+  fireWeapons(targetAlien = null, targetRock = null) {
+    const P = this.player;
+    if (!P || P.dead || P.crashed) return;
+    if (this.weaponCooldown > 0) return;
+
+    const weapons = this.getActivePlayerWeapons();
+    if (!weapons.length) {
+      const now = performance.now();
+      if (!this._lastNoBatWarnT || now - this._lastNoBatWarnT > 2200) {
+        this._lastNoBatWarnT = now;
+        const ownedAll = (this.rocket?.weapons || []).filter((w) => P.owns(w.seg));
+        if (ownedAll.length > 0) {
+          this.event(
+            tr(
+              '🚫 Súng chỉ xài Pin! Tên lửa xài nhiên liệu thường phải gắn thêm "Pin Siêu Siêu Nhỏ (Gắn Súng)" vào súng trong Xưởng mới bắn được!',
+              '🚫 Guns only run on Battery! Regular-fuel rockets must attach the "Ultra-Tiny Gun Battery" onto their guns in the VAB to fire!'
+            ),
+            'bad'
+          );
+        } else {
+          this.event(
+            tr(
+              '🚫 Chưa có Súng & Pin! Hãy gắn Súng (Lazer / Nước / Acid / Điện) kèm "Pin Siêu Siêu Nhỏ (Gắn Súng)" trong Xưởng lắp ráp!',
+              '🚫 No Guns & Battery attached! Attach Guns + "Ultra-Tiny Gun Battery" in the VAB to fire!'
+            ),
+            'bad'
+          );
+        }
+      }
+      return;
+    }
+
+    const cd = this.getWeaponCooldown();
+    this.weaponCooldown = Math.max(cd * 0.25, (this.weaponCooldown || 0) + cd);
+
+    // 1) Explicit clicked rock or held clicked rock
+    let rockTgt = this.isRockTargetAlive(targetRock)
+      ? targetRock
+      : (this.isRockTargetAlive(this.lastClickedRock) ? this.lastClickedRock : null);
+
+    // 2) Pick target Alien (either clicked Alien, or Royal King/Queen first, then closest Alien)
+    let tgt = rockTgt ? null : targetAlien;
+    if (!rockTgt && !tgt && this.aliens && this.aliens.length) {
+      let bestRoyalD = Infinity;
+      for (const a of this.aliens) {
+        if (!a.isRoyal || a.dead || a.hp <= 0) continue;
+        const d = a.relPos.length();
+        if (d < bestRoyalD) { bestRoyalD = d; tgt = a; }
+      }
+      if (!tgt) {
+        let bestD = Infinity;
+        for (const a of this.aliens) {
+          if (a.dead || a.hp <= 0) continue;
+          const d = a.relPos.length();
+          if (d < bestD) { bestD = d; tgt = a; }
+        }
+      }
+    }
+
+    // 3) Auto-lock onto nearby Asteroid Belt / Kuiper Belt / Oort Cloud rock when no Alien is targeted
+    if (!rockTgt && !tgt) {
+      rockTgt = this.findAutoTargetBeltRock();
+    }
+
+    let firedLaser = false;
+    let firedWater = false;
+    let firedAcid = false;
+    let firedElectric = false;
+    const pWorld = P.root.position;
+    const wxOff = P.sx, wyOff = P.alt, wzOff = P.s.z || 0;
+
+    for (const w of weapons) {
+      const startPos = new THREE.Vector3();
+      if (w.fallbackOffset) {
+        startPos.copy(w.fallbackOffset).applyQuaternion(P.root.quaternion).add(pWorld);
+      } else if (w.muzzle) {
+        w.muzzle.getWorldPosition(startPos);
+      } else {
+        startPos.copy(pWorld);
+      }
+
+      if (!this.isRockTargetAlive(rockTgt)) {
+        rockTgt = !tgt ? this.findAutoTargetBeltRock() : null;
+      }
+
+      const endPos = new THREE.Vector3();
+      let isShootingRock = false;
+      if (tgt && tgt.mesh) {
+        endPos.copy(tgt.mesh.position);
+        endPos.x += (Math.random() - 0.5) * 0.8;
+        endPos.y += 0.35 + (Math.random() - 0.5) * 0.6;
+        endPos.z += (Math.random() - 0.5) * 0.8;
+      } else if (rockTgt && this.isRockTargetAlive(rockTgt)) {
+        isShootingRock = true;
+        const rawRockPos = this.getBeltRockWorldPos(rockTgt, new THREE.Vector3());
+        const rJit = Math.min(40, (rockTgt.radius || 20) * 0.18);
+        rawRockPos.x += (Math.random() - 0.5) * rJit;
+        rawRockPos.y += (Math.random() - 0.5) * rJit;
+        rawRockPos.z += (Math.random() - 0.5) * rJit;
+        const rawDiff = rawRockPos.clone().sub(startPos);
+        const rawDist = Math.max(1, rawDiff.length());
+        const clampedDist = Math.min(rawDist, 1800000);
+        endPos.copy(startPos).addScaledVector(rawDiff.divideScalar(rawDist), clampedDist);
+      } else {
+        const fwd = (P.dir3D ? P.dir3D.clone() : new THREE.Vector3(0, 1, 0)).normalize();
+        endPos.copy(startPos).addScaledVector(fwd, 850);
+      }
+
+      const beam = createBeamVisual(w.weaponType, startPos, endPos);
+      this.scene.add(beam);
+      this.weaponBeams.push({
+        mesh: beam,
+        relStart: startPos.clone().sub(pWorld),
+        relEnd: endPos.clone().sub(pWorld),
+        life: beam.userData.life,
+        maxLife: beam.userData.maxLife,
+      });
+
+      const dir = new THREE.Vector3().subVectors(endPos, startPos).normalize();
+      const hitX = wxOff + (endPos.x - pWorld.x);
+      const hitY = wyOff + (endPos.y - pWorld.y);
+      const hitZ = wzOff + (endPos.z - pWorld.z);
+      const muzX = wxOff + (startPos.x - pWorld.x);
+      const muzY = wyOff + (startPos.y - pWorld.y);
+      const muzZ = wzOff + (startPos.z - pWorld.z);
+
+      if (w.weaponType === 'water') {
+        firedWater = true;
+        // 1,000,000 PSI Supersonic Water Jet spray + high-pressure mist burst
+        for (let i = 0; i < 16; i++) {
+          const sp = 55 + Math.random() * 85;
+          this.fire.emit(
+            muzX + dir.x * i * 1.4,
+            muzY + dir.y * i * 1.4,
+            muzZ + dir.z * i * 1.4,
+            P.vSurf.e + dir.x * sp + (Math.random() - 0.5) * 12,
+            P.vSurf.u + dir.y * sp + (Math.random() - 0.5) * 12,
+            dir.z * sp + (Math.random() - 0.5) * 12,
+            { life: 0.22 + Math.random() * 0.18, size0: 1.2, size1: 3.6, alpha: 0.85, drag: 1.2, buoy: 0, color: [0.65, 2.8, 5.5] }
+          );
+        }
+        for (let i = 0; i < 18; i++) {
+          const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(12 + Math.random() * 26);
+          this.smoke.emit(
+            hitX, hitY, hitZ,
+            P.vSurf.e + d.x, P.vSurf.u + d.y, d.z,
+            { life: 0.65 + Math.random() * 0.5, size0: 2.0, size1: 7.5, alpha: 0.75, drag: 0.5, buoy: 0.2, color: [0.82, 0.95, 1.0] }
+          );
+        }
+        if (tgt && tgt.hp > 0) {
+          tgt.hp -= 30;
+          tgt.hitFlash = 0.16;
+          // 1,000,000 PSI knockback impulse
+          tgt.vel.addScaledVector(dir, 24);
+          tgt.mesh.userData.setHp(tgt.hp / tgt.maxHp);
+          if (tgt.hp <= 0) this.destroyAlien(tgt, 'water');
+        } else if (isShootingRock && rockTgt) {
+          this.damageBeltRock(rockTgt, 34, 'water', endPos);
+        }
+      } else if (w.weaponType === 'acid') {
+        firedAcid = true;
+        // Corrosive Acid stream droplets + toxic green fumes on impact
+        for (let i = 0; i < 14; i++) {
+          const sp = 42 + Math.random() * 68;
+          this.fire.emit(
+            muzX + dir.x * i * 1.4,
+            muzY + dir.y * i * 1.4,
+            muzZ + dir.z * i * 1.4,
+            P.vSurf.e + dir.x * sp + (Math.random() - 0.5) * 14,
+            P.vSurf.u + dir.y * sp + (Math.random() - 0.5) * 14,
+            dir.z * sp + (Math.random() - 0.5) * 14,
+            { life: 0.28 + Math.random() * 0.22, size0: 1.3, size1: 4.2, alpha: 0.92, drag: 1.3, buoy: -0.1, color: [1.8, 6.2, 0.75] }
+          );
+        }
+        for (let i = 0; i < 16; i++) {
+          const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(8 + Math.random() * 18);
+          this.smoke.emit(
+            hitX, hitY, hitZ,
+            P.vSurf.e + d.x, P.vSurf.u + d.y, d.z,
+            { life: 0.85 + Math.random() * 0.65, size0: 2.2, size1: 8.5, alpha: 0.78, drag: 0.6, buoy: 0.35, color: [0.42, 0.95, 0.32] }
+          );
+        }
+        if (tgt && tgt.hp > 0) {
+          tgt.hp -= 32;
+          tgt.acidTimer = 4.5; // Continuous acid corrosion DoT for 4.5 seconds
+          tgt.hitFlash = 0.18;
+          tgt.vel.addScaledVector(dir, 12);
+          tgt.mesh.userData.setHp(tgt.hp / tgt.maxHp);
+          if (tgt.hp <= 0) this.destroyAlien(tgt, 'acid');
+        } else if (isShootingRock && rockTgt) {
+          this.damageBeltRock(rockTgt, 36, 'acid', endPos);
+        }
+      } else if (w.weaponType === 'electric') {
+        firedElectric = true;
+        // 1,000,000 WATT High-Voltage Tesla lightning discharge sparks
+        for (let i = 0; i < 20; i++) {
+          const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(18 + Math.random() * 42);
+          const col = i % 2 === 0 ? [1.2, 5.8, 8.5] : [8.5, 7.5, 1.4];
+          this.fire.emit(
+            hitX, hitY, hitZ,
+            P.vSurf.e + d.x, P.vSurf.u + d.y, d.z,
+            { life: 0.20 + Math.random() * 0.22, size0: 1.5, size1: 4.6, alpha: 0.98, drag: 1.6, buoy: 0, color: col }
+          );
+        }
+        if (tgt && tgt.hp > 0) {
+          tgt.hp -= 38;
+          tgt.hitFlash = 0.22;
+          tgt.vel.multiplyScalar(0.2); // High-voltage stun/shock impulse
+          tgt.vel.addScaledVector(dir, 10);
+          tgt.mesh.userData.setHp(tgt.hp / tgt.maxHp);
+
+          // 1,000,000 WATT Chain Lightning: arcs to up to 2 nearby Aliens within 48m!
+          let chained = 0;
+          for (const other of this.aliens) {
+            if (other === tgt || other.dead || other.hp <= 0) continue;
+            if (other.mesh && tgt.mesh && other.mesh.position.distanceTo(tgt.mesh.position) < 48) {
+              const chainBeam = createBeamVisual('electric', tgt.mesh.position, other.mesh.position);
+              this.scene.add(chainBeam);
+              this.weaponBeams.push({
+                mesh: chainBeam,
+                relStart: tgt.mesh.position.clone().sub(pWorld),
+                relEnd: other.mesh.position.clone().sub(pWorld),
+                life: chainBeam.userData.life,
+                maxLife: chainBeam.userData.maxLife,
+              });
+              other.hp -= 22;
+              other.hitFlash = 0.20;
+              other.mesh.userData.setHp(other.hp / other.maxHp);
+              if (other.hp <= 0) this.destroyAlien(other, 'electric');
+              if (++chained >= 2) break;
+            }
+          }
+
+          if (tgt.hp <= 0) this.destroyAlien(tgt, 'electric');
+        } else if (isShootingRock && rockTgt) {
+          const srcPos = endPos.clone();
+          this.damageBeltRock(rockTgt, 42, 'electric', srcPos);
+          // Chain lightning arcs to up to 2 nearby belt boulders!
+          if (!rockTgt.isMacro) {
+            const localMeshes = this.getVisibleLocalBeltMeshes();
+            const cPos = new THREE.Vector3();
+            let chainedRocks = 0;
+            for (const im of localMeshes) {
+              const meta = im.userData.beltRocks;
+              for (let i = 0; i < meta.count; i++) {
+                if (!meta.alive[i] || (im === rockTgt.im && i === rockTgt.index)) continue;
+                const i3 = i * 3;
+                cPos.set(meta.localPos[i3], meta.localPos[i3 + 1], meta.localPos[i3 + 2]).applyMatrix4(im.matrixWorld);
+                if (cPos.distanceTo(srcPos) < 950) {
+                  const chainBeam = createBeamVisual('electric', srcPos, cPos);
+                  this.scene.add(chainBeam);
+                  this.weaponBeams.push({
+                    mesh: chainBeam,
+                    relStart: srcPos.clone().sub(pWorld),
+                    relEnd: cPos.clone().sub(pWorld),
+                    life: chainBeam.userData.life,
+                    maxLife: chainBeam.userData.maxLife,
+                  });
+                  this.damageBeltRock({ im, index: i, radius: meta.radii[i] || 20, beltKind: meta.beltKind, isMacro: false }, 32, 'electric', cPos);
+                  if (++chainedRocks >= 2) break;
+                }
+              }
+              if (chainedRocks >= 2) break;
+            }
+          }
+        }
+      } else {
+        firedLaser = true;
+        // High-energy Laser impact plasma sparks
+        for (let i = 0; i < 18; i++) {
+          const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(15 + Math.random() * 35);
+          this.fire.emit(
+            hitX, hitY, hitZ,
+            P.vSurf.e + d.x, P.vSurf.u + d.y, d.z,
+            { life: 0.25 + Math.random() * 0.25, size0: 1.6, size1: 4.8, alpha: 0.95, drag: 1.4, buoy: 0, color: [7.5, 0.7, 2.2] }
+          );
+        }
+        if (tgt && tgt.hp > 0) {
+          tgt.hp -= 35;
+          tgt.hitFlash = 0.16;
+          tgt.vel.addScaledVector(dir, 8);
+          tgt.mesh.userData.setHp(tgt.hp / tgt.maxHp);
+          if (tgt.hp <= 0) this.destroyAlien(tgt, 'laser');
+        } else if (isShootingRock && rockTgt) {
+          this.damageBeltRock(rockTgt, 38, 'laser', endPos);
+        }
+      }
+    }
+
+    if (firedLaser) audio.laserShot(0.32);
+    if (firedWater) audio.waterBlast(0.38);
+    if (firedAcid) audio.acidSpray(0.36);
+    if (firedElectric) audio.electricZap(0.38);
+  }
+
+  destroyAlien(alien, weaponType) {
+    if (!alien || alien.dead) return;
+    alien.dead = true;
+    const P = this.player;
+    const pWorld = P ? P.root.position : new THREE.Vector3();
+    const hitX = (P ? P.sx : 0) + (alien.mesh.position.x - pWorld.x);
+    const hitY = (P ? P.alt : 0) + (alien.mesh.position.y - pWorld.y);
+    const hitZ = (P ? (P.s.z || 0) : 0) + (alien.mesh.position.z - pWorld.z);
+
+    // Big neon green & purple Alien UFO explosion
+    for (let i = 0; i < 65; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(10 + Math.random() * 42);
+      const col = i % 2 === 0 ? [1.2, 6.8, 2.2] : [4.8, 1.4, 6.8];
+      this.fire.emit(
+        hitX, hitY, hitZ,
+        (P?.vSurf?.e || 0) + d.x, (P?.vSurf?.u || 0) + d.y, d.z,
+        { life: 0.55 + Math.random() * 0.65, size0: 3.2, size1: 14 + Math.random() * 10, alpha: 1.0, drag: 1.1, buoy: 0.4, color: col }
+      );
+    }
+    for (let i = 0; i < 32; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().multiplyScalar(8 + Math.random() * 24);
+      this.smoke.emit(
+        hitX, hitY, hitZ,
+        (P?.vSurf?.e || 0) + d.x, (P?.vSurf?.u || 0) + d.y, d.z,
+        { life: 2.2 + Math.random() * 2.0, size0: 4, size1: 18, alpha: 0.7, drag: 0.4, buoy: 0.5, color: [0.35, 0.85, 0.45] }
+      );
+    }
+
+    if (alien.mesh && alien.mesh.parent) alien.mesh.parent.remove(alien.mesh);
+    this.aliens = this.aliens.filter((a) => a !== alien);
+    this.aliensKilled = (this.aliensKilled || 0) + 1;
+    if (weaponType !== 'supernova') {
+      const { newlyUnlocked } = unlockUfoByAlienTier(alien.tier);
+      if (newlyUnlocked && this.app?.build) {
+        this.app.build.renderPalette?.();
+        this.app.build.renderPresets?.();
+      }
+    }
+    if (alien.tier === 'king') this.setFlag('killKing');
+    else if (alien.tier === 'queen') this.setFlag('killQueen');
+    if (this.mission?.id === 'alien100' || this.mission?.id === 'alien500' || this.mission?.id === 'alien1500' || this.mission?.id === 'alien5000') {
+      this.checkObjectives();
+      this.renderMissionPanel(false);
+    }
+    audio.alienBoom(0.7);
+    this.flash = Math.max(this.flash || 0, 0.55);
+    this.flashPos = { x: hitX, y: hitY, z: hitZ };
+
+    if (alien.tier === 'king' || alien.tier === 'queen') {
+      const aName = tr(alien.labelVi || 'UFO Alien', alien.labelEn || 'Alien UFO');
+      const wLabel = weaponType === 'supernova'
+        ? tr('Vụ Nổ Siêu Tân Tinh', 'Supernova Shockwave')
+        : weaponType === 'water'
+          ? tr('Máy Phun Nước 1,000,000 PSI', '1,000,000 PSI Water Cannon')
+          : weaponType === 'acid'
+            ? tr('Súng Acid Ăn Mòn', 'Corrosive Acid Cannon')
+            : weaponType === 'electric'
+              ? tr('Súng Điện 1,000,000 WATT', '1,000,000 WATT Electric Cannon')
+              : tr('Súng Lazer Siêu Hạng', 'Plasma Laser Turret');
+      this.event(
+        tr(
+          `👽💥 Đã hạ gục ${aName} (${alien.maxHp} HP) bằng ${wLabel}! (Tổng diệt: ${this.aliensKilled})`,
+          `👽💥 Destroyed ${aName} (${alien.maxHp} HP) with ${wLabel}! (Total kills: ${this.aliensKilled})`
+        )
+      );
+      if (alien.tier === 'king') {
+        this.milestone(
+          tr('👑💥 ĐÃ TIÊU DIỆT ALIEN VUA (100.000 HP)!', '👑💥 COLOSSAL ALIEN KING (100,000 HP) DEFEATED!'),
+          tr('Chiến công chấn động vũ trụ ở độ cao 1.000.000.000 km! 🔓 Đã mở khóa Đĩa Bay UFO Vua!', 'Cosmic victory at 1,000,000,000 km altitude! 🔓 King UFO unlocked!')
+        );
+      } else {
+        this.milestone(
+          tr('👸💥 ĐÃ TIÊU DIỆT ALIEN HOÀNG HẬU (90.500 HP)!', '👸💥 COLOSSAL ALIEN QUEEN (90,500 HP) DEFEATED!'),
+          tr('Chiến công chấn động vũ trụ ở độ cao 1.000.000.000 km! 🔓 Đã mở khóa Đĩa Bay UFO Hoàng Hậu!', 'Cosmic victory at 1,000,000,000 km altitude! 🔓 Queen UFO unlocked!')
+        );
+      }
+    }
+
+    // Heavy Boss / Royal Alien core collapses into a mini Supernova on destruction (only in outer space, never on planets/moons)!
+    const onPlanetOrMoon = !P || P.clamped || P.landed || (P.ref !== 'sun' && P.alt < ATM_TOP);
+    if ((alien.tier === 'boss' || alien.isRoyal) && weaponType !== 'supernova' && !onPlanetOrMoon) {
+      this.triggerSupernova(alien.relPos ? alien.relPos.clone() : null, alien.isRoyal ? 1.45 : 0.58, true);
+    }
+  }
+
+  triggerSupernova(originRel = null, scale = 1.15, isBossCollapse = false) {
+    const P = this.player;
+    if (!P) return;
+
+    // Never allow Supernova on or near any planet or moon (only in outer space >= ATM_TOP or interplanetary space)
+    const onPlanetOrMoon = P.clamped || P.landed || (P.ref !== 'sun' && P.alt < ATM_TOP);
+    if (onPlanetOrMoon) return;
+    if (!this.supernovas) this.supernovas = [];
+
+    const pWorld = P.root ? P.root.position : new THREE.Vector3();
+    let relPos = originRel ? originRel.clone() : null;
+    if (!relPos) {
+      if (this.aliens && this.aliens.length) {
+        relPos = this.aliens[0].relPos.clone();
+      } else {
+        const fwd = (P.dir3D ? P.dir3D.clone() : new THREE.Vector3(0, 1, 0)).normalize();
+        relPos = new THREE.Vector3(24, 34, -28).addScaledVector(fwd, 38);
+      }
+    }
+
+    const mesh = createSupernovaMesh(scale);
+    mesh.position.copy(pWorld).add(relPos);
+    this.scene.add(mesh);
+
+    // 100x longer duration than original (3.8s -> 380s, 5.6s -> 560s)
+    const maxLife = (isBossCollapse ? 3.8 : 5.6) * 100;
+    const E = P.east || { x: 1, y: 0 };
+    const U = P.up || { x: 0, y: 1 };
+    const worldS = {
+      x: P.s.x + relPos.x * E.x + relPos.y * U.x,
+      y: P.s.y + relPos.x * E.y + relPos.y * U.y,
+      z: (P.s.z || 0) + relPos.z,
+    };
+    const hitX = (P.sx || 0) + relPos.x;
+    const hitY = (P.alt || 0) + relPos.y;
+    const hitZ = (P.s?.z || 0) + relPos.z;
+
+    this.supernovas.push({
+      mesh,
+      worldS,
+      hitX,
+      hitY,
+      hitZ,
+      phi0: P.phi || 0,
+      scale,
+      emberTimer: 0,
+      age: 0,
+      maxLife,
+    });
+
+    // Multi-chromatic Supernova plasma ejecta fixed at the explosion site (does not follow player velocity)
+    const snPalette = [
+      [1.5, 5.5, 9.0],
+      [8.5, 1.4, 5.2],
+      [9.0, 6.2, 1.2],
+      [7.5, 7.5, 9.5],
+    ];
+    const count = isBossCollapse ? 85 : 150;
+    for (let i = 0; i < count; i++) {
+      const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize()
+        .multiplyScalar((18 + Math.random() * 95) * scale);
+      const col = snPalette[i % snPalette.length];
+      this.fire.emit(
+        hitX, hitY, hitZ,
+        d.x, d.y, d.z,
+        { life: 2.2 + Math.random() * 3.5, size0: 4.5 * scale, size1: (22 + Math.random() * 18) * scale, alpha: 1.0, drag: 0.75, buoy: 0.2, color: col }
+      );
+    }
+
+    audio.supernova(isBossCollapse ? 0.65 : 0.95);
+    this.flash = Math.max(this.flash || 0, isBossCollapse ? 1.2 : 2.2);
+    this.flashPos = { x: hitX, y: hitY, z: hitZ };
+    this.shakeBoost = Math.max(this.shakeBoost || 0, isBossCollapse ? 2.5 : 4.5);
+
+    if (!isBossCollapse) {
+      // Vaporize non-royal Aliens caught in the Supernova shockwave (Royal King & Queen survive so player can fight them)!
+      const doomed = (this.aliens || []).filter((a) => !a.isRoyal);
+      for (const a of doomed) {
+        this.destroyAlien(a, 'supernova');
+      }
+      const starNames = [
+        'Betelgeuse-IX', 'Eta Carinae', 'Cygnus X-3', 'Vega Prime',
+        'Antares-B', 'Kepler-1604', 'Rigel Hypergiant', 'Pulsar Vela-VII',
+      ];
+      const starName = starNames[Math.floor(Math.random() * starNames.length)];
+      this.milestone(
+        tr('💥 SIÊU TÂN TINH LIÊN SAO BÙNG NỔ!', '💥 INTERSTELLAR SUPERNOVA ERUPTION!'),
+        tr(`Tên lửa đang bay trong Không gian Liên sao ngoài Hệ Mặt Trời thì sao ${starName} phát nổ Siêu Tân Tinh chói lọi!`, `Cruising in Interstellar Space beyond the Solar System, star ${starName} erupted into a brilliant Supernova!`)
+      );
+      this.event(
+        tr(
+          `💥🌟 [Không gian Liên sao] Vụ nổ Siêu Tân Tinh (${starName}) bùng phát rực rỡ ngoài Hệ Mặt Trời!`,
+          `💥🌟 [Interstellar Space] Supernova explosion (${starName}) erupted brightly beyond the Solar System!`
+        ),
+        'warn'
+      );
+    }
+  }
+
+  updateAliensAndWeapons(dt) {
+    const P = this.player;
+    if (!P) return;
+    const playerAlive = !P.dead && !P.crashed;
+    if (!this.aliens) this.aliens = [];
+    if (!this.weaponBeams) this.weaponBeams = [];
+
+    this.weaponCooldown = (this.weaponCooldown || 0) - dt;
+    if (playerAlive && (this.keys['v'] || this.keys['enter'] || this.firingHeld)) {
+      let burstGuard = 0;
+      while (this.weaponCooldown <= 0 && burstGuard++ < 4) {
+        this.fireWeapons();
+      }
+    } else {
+      this.weaponCooldown = Math.max(0, this.weaponCooldown);
+    }
+
+    // Never allow Aliens on Earth (< ATM_TOP) or when Aliens are disabled
+    const onEarth = P.ref === 'earth' && P.alt < ATM_TOP;
+    if (onEarth || this.aliensDisabled) {
+      if (this.aliens.length) {
+        this.clearAllAliens();
+      }
+    } else if (playerAlive) {
+      // Spawn colossal Alien King & Alien Queen when player reaches altitude >= 1,000,000,000 km
+      const curAltKm = (P.ref === 'earth' ? Math.max(0, P.alt - (this.startAlt || 0)) : Math.max(0, P.alt)) / 1000;
+      const earthDistKm = Math.max(0, Math.hypot(P.s.x, P.s.y, P.s.z || 0) - R_E) / 1000;
+      const effectiveAltKm = Math.max(curAltKm, earthDistKm);
+      if (effectiveAltKm >= 1000000000) {
+        const spawnedKing = !this.flags.killKing ? this.spawnRoyalAlien('king') : null;
+        const spawnedQueen = !this.flags.killQueen ? this.spawnRoyalAlien('queen') : null;
+        if (!this.flags.royalAliens1B && (spawnedKing || spawnedQueen)) {
+          this.setFlag('royalAliens1B');
+          this.milestone(
+            tr('👑👸 ALIEN VUA & ALIEN HOÀNG HẬU XUẤT HIỆN!', '👑👸 ALIEN KING & ALIEN QUEEN HAVE APPEARED!'),
+            tr('Đạt độ cao 1.000.000.000 km! Hai siêu trùm khổng lồ Alien Vua (100.000 HP) và Alien Hoàng Hậu (90.500 HP) đã xuất hiện!', 'Reached 1,000,000,000 km altitude! Colossal Alien King (100,000 HP) & Alien Queen (90,500 HP) have emerged!')
+          );
+          this.event(
+            tr('👑👸🚨 Đạt độ cao 1.000.000.000 km! ALIEN VUA (100.000 HP) và ALIEN HOÀNG HẬU (90.500 HP) khổng lồ đã xuất hiện! Nhấn V hoặc click chuột để bắn!', '👑👸🚨 Reached 1,000,000,000 km altitude! Colossal ALIEN KING (100,000 HP) & ALIEN QUEEN (90,500 HP) have appeared! Press V or click to fire!'),
+            'warn'
+          );
+        }
+      }
+
+      const density = this.getAlienDensityConfig();
+      const { maxConcurrentAliens, spawnInterval, batchSize } = density;
+      while (this.aliens.length > maxConcurrentAliens + 4) {
+        const idx = this.aliens.findLastIndex((a) => !a.isRoyal);
+        if (idx === -1) break;
+        const [rem] = this.aliens.splice(idx, 1);
+        if (rem && rem.mesh && rem.mesh.parent) rem.mesh.parent.remove(rem.mesh);
+      }
+      this.alienSpawnTimer = (this.alienSpawnTimer || 0) - dt;
+      if (this.aliens.length < maxConcurrentAliens && this.alienSpawnTimer <= 0) {
+        const toSpawn = Math.min(batchSize, maxConcurrentAliens - this.aliens.length);
+        for (let s = 0; s < toSpawn; s++) {
+          this.spawnAlien(density);
+        }
+        this.alienSpawnTimer = spawnInterval;
+      }
+    }
+
+    const pWorld = P.root.position;
+
+    let nearestAlien = null;
+    let bestDist = Infinity;
+
+    // Mutual separation: all Aliens peacefully steer clear of each other and NEVER collide or brawl
+    for (let i = 0; i < this.aliens.length; i++) {
+      const a = this.aliens[i];
+      for (let j = i + 1; j < this.aliens.length; j++) {
+        const b = this.aliens[j];
+        const diff = new THREE.Vector3().subVectors(a.relPos, b.relPos);
+        const dist = diff.length();
+        const minSep = (a.isRoyal || b.isRoyal) ? 38.0 : 16.0;
+        if (dist > 0.01 && dist < minSep) {
+          const push = ((minSep - dist) / minSep) * 18 * dt;
+          diff.normalize();
+          a.vel.addScaledVector(diff, push);
+          b.vel.addScaledVector(diff, -push);
+        }
+      }
+    }
+
+    for (const a of this.aliens) {
+      a.orbitAngle += a.orbitSpeed * dt;
+      a.hitFlash = Math.max(0, a.hitFlash - dt);
+      a.pushOffset.addScaledVector(a.vel, dt);
+      a.vel.multiplyScalar(Math.exp(-dt * 3.2));
+      a.pushOffset.multiplyScalar(Math.exp(-dt * 1.4));
+
+      const tx = Math.cos(a.orbitAngle) * a.orbitRadius + a.pushOffset.x;
+      const tz = Math.sin(a.orbitAngle) * a.orbitRadius + a.pushOffset.z;
+      const minRelY = this.alienFloorRelY(tx, tz, a.tier);
+      if (a.baseY - a.bobAmp < minRelY) {
+        a.baseY = minRelY + a.bobAmp + 1.5;
+      }
+      const bobY = Math.sin(this.time * 2.2 + a.bobPhase) * a.bobAmp;
+      let ty = a.baseY + bobY + a.pushOffset.y;
+      if (ty < minRelY) {
+        ty = minRelY;
+        a.pushOffset.y = Math.max(a.pushOffset.y, minRelY - (a.baseY + bobY));
+        if (a.vel.y < 0) a.vel.y = -a.vel.y * 0.35;
+      }
+
+      a.relPos.set(tx, ty, tz);
+      a.mesh.position.copy(pWorld).add(a.relPos);
+      if (a.mesh.userData.animate) {
+        a.mesh.userData.animate(this.time, a.hitFlash, this.camera.quaternion);
+      }
+
+      // Continuous Acid Corrosion DoT when hit by gunAcid
+      if (a.acidTimer > 0 && !a.dead && a.hp > 0) {
+        a.acidTimer = Math.max(0, a.acidTimer - dt);
+        a.hp -= 18 * dt;
+        a.mesh.userData.setHp(a.hp / a.maxHp);
+        if (Math.random() < dt * 10) {
+          const hitX = P.sx + a.relPos.x;
+          const hitY = P.alt + a.relPos.y;
+          const hitZ = (P.s.z || 0) + a.relPos.z;
+          this.fire.emit(
+            hitX + (Math.random() - 0.5) * 2.2,
+            hitY + (Math.random() - 0.5) * 1.6,
+            hitZ + (Math.random() - 0.5) * 2.2,
+            (P.vSurf?.e || 0) + (Math.random() - 0.5) * 8,
+            (P.vSurf?.u || 0) + 3 + Math.random() * 8,
+            (Math.random() - 0.5) * 8,
+            { life: 0.35 + Math.random() * 0.25, size0: 1.1, size1: 3.8, alpha: 0.85, drag: 1.0, buoy: 0.4, color: [1.6, 5.8, 0.7] }
+          );
+        }
+        if (a.hp <= 0) {
+          this.destroyAlien(a, 'acid');
+          continue;
+        }
+      }
+
+      // Passive Alien self-regeneration: +10 HP/s up to maxHp
+      if (!a.dead && a.hp > 0 && a.hp < a.maxHp) {
+        const regen = (a.regenRate ?? 10) * dt;
+        a.hp = Math.min(a.maxHp, a.hp + regen);
+        if (a.mesh?.userData?.setHp) {
+          a.mesh.userData.setHp(a.hp / a.maxHp);
+        }
+        // Subtle green bio-regeneration sparkles while healing
+        if (a.hitFlash <= 0 && !(a.acidTimer > 0) && Math.random() < dt * 4.5) {
+          const hitX = P.sx + a.relPos.x;
+          const hitY = P.alt + a.relPos.y;
+          const hitZ = (P.s.z || 0) + a.relPos.z;
+          this.fire.emit(
+            hitX + (Math.random() - 0.5) * 2.5,
+            hitY + (Math.random() - 0.5) * 1.4,
+            hitZ + (Math.random() - 0.5) * 2.5,
+            (P.vSurf?.e || 0) + (Math.random() - 0.5) * 3,
+            (P.vSurf?.u || 0) + 4 + Math.random() * 5,
+            (Math.random() - 0.5) * 3,
+            { life: 0.35 + Math.random() * 0.25, size0: 0.9, size1: 2.6, alpha: 0.75, drag: 1.1, buoy: 0.5, color: [0.5, 4.8, 1.8] }
+          );
+        }
+      }
+
+      const d = a.relPos.length();
+      if (d < bestDist) {
+        bestDist = d;
+        nearestAlien = a;
+      }
+    }
+
+    // Rotate weapon turrets slightly toward the nearest Alien target & auto-fire when Autopilot is enabled
+    if (playerAlive && nearestAlien && this.rocket && this.rocket.weapons) {
+      for (const w of this.rocket.weapons) {
+        if (!w.turret || !P.owns(w.seg)) continue;
+        w.turret.rotation.z = Math.sin(this.time * 3.5) * 0.12;
+      }
+    }
+    if (playerAlive && (this.program || this.autoShootAliens) && nearestAlien) {
+      let burstGuard = 0;
+      while (nearestAlien && !nearestAlien.dead && nearestAlien.hp > 0 && this.weaponCooldown <= 0 && burstGuard++ < 4) {
+        this.fireWeapons(nearestAlien);
+      }
+    }
+
+    // Update active laser & 1,000,000 PSI water beams
+    for (let i = this.weaponBeams.length - 1; i >= 0; i--) {
+      const b = this.weaponBeams[i];
+      b.life -= dt;
+      if (b.life <= 0) {
+        if (b.mesh.parent) b.mesh.parent.remove(b.mesh);
+        if (b.mesh.userData.coreGeo) b.mesh.userData.coreGeo.dispose();
+        if (b.mesh.userData.outerGeo) b.mesh.userData.outerGeo.dispose();
+        if (b.mesh.userData.arcGeo) b.mesh.userData.arcGeo.dispose();
+        this.weaponBeams.splice(i, 1);
+      } else {
+        const f = b.life / b.maxLife;
+        const startW = pWorld.clone().add(b.relStart);
+        const endW = pWorld.clone().add(b.relEnd);
+        b.mesh.position.addVectors(startW, endW).multiplyScalar(0.5);
+        if (b.mesh.userData.coreMat) b.mesh.userData.coreMat.opacity = f;
+        if (b.mesh.userData.outerMat) b.mesh.userData.outerMat.opacity = f * 0.7;
+      }
+    }
+
+    // Update tumbling 3D shattered asteroid / Kuiper / Oort rock fragments
+    if (this.rockFragments && this.rockFragments.length) {
+      for (let i = this.rockFragments.length - 1; i >= 0; i--) {
+        const rf = this.rockFragments[i];
+        rf.life -= dt;
+        if (rf.life <= 0) {
+          if (rf.mesh && rf.mesh.parent) rf.mesh.parent.remove(rf.mesh);
+          this.rockFragments.splice(i, 1);
+        } else {
+          rf.relPos.addScaledVector(rf.vel, dt);
+          rf.mesh.position.copy(pWorld).add(rf.relPos);
+          rf.mesh.rotation.x += rf.rotVel.x * dt;
+          rf.mesh.rotation.y += rf.rotVel.y * dt;
+          rf.mesh.rotation.z += rf.rotVel.z * dt;
+          const shrink = Math.min(1, rf.life / (rf.maxLife * 0.4));
+          rf.mesh.scale.copy(rf.baseScale).multiplyScalar(shrink);
+        }
+      }
+    }
+
+    // Heliocentric distance to the Sun, Oort Cloud check, and Interstellar boundary check
+    const _sunPos = { x: 0, y: 0, z: 0 };
+    bodyPos('sun', this.simT, _sunPos);
+    const dxSun = P.s.x - _sunPos.x;
+    const dySun = P.s.y - _sunPos.y;
+    const dzSun = (P.s.z || 0) - (_sunPos.z || 0);
+    const rSun = Math.hypot(dxSun, dySun, dzSun);
+    const isInOortCloud = rSun >= OORT_CLOUD_INNER && rSun <= OORT_CLOUD_OUTER;
+    const isOutsideSolarSystem = rSun >= SUN_SOI;
+
+    if (playerAlive && isInOortCloud && !this.flags.oortCloud && !P.clamped && !P.landed) {
+      this.setFlag('oortCloud');
+      this.milestone(
+        tr('☄️ TIẾN VÀO ĐÁM MÂY OORT!', '☄️ ENTERED THE OORT CLOUD!'),
+        tr('Vỏ cầu sao chổi băng khổng lồ bao quanh rìa Hệ Mặt Trời (1.120.000 – 1.520.000 km)!', 'Giant 3D spherical shell of icy cometary nuclei surrounding the edge of the Solar System (1,120,000 – 1,520,000 km)!')
+      );
+      this.event(
+        tr('☄️✨ Tàu đã bay vào Đám mây Oort — vùng vỏ cầu sao chổi băng bao quanh Hệ Mặt Trời!', '☄️✨ The craft has entered the Oort Cloud — the spherical icy cometary shell surrounding the Solar System!'),
+        'warn'
+      );
+    }
+
+    // Milestone & event when crossing the outer boundary of the Solar System
+    if (playerAlive && isOutsideSolarSystem && !this.flags.interstellarSpace && !P.clamped && !P.landed) {
+      this.setFlag('interstellarSpace');
+      this.milestone(
+        tr('🌌 TIẾN VÀO KHÔNG GIAN LIÊN SAO!', '🌌 ENTERED INTERSTELLAR SPACE!'),
+        tr('Tàu đã vượt qua Đám mây Oort & ranh giới Hệ Mặt Trời (> 1.560.000 km) · Vùng không gian sâu thẳm nơi các Siêu Tân Tinh (Supernova) thi thoảng bùng nổ!', 'Craft passed the Oort Cloud & Solar System boundary (> 1,560,000 km) · Deep space where Supernovas erupt periodically!')
+      );
+      this.event(
+        tr('🌌✨ Tàu đã chính thức rời khỏi Hệ Mặt Trời, tiến vào Không gian Liên sao rộng lớn!', '🌌✨ The craft has officially left the Solar System, venturing into deep Interstellar Space!'),
+        'warn'
+      );
+      this.supernovaSpawnTimer = 900 + Math.random() * 600;
+    }
+
+    // Spontaneous Supernova ONLY outside the Solar System in Interstellar Space (every 900-1500 seconds)
+    const onPlanetOrMoon = P.clamped || P.landed || (P.ref !== 'sun' && P.alt < ATM_TOP);
+    if (!isOutsideSolarSystem || onPlanetOrMoon) {
+      // Inside solar system: clear any active supernovas if on/near body and do not spawn natural supernovas
+      if (onPlanetOrMoon && this.supernovas && this.supernovas.length) {
+        for (const sn of this.supernovas) {
+          if (sn.mesh && sn.mesh.parent) sn.mesh.parent.remove(sn.mesh);
+          if (sn.mesh?.userData?.dispose) sn.mesh.userData.dispose();
+        }
+        this.supernovas = [];
+      }
+      this.supernovaSpawnTimer = 900 + Math.random() * 600;
+      this.supernovaDistAcc = 0;
+    } else if (this.phase === 'flight') {
+      const spd = P.speed || Math.hypot(P.vSurf?.e || 0, P.vSurf?.u || 0);
+      this.supernovaDistAcc = (this.supernovaDistAcc || 0) + spd * dt;
+      this.supernovaSpawnTimer = (this.supernovaSpawnTimer ?? 1200) - dt;
+      if (this.supernovaSpawnTimer <= 0) {
+        const vxScene = P.vSurf?.e || 0;
+        const vyScene = P.vSurf?.u || 0;
+        const vzScene = P.s?.vz || 0;
+        const vMag = Math.hypot(vxScene, vyScene, vzScene);
+        const moveDir = vMag > 5
+          ? new THREE.Vector3(vxScene / vMag, vyScene / vMag, vzScene / vMag)
+          : (P.dir3D ? P.dir3D.clone() : new THREE.Vector3(0, 1, 0)).normalize();
+        const distAhead = THREE.MathUtils.clamp(vMag * 2.2, 110, 2400);
+        const rSide = Math.max(45, distAhead * 0.38);
+        const az = Math.random() * Math.PI * 2;
+        const flybyPos = new THREE.Vector3(
+          Math.cos(az) * rSide,
+          18 + Math.random() * 28,
+          Math.sin(az) * rSide
+        ).addScaledVector(moveDir, distAhead);
+        const snScale = THREE.MathUtils.clamp(distAhead / 52, 1.8, 38);
+        this.triggerSupernova(flybyPos, snScale, false);
+        this.supernovaSpawnTimer = 900 + Math.random() * 600; // Spawns every 900-1500 seconds in interstellar space
+        this.supernovaDistAcc = 0;
+        this.supernovaDistNext = 5000 + Math.random() * 8000;
+      }
+    }
+
+    // Update active 3D Supernova cataclysms (stationary in world space, 100x longer duration)
+    if (this.supernovas && this.supernovas.length) {
+      const snPalette = [
+        [1.5, 5.5, 9.0],
+        [8.5, 1.4, 5.2],
+        [9.0, 6.2, 1.2],
+        [7.5, 7.5, 9.5],
+      ];
+      for (let i = this.supernovas.length - 1; i >= 0; i--) {
+        const sn = this.supernovas[i];
+        sn.age += dt;
+        if (sn.age >= sn.maxLife) {
+          if (sn.mesh.parent) sn.mesh.parent.remove(sn.mesh);
+          if (sn.mesh.userData.dispose) sn.mesh.userData.dispose();
+          this.supernovas.splice(i, 1);
+        } else {
+          if (this._proj && sn.worldS) {
+            this._proj(sn.worldS.x, sn.worldS.y, sn.worldS.z, sn.mesh.position);
+          }
+          if (sn.mesh.userData.animate) {
+            sn.mesh.userData.animate(sn.age, sn.maxLife);
+          }
+          sn.emberTimer = (sn.emberTimer || 0) - dt;
+          if (sn.emberTimer <= 0 && sn.mesh.position.lengthSq() < 2.25e8) {
+            sn.emberTimer = 0.28;
+            const sc = sn.scale || 1.0;
+            const d = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+              .normalize()
+              .multiplyScalar((14 + Math.random() * 48) * sc);
+            const col = snPalette[Math.floor(Math.random() * snPalette.length)];
+            this.fire.emit(
+              sn.hitX, sn.hitY, sn.hitZ,
+              d.x, d.y, d.z,
+              { life: 1.2 + Math.random() * 1.6, size0: 3.5 * sc, size1: 16 * sc, alpha: 0.85, drag: 0.7, buoy: 0.1, color: col }
+            );
+          }
+        }
+      }
+    }
+  }
+
+  animateParts() {
+    const owner = {};
+    for (const v of this.vessels) for (const k of v.segIdx) owner[k] = v;
+    for (const d of this.rocket.deployables) {
+      const v = owner[d.seg]; if (!v) continue;
+      const t = d.type === 'legs' ? v.legsT : v.finsT;
+      for (const o of d.objs) if (o.userData.setDeploy && o.userData._dt !== t) { o.userData._dt = t; o.userData.setDeploy(t, true); }
+    }
+    const cap = this.rocket.capsule;
+    if (cap) {
+      const v = owner[cap.seg];
+      const t = v ? v.chuteT : 0;
+      if (cap.obj.userData.setChute && cap.obj.userData._ct !== t) { cap.obj.userData._ct = t; cap.obj.userData.setChute(t); }
+    }
+    // Rover / Plane wheel rotation & front-wheel steering
+    if (this.rocket.wheels) {
+      const v = this.player;
+      const spd = v ? (v.isPlane ? (v.landed ? (v.planeRollSpeed || 0) : 0) : (v.groundSpeed || (v.vSurf ? v.vSurf.e : 0))) : 0;
+      const steer = v && v.ctl ? (v.ctl.input || 0) : 0;
+      for (const wo of this.rocket.wheels) {
+        const wg = wo.userData.wheelGroup;
+        if (wg) {
+          wg.rotation.order = 'YXZ';
+          const sideSign = wo.userData.sideSign || 1;
+          const spinScale = v && v.isRover ? 0.10 : 0.05;
+          wg.rotation.x += spd * spinScale * sideSign;
+          const targetSteer = wo.userData.isFront ? (-steer * 0.42) : 0;
+          wg.rotation.y += (targetSteer - wg.rotation.y) * 0.25;
+        }
+      }
+    }
+    if (this.airport && this.airport.visible) {
+      if (this.airportRadars && this.airportRadars.length) {
+        for (let i = 0; i < this.airportRadars.length; i++) {
+          this.airportRadars[i].rotation.y += 0.035 + (i % 3) * 0.004;
+        }
+      } else if (this.airportRadar) {
+        this.airportRadar.rotation.y += 0.035;
+      }
+      if (this.airportWindsocks && this.airportWindsocks.length) {
+        for (let i = 0; i < this.airportWindsocks.length; i++) {
+          const ws = this.airportWindsocks[i];
+          ws.rotation.y = Math.sin(this.time * 1.8 + i * 0.65) * 0.18;
+          ws.rotation.z = -0.12 + Math.sin(this.time * 3.1 + i * 0.5) * 0.06;
+        }
+      } else if (this.airportWindsock) {
+        this.airportWindsock.rotation.y = Math.sin(this.time * 1.8) * 0.18;
+        this.airportWindsock.rotation.z = -0.12 + Math.sin(this.time * 3.1) * 0.06;
+      }
+    }
+    if (this.harbor && this.harbor.visible) {
+      if (this.harborRadars && this.harborRadars.length) {
+        for (let i = 0; i < this.harborRadars.length; i++) {
+          this.harborRadars[i].rotation.y += 0.032 + (i % 3) * 0.003;
+        }
+      } else if (this.harborRadar) {
+        this.harborRadar.rotation.y += 0.032;
+      }
+      if (this.harborLighthouseBeacons && this.harborLighthouseBeacons.length) {
+        for (let i = 0; i < this.harborLighthouseBeacons.length; i++) {
+          this.harborLighthouseBeacons[i].rotation.y += 0.024 + (i % 2) * 0.004;
+        }
+      } else if (this.harborLighthouseBeacon) {
+        this.harborLighthouseBeacon.rotation.y += 0.024;
+      }
+    }
+    // Boat propeller, Rover Lidar, Jet strobes & UFO halo/crown rotation
+    if (this.rocket.partObjs) {
+      const v = this.player;
+      const spd = v ? (v.waterSpeed || 0) : 0;
+      const running = v && (v.engineOn || Math.abs(spd) > 0.05);
+      const strobePhase = (this.time * 2.2) % 1.0;
+      const strobeFlash = (strobePhase < 0.08 || (strobePhase > 0.16 && strobePhase < 0.24)) ? 1.0 : 0.0;
+      for (const po of this.rocket.partObjs) {
+        if (po.obj.userData.ufoSpinGroup) {
+          po.obj.userData.ufoSpinGroup.rotation.y += (v && v.engineOn) ? 0.036 : 0.018;
+        }
+        if (po.obj.userData.roverSpinGroup) {
+          const rSpd = v ? Math.abs(v.groundSpeed || 0) : 0;
+          po.obj.userData.roverSpinGroup.rotation.y += 0.055 + Math.min(0.08, rSpd * 0.003);
+        }
+        if (po.obj.userData.planeStrobeMats) {
+          const stInt = 1.6 + strobeFlash * 5.2;
+          for (const sm of po.obj.userData.planeStrobeMats) {
+            if (sm) sm.emissiveIntensity = stInt;
+          }
+        }
+        if (running) {
+          const spinStep = (Math.abs(spd) * 0.4 + 12) * 0.08;
+          if (po.obj.userData.propGroups && Array.isArray(po.obj.userData.propGroups)) {
+            for (const pg of po.obj.userData.propGroups) {
+              pg.rotation.z += spinStep * (pg.userData?.spinSign || 1);
+            }
+          } else if (po.obj.userData.propGroup) {
+            po.obj.userData.propGroup.rotation.z += spinStep;
+          }
+        }
+      }
+    }
+    if (this.rocket.fanGroups && this.rocket.fanGroups.length) {
+      const v = this.player;
+      const running = v && v.engineOn && v.throttle > 0;
+      const airSpd = v ? (v.speedSurf || 0) : 0;
+      const fanStep = running ? (0.42 + (v.throttle || 0) * 0.55) : Math.min(0.22, airSpd * 0.002);
+      if (fanStep > 0) {
+        for (const fg of this.rocket.fanGroups) {
+          if (fg.grp) fg.grp.rotation.y += fanStep;
+        }
+      }
+    }
+  }
+
+  // =================================================================== SCENE PLACEMENT (floating origin at the focus vessel)
+  placeScene(F) {
+    const t = this.simT;
+    const E = F.east, U = F.up, S = F.s, phi = F.phi;
+    const proj = (x, y, z, out) => out.set((x - S.x) * E.x + (y - S.y) * E.y, (x - S.x) * U.x + (y - S.y) * U.y, z - S.z);
+    this._proj = proj;
+    for (const v of this.vessels) {
+      if (v.dead) {
+        if (v === this.player && v.root) proj(v.s.x, v.s.y, v.s.z, v.root.position);
+        continue;
+      }
+      proj(v.s.x, v.s.y, v.s.z, v.root.position);
+      if (v.isPlane) {
+        const qBase = this._qPlaneBase || (this._qPlaneBase = new THREE.Quaternion(0.5, 0.5, 0.5, -0.5));
+        const pitch = (phi + Math.PI / 2) - v.beta;
+        const bank = v.bank || 0;
+        const heading = v.heading || 0;
+        const qYaw = (this._qYaw || (this._qYaw = new THREE.Quaternion())).setFromAxisAngle(this._yAxis || (this._yAxis = new THREE.Vector3(0, 1, 0)), heading);
+        const qPitch = (this._qPitch || (this._qPitch = new THREE.Quaternion())).setFromAxisAngle(this._zAxis || (this._zAxis = new THREE.Vector3(0, 0, 1)), pitch);
+        const qBank = (this._qBank || (this._qBank = new THREE.Quaternion())).setFromAxisAngle(this._xAxis || (this._xAxis = new THREE.Vector3(1, 0, 0)), bank);
+        v.root.quaternion.copy(qYaw).multiply(qPitch).multiply(qBank).multiply(qBase);
+      } else if (v.isRover || v.isBoat) {
+        const pitch = v.beta - phi;
+        const yaw = Math.PI / 2 + (v.heading || 0);
+        const roll = (v.isRover ? (v.terrainRoll || 0) : 0) + (v.ctl?.input || 0) * (v.isRover ? 0.04 : 0.06);
+        v.root.rotation.set(-pitch, yaw, roll, 'YXZ');
+      } else {
+        if (v.dir3D) {
+          const _up = this._vUp || (this._vUp = new THREE.Vector3(0, 1, 0));
+          v.root.quaternion.setFromUnitVectors(_up, v.dir3D);
+        } else {
+          v.root.rotation.set(0, 0, -(v.beta - phi));
+        }
+      }
+    }
+    for (const d of this.debris) {
+      proj(d.s.x, d.s.y, d.s.z, d.obj.position);
+      d.obj.quaternion.setFromAxisAngle(this._zAxis || (this._zAxis = new THREE.Vector3(0, 0, 1)), phi - d.beta).multiply(d.q0);
+    }
+    if (this.supernovas && this.supernovas.length) {
+      for (const sn of this.supernovas) {
+        if (sn.worldS && sn.mesh) {
+          proj(sn.worldS.x, sn.worldS.y, sn.worldS.z, sn.mesh.position);
+        }
+      }
+    }
+    if (this.player && this.aliens && this.aliens.length) {
+      const pPos = this.player.root.position;
+      for (const a of this.aliens) {
+        a.mesh.position.copy(pPos).add(a.relPos);
+      }
+    }
+    // sun in the focus frame
+    this.sunDir.set(SUN_ECI.x * E.x + SUN_ECI.y * E.y, SUN_ECI.x * U.x + SUN_ECI.y * U.y, SUN_ECI.z).normalize();
+    this.skyMat.uniforms.uSun.value.copy(this.sunDir);
+    this.earth.material.uniforms.uSun.value.copy(this.sunDir);
+    if (this.moon.material.uniforms.uSun) this.moon.material.uniforms.uSun.value.copy(this.sunDir);
+    // celestial bodies
+    const _v = this._tv || (this._tv = new THREE.Vector3());
+    const sp = bodyPos('sun', t);
+    const rSunF = Math.hypot(S.x - sp.x, S.y - sp.y, (S.z || 0) - (sp.z || 0));
+    if (this.sunSphere) {
+      proj(sp.x, sp.y, sp.z, this.sunSphere.position);
+      this.sunSphere.rotation.set(0, 0, phi - bodyRotation('sun', t));
+      const ud = this.sunSphere.userData;
+      if (ud.coreMat) ud.coreMat.uniforms.uTime.value = this.time;
+      if (ud.asteroidBelt) ud.asteroidBelt.visible = (F.ref !== 'earth' || F.alt > 25e3);
+      const atSun = F.ref === 'sun';
+      if (ud.coreMesh) ud.coreMesh.scale.setScalar(atSun ? 1.0 : 0.012);
+      if (ud.coronaMesh) {
+        ud.coronaMesh.visible = atSun;
+        ud.coronaMesh.scale.setScalar(atSun ? 1.0 : 0.012);
+      }
+    }
+    const earthFollowZ = (F.ref === 'earth' && F.alt < 140e3)
+      ? (S.z || 0) * (1 - THREE.MathUtils.smoothstep(F.alt, 45e3, 140e3))
+      : 0;
+    proj(0, 0, earthFollowZ, this.earth.position);
+    this.earth.rotation.set(0, 0, phi - OMEGA_E * t);
+    const mp = moonPos(t);
+    proj(mp.x, mp.y, mp.z, this.moon.position);
+    this.moon.rotation.set(0, 0, phi - moonAngle(t));
+    this.moon.visible = F.ref === 'moon';
+    for (const name of NON_EARTH_BODIES) {
+      const pm = this.planets[name];
+      if (!pm) continue;
+      pm.visible = F.ref === name;
+      if (!pm.visible) continue;
+      const bp = bodyPos(name, t);
+      proj(bp.x, bp.y, bp.z, pm.position);
+      pm.rotation.set(0, 0, phi - bodyRotation(name, t));
+      if (pm.material.uniforms.uSun) pm.material.uniforms.uSun.value.copy(this.sunDir);
+      if (pm.material.uniforms.uTime) pm.material.uniforms.uTime.value = this.time;
+    }
+    this.stars.rotation.set(0, 0, phi);
+    // ISS
+    const ip = this.issOrbit.pos(t);
+    proj(ip.x, ip.y, 0, this.iss.position);
+    const issAng = phi - this.issOrbit.angle(t);
+    this.iss.rotation.set(0, 0, issAng);
+    this.iss.visible = (F.ref === 'earth' && F.alt > 40e3 && F.alt < 1200e3) || !!this.docked;
+    if (this.docked && this.player && !this.player.dead) {
+      const L = this.docked.L ?? this.dockPortOffset();
+      const lx = this.issPortLocal.x - L, ly = this.issPortLocal.y;
+      const c = Math.cos(issAng), s = Math.sin(issAng);
+      this.player.root.position.set(
+        this.iss.position.x + lx * c - ly * s,
+        this.iss.position.y + lx * s + ly * c,
+        this.iss.position.z
+      );
+      this.player.root.rotation.set(0, 0, issAng - Math.PI / 2);
+    }
+    // planetary / lunar surface patch + flag (disabled for gas giants so vessels can fly straight through)
+    const onBody = F.ref !== 'earth' && F.ref !== 'sun' && !BODIES[F.ref]?.gasGiant && F.alt < 60e3;
+    this.moonPatch.visible = onBody;
+    if (onBody) {
+      const psi = F.phiRot, snap = Math.round(psi / 0.012) * 0.012;
+      const bodyR = (BODIES[F.ref] || BODIES.moon).R;
+      const u = this.moonPatch.userData.uniforms;
+      if (u.uBodyR) u.uBodyR.value = bodyR;
+      if (u.uIsMars) u.uIsMars.value = F.ref === 'mars' ? 1.0 : 0.0;
+      if (u.uTint) {
+        if (F.ref === 'mars') u.uTint.value.set(1.05, 0.44, 0.24);
+        else if (F.ref === 'venus') u.uTint.value.set(0.95, 0.74, 0.38);
+        else if (F.ref === 'mercury') u.uTint.value.set(0.82, 0.76, 0.68);
+        else if (F.ref === 'phobos') u.uTint.value.set(0.68, 0.60, 0.54);
+        else if (F.ref === 'deimos') u.uTint.value.set(0.76, 0.70, 0.62);
+        else if (F.ref === 'ceres') u.uTint.value.set(0.66, 0.69, 0.74);
+        else if (F.ref === 'haumea') u.uTint.value.set(0.92, 0.96, 1.02);
+        else if (F.ref === 'makemake') u.uTint.value.set(1.02, 0.56, 0.42);
+        else if (F.ref === 'eris') u.uTint.value.set(0.96, 0.98, 1.04);
+        else if (F.ref !== 'moon' && BODIES[F.ref]?.hex) {
+          const tc = new THREE.Color(BODIES[F.ref].hex);
+          u.uTint.value.set(tc.r * 0.80, tc.g * 0.80, tc.b * 0.80);
+        } else u.uTint.value.set(0.82, 0.82, 0.82);
+      }
+      if (this.moonPatchPsi !== snap || this.moonPatchBody !== F.ref) {
+        this.moonPatchPsi = snap;
+        this.moonPatchBody = F.ref;
+        u.uUp.value.set(Math.sin(snap), Math.cos(snap), 0);
+        u.uEast.value.set(Math.cos(snap), -Math.sin(snap), 0);
+        u.uNorth.value.set(0, 0, 1);
+        if (F.alt < 6000) { this.moonPatch.userData.rebuildRocks(); this.rocksFresh = true; } else this.rocksFresh = false;
+      } else if (F.alt < 6000 && !this.rocksFresh) { this.moonPatch.userData.rebuildRocks(); this.rocksFresh = true; }
+      for (const c of this.moonPatch.children) c.visible = F.alt < 6000;
+      const th = snap - psi;
+      const bodyMesh = F.ref === 'moon' ? this.moon : (this.planets[F.ref] || this.moon);
+      this.moonPatch.position.set(bodyMesh.position.x + bodyR * Math.sin(th), bodyMesh.position.y + bodyR * Math.cos(th), bodyMesh.position.z);
+      this.moonPatch.rotation.set(0, 0, -th);
+    }
+    if (this.olympusMons) {
+      const showOm = F.ref === 'mars' && F.alt < 60e3 && this.planets.mars;
+      this.olympusMons.group.visible = !!showOm;
+      if (showOm) {
+        const marsMesh = this.planets.mars;
+        const mR = BODIES.mars.R;
+        for (const sp of this.olympusMons.spots) {
+          const th = wrapPi(sp.psi - F.phiRot);
+          sp.node.position.set(
+            marsMesh.position.x + (mR + sp.h) * Math.sin(th),
+            marsMesh.position.y + (mR + sp.h) * Math.cos(th),
+            marsMesh.position.z + sp.z
+          );
+          sp.node.rotation.set(0, 0, -th);
+        }
+      }
+    }
+    const isCeresLow = F.ref === 'ceres' && F.alt < 2200;
+    const isKuiperDwarf = F.ref === 'pluto' || F.ref === 'haumea' || F.ref === 'makemake' || F.ref === 'eris';
+    const isKuiperLow = isKuiperDwarf && F.alt < 2200;
+    if (this.ceresBelt) {
+      const showCeresBelt = F.ref === 'ceres' && F.alt < 90e3;
+      this.ceresBelt.visible = !!showCeresBelt;
+      if (showCeresBelt) {
+        const driftX = ((this.time * 18) % 8000) - 4000;
+        this.ceresBelt.position.set(driftX, -F.alt, -S.z);
+        this.ceresBelt.updateMatrixWorld(true);
+      }
+    }
+    if (this.asteroidSpaceField) {
+      const showAstSpace = !isCeresLow && (
+        (F.ref === 'ceres' && F.alt >= 2200) ||
+        (rSunF >= ASTEROID_BELT_INNER - 4000e3 && rSunF <= ASTEROID_BELT_OUTER + 4000e3)
+      );
+      this.asteroidSpaceField.visible = !!showAstSpace;
+      if (showAstSpace) {
+        const driftX = ((this.time * 16) % 5000) - 2500;
+        const driftY = Math.sin(this.time * 0.18) * 320;
+        this.asteroidSpaceField.position.set(driftX, driftY, 0);
+        this.asteroidSpaceField.rotation.y = this.time * 0.010;
+        this.asteroidSpaceField.updateMatrixWorld(true);
+      }
+    }
+    if (this.kuiperBelt) {
+      const showKuiperBelt = isKuiperDwarf && F.alt < 90e3;
+      this.kuiperBelt.visible = !!showKuiperBelt;
+      if (showKuiperBelt) {
+        const driftX = ((this.time * 14) % 8000) - 4000;
+        this.kuiperBelt.position.set(driftX, -F.alt, -S.z);
+        this.kuiperBelt.updateMatrixWorld(true);
+      }
+    }
+    if (this.kuiperSpaceField) {
+      const showKuiperSpace = !isKuiperLow && (
+        (isKuiperDwarf && F.alt >= 2200) ||
+        (rSunF >= KUIPER_BELT_INNER - 10000e3 && rSunF <= KUIPER_BELT_OUTER + 10000e3)
+      );
+      this.kuiperSpaceField.visible = !!showKuiperSpace;
+      if (showKuiperSpace) {
+        const driftX = ((this.time * 13) % 5000) - 2500;
+        const driftY = Math.sin(this.time * 0.16 + 1.1) * 350;
+        this.kuiperSpaceField.position.set(driftX, driftY, 0);
+        this.kuiperSpaceField.rotation.y = this.time * 0.009;
+        this.kuiperSpaceField.updateMatrixWorld(true);
+      }
+    }
+    if (this.oortCloud) {
+      const showOortCloud = rSunF >= OORT_CLOUD_INNER - 15000e3 && rSunF <= OORT_CLOUD_OUTER + 15000e3;
+      this.oortCloud.visible = !!showOortCloud;
+      if (showOortCloud) {
+        const driftX = ((this.time * 12) % 6000) - 3000;
+        const driftY = Math.sin(this.time * 0.15) * 400;
+        this.oortCloud.position.set(driftX, driftY, 0);
+        this.oortCloud.rotation.y = this.time * 0.008;
+        this.oortCloud.updateMatrixWorld(true);
+      }
+    }
+    if (this.flagSpot) {
+      const fBody = this.flagSpot.body || 'moon';
+      const fR = (BODIES[fBody] || BODIES.moon).R;
+      const bodyMesh = fBody === 'moon' ? this.moon : (this.planets[fBody] || this.moon);
+      const th = this.flagSpot.psi - (F.ref === fBody ? F.phiRot : 0);
+      const ok = F.ref === fBody && Math.abs(th) * fR < 120e3;
+      this.flagObj.visible = ok;
+      if (ok) {
+        this.flagObj.position.set(bodyMesh.position.x + (fR + this.flagSpot.h) * Math.sin(th), bodyMesh.position.y + (fR + this.flagSpot.h) * Math.cos(th), bodyMesh.position.z);
+        this.flagObj.rotation.set(0, 0, -th);
+      }
+    }
+    // Animate Rocket Airlock Gate (opens doors & unfolds ramp both when astronauts board on the launchpad AND when deployed on any planet/moon/orbit)
+    if (this.boardingHatch) {
+      const P = this.player;
+      const closeEnd = (this.hatchCloseStartT || 0) + 0.36;
+      if (!P || P.dead || P.crashed || F.ref !== P.ref || !this.hatchCloseStartT || this.time >= closeEnd) {
+        this.boardingHatch.visible = false;
+      } else {
+        this.boardingHatch.visible = true;
+        const hatchZ = this.getBoardingHatchZ();
+        const hatchOff = this._hatchOff || (this._hatchOff = new THREE.Vector3());
+        hatchOff.set(0, -P.bottomOffset() + 0.42, hatchZ).applyQuaternion(P.root.quaternion);
+        this.boardingHatch.position.copy(P.root.position).add(hatchOff);
+        this.boardingHatch.quaternion.copy(P.root.quaternion);
+
+        const openElapsed = Math.max(0, this.time - (this.hatchOpenStartT || 0));
+        const openProg = Math.min(1, openElapsed / 0.26);
+        const closeElapsed = Math.max(0, this.time - this.hatchCloseStartT);
+        const closeProg = Math.min(1, closeElapsed / 0.36);
+        const rawOpen = Math.min(openProg, 1 - closeProg);
+        const openAmt = rawOpen * rawOpen * (3 - 2 * rawOpen);
+        const hud = this.boardingHatch.userData;
+        if (hud) {
+          if (hud.leftDoorPivot) hud.leftDoorPivot.rotation.y = -openAmt * 1.98;
+          if (hud.rightDoorPivot) hud.rightDoorPivot.rotation.y = openAmt * 1.98;
+          if (hud.rampPivot) hud.rampPivot.rotation.x = 0.04 + openAmt * 1.32;
+        }
+      }
+    }
+
+    // Update Launchpad / Airport / Sea Boarding Crew
+    if (this.padAstronautMeshes && this.padAstronautMeshes.length) {
+      const P = this.player;
+      const showOnPad = !!P && !P.dead && !P.crashed && !P.isRover && F.ref === 'earth' && F.alt < 5000 && (
+        P.isPlane
+          ? !!P.landed
+          : P.isBoat
+            ? !!P.landed
+            : (this.phase === 'ready' || (!this.lifted && P.ref === 'earth' && (P.clamped || (P.landed && P.landed.site === 'pad'))))
+      );
+
+      for (let i = 0; i < this.padAstronautMeshes.length; i++) {
+        const m = this.padAstronautMeshes[i];
+        const ud = m.userData;
+        if (!showOnPad || !ud || !ud.boarding) {
+          m.visible = false;
+          if (ud) ud.boarding = false;
+          continue;
+        }
+        const elapsed = this.time - (ud.boardStartT || 0);
+        const dur = ud.boardDur || 1.22;
+        if (elapsed < 0) {
+          m.visible = false;
+          continue;
+        }
+        if (elapsed >= dur) {
+          ud.boarding = false;
+          m.visible = false;
+          continue;
+        }
+        const p = elapsed / dur;
+        const hatchZ = ud.hatchZ ?? 1.28;
+        const rampFootZ = hatchZ + 2.35;
+        const splitP = 0.58;
+        const baseX = P.sx ?? ud.baseX ?? 0;
+        const baseY = ud.baseY ?? (P.isPlane ? 0.25 : P.isBoat ? 0.0 : PAD_TOP);
+        const baseZ = P.s?.z ?? ud.baseZ ?? 0;
+        let curX = 0, curY = baseY, curZ = rampFootZ, rotY = Math.PI;
+        if (p < splitP) {
+          // Phase 1: Walk from launchpad / tarmac / pier to the foot of the boarding ramp
+          const t1 = p / splitP;
+          const e1 = t1 * t1 * (3 - 2 * t1);
+          curX = ud.startX * (1 - e1);
+          curZ = ud.startZ + (rampFootZ - ud.startZ) * e1;
+          curY = baseY;
+          rotY = Math.atan2(-ud.startX, rampFootZ - ud.startZ);
+        } else {
+          // Phase 2: Walk straight up the ramp and through the open airlock doors into the glowing cabin
+          const t2 = (p - splitP) / (1 - splitP);
+          curX = 0;
+          curZ = rampFootZ + ((hatchZ - 0.32) - rampFootZ) * t2;
+          curY = baseY + 0.62 * t2;
+          rotY = Math.PI;
+        }
+        const hop = Math.abs(Math.sin(elapsed * 16)) * 0.06 * (1 - p * 0.4);
+        m.position.set(baseX + curX, curY + hop, baseZ + curZ);
+        m.rotation.set(0, rotY, 0);
+        const shrink = p > 0.78 ? Math.max(0.05, 1 - (p - 0.78) / 0.22) : 1;
+        m.scale.setScalar((1.15 / 3) * shrink);
+        m.visible = true;
+
+        const stride = elapsed * 16;
+        if (ud.leftLeg) ud.leftLeg.rotation.x = Math.sin(stride) * 0.65;
+        if (ud.rightLeg) ud.rightLeg.rotation.x = -Math.sin(stride) * 0.65;
+        if (ud.leftArm) ud.leftArm.rotation.x = -Math.sin(stride) * 0.50;
+        if (ud.rightArm) {
+          ud.rightArm.rotation.z = -0.22;
+          ud.rightArm.rotation.x = Math.sin(stride) * 0.50;
+        }
+      }
+    }
+    // Update Deployed Astronauts on Planets / Moons (including walking out of the open airlock gate)
+    const placeDt = Math.min(0.1, Math.max(0, this.time - (this._lastPlaceT ?? this.time)));
+    this._lastPlaceT = this.time;
+    if (this.deployedAstronauts && this.deployedAstronauts.length) {
+      const P = this.player;
+      for (const a of this.deployedAstronauts) {
+        const m = a.mesh;
+        if (!m) continue;
+        if (F.ref !== a.body) {
+          m.visible = false;
+          continue;
+        }
+        const exitElapsed = this.time - (a.exitStartT ?? -999);
+        const exitDur = a.exitDur || 1.28;
+        if (exitElapsed < 0) {
+          m.visible = false;
+          continue;
+        }
+        if (exitElapsed < exitDur) {
+          // Walk out from inside the glowing airlock gate, down the ramp, and across the surface to the target spot
+          let targetX = 0, targetY = 0, targetZ = 0, surfTiltZ = 0;
+          if (a.mode === 'eva') {
+            targetX = a.relX;
+            targetY = a.relY;
+            targetZ = a.relZ;
+          } else if (a.body === 'earth') {
+            targetX = a.sx - F.sx;
+            targetY = (a.h + a.dropH) - F.alt;
+            targetZ = a.z - S.z;
+          } else {
+            const B = BODIES[a.body] || BODIES.moon;
+            const fR = B.R;
+            const bodyMesh = a.body === 'moon' ? this.moon : (this.planets[a.body] || this.moon);
+            const th = a.basePsi - F.phiRot;
+            const rAlt = fR + a.h + a.dropH;
+            if (bodyMesh) {
+              targetX = bodyMesh.position.x + rAlt * Math.sin(th);
+              targetY = bodyMesh.position.y + rAlt * Math.cos(th);
+              targetZ = bodyMesh.position.z + (a.z - S.z);
+            }
+            surfTiltZ = -th;
+          }
+
+          const pX = P ? P.root.position.x : 0;
+          const groundY = P ? (P.root.position.y - P.bottomOffset()) : targetY;
+          const pZ = P ? P.root.position.z : 0;
+          const hatchZ = a.hatchZ ?? 1.28;
+          const doorX = pX, doorY = groundY + 0.62, doorZ = pZ + hatchZ - 0.32;
+          const rampFootX = pX, rampFootY = groundY, rampFootZ = pZ + hatchZ + 2.35;
+
+          const p = exitElapsed / exitDur;
+          const splitP = 0.42;
+          let curX = 0, curY = groundY, curZ = rampFootZ, rotY = 0;
+          if (p < splitP) {
+            // Phase 1: Step out of the open airlock doors and walk down the boarding ramp
+            const t1 = p / splitP;
+            curX = doorX + (rampFootX - doorX) * t1;
+            curY = doorY + (rampFootY - doorY) * t1;
+            curZ = doorZ + (rampFootZ - doorZ) * t1;
+            rotY = 0;
+          } else {
+            // Phase 2: Walk from the foot of the ramp across the surface to the target spot
+            const t2 = (p - splitP) / (1 - splitP);
+            const e2 = t2 * t2 * (3 - 2 * t2);
+            curX = rampFootX + (targetX - rampFootX) * e2;
+            curY = rampFootY + (targetY - rampFootY) * e2;
+            curZ = rampFootZ + (targetZ - rampFootZ) * e2;
+            const walkDirY = Math.atan2(targetX - rampFootX, targetZ - rampFootZ);
+            rotY = walkDirY * (1 - t2 * 0.72);
+          }
+
+          const hop = Math.abs(Math.sin(exitElapsed * 16)) * 0.067;
+          const emerge = p < 0.22 ? (0.18 + 0.82 * (p / 0.22)) : 1.0;
+          m.scale.setScalar((1.35 / 3) * emerge);
+          m.position.set(curX, curY + hop, curZ);
+          m.rotation.set(0, rotY, surfTiltZ);
+          m.visible = true;
+
+          const ud = m.userData;
+          if (ud) {
+            const stride = exitElapsed * 16;
+            if (ud.leftLeg) ud.leftLeg.rotation.x = Math.sin(stride) * 0.65;
+            if (ud.rightLeg) ud.rightLeg.rotation.x = -Math.sin(stride) * 0.65;
+            if (ud.leftArm) ud.leftArm.rotation.x = -Math.sin(stride) * 0.50;
+            if (ud.rightArm) {
+              ud.rightArm.rotation.z = -0.22;
+              ud.rightArm.rotation.x = Math.sin(stride) * 0.50;
+            }
+          }
+          continue;
+        }
+
+        m.scale.setScalar(1.35 / 3);
+        if (a.dropH > 0) {
+          a.dropH = Math.max(0, a.dropH - placeDt * 16);
+        }
+        const ph = this.time * 4.8 + (m.userData?.phaseOffset || 0);
+        const hopY = a.mode === 'surface' && a.dropH <= 0 ? Math.max(0, Math.sin(ph * 0.85)) * 0.15 : 0;
+        const walkX = a.mode === 'surface' && a.dropH <= 0 ? Math.sin(ph * 0.35) * 0.6 : 0;
+
+        if (m.userData) {
+          if (m.userData.rightArm) m.userData.rightArm.rotation.z = -2.35 + Math.sin(ph * 1.2) * 0.42;
+          if (m.userData.leftArm) m.userData.leftArm.rotation.x = Math.sin(ph * 0.85) * 0.35;
+          if (m.userData.leftLeg) m.userData.leftLeg.rotation.x = Math.sin(ph * 0.85) * 0.45;
+          if (m.userData.rightLeg) m.userData.rightLeg.rotation.x = -Math.sin(ph * 0.85) * 0.45;
+        }
+
+        if (a.mode === 'eva') {
+          m.visible = true;
+          const bobY = Math.sin(ph * 0.6) * 0.3;
+          m.position.set(a.relX + walkX * 0.4, a.relY + bobY, a.relZ);
+          m.rotation.set(Math.sin(ph * 0.3) * 0.15, Math.sin(ph * 0.25) * 0.4, 0);
+        } else if (a.body === 'earth') {
+          const ok = Math.abs(a.sx - F.sx) < 50000 && F.alt < 50000;
+          m.visible = ok;
+          if (ok) {
+            const liveH = a.site === 'land'
+              ? this.earthGroundWave(a.sx + walkX, a.z, (this.player?.isPlane || this.player?.isRover) ? 0.0 : 1.0, this.player?.isPlane ? 1.0 : 0.0)
+              : a.h;
+            m.position.set((a.sx + walkX) - F.sx, (liveH + a.dropH + hopY) - F.alt, a.z - S.z);
+            m.rotation.set(0, Math.sin(ph * 0.3) * 0.35, 0);
+          }
+        } else {
+          const B = BODIES[a.body] || BODIES.moon;
+          const fR = B.R;
+          const bodyMesh = a.body === 'moon' ? this.moon : (this.planets[a.body] || this.moon);
+          const curPsi = a.basePsi + walkX / fR;
+          const th = curPsi - F.phiRot;
+          const ok = Math.abs(th) * fR < 120e3 && F.alt < 90e3;
+          m.visible = ok;
+          if (ok && bodyMesh) {
+            const rAlt = fR + a.h + a.dropH + hopY;
+            m.position.set(
+              bodyMesh.position.x + rAlt * Math.sin(th),
+              bodyMesh.position.y + rAlt * Math.cos(th),
+              bodyMesh.position.z + (a.z - S.z)
+            );
+            m.rotation.set(0, Math.sin(ph * 0.3) * 0.35, -th);
+          }
+        }
+      }
+    }
+    // unrolled-surface world (ground, pad, sites) + double-precision particle origin alignment
+    this.world.position.set(-F.sx, -F.alt, -S.z);
+    if (this.smoke?.mesh) {
+      this.smoke.mesh.position.set((this.smoke.originX || 0) - F.sx, (this.smoke.originY || 0) - F.alt, (this.smoke.originZ || 0) - (S.z || 0));
+    }
+    if (this.fire?.mesh) {
+      this.fire.mesh.position.set((this.fire.originX || 0) - F.sx, (this.fire.originY || 0) - F.alt, (this.fire.originZ || 0) - (S.z || 0));
+    }
+    const near = F.ref === 'earth' && F.alt < 60000;
+    const isPlaneMode = !!(this.player && this.player.isPlane);
+    const isRoverMode = !!(this.player && this.player.isRover);
+    const curBodyR = (BODIES[F.ref] || BODIES.earth).R;
+    if (this.groundUniforms) {
+      if (this.groundUniforms.uBend) this.groundUniforms.uBend.value = 1 / (2 * curBodyR);
+      if (this.groundUniforms.uShowPad) this.groundUniforms.uShowPad.value = (isPlaneMode || isRoverMode) ? 0.0 : 1.0;
+      if (this.groundUniforms.uShowAirport) this.groundUniforms.uShowAirport.value = isPlaneMode ? 1.0 : 0.0;
+      if (this.groundUniforms.uAirport0Off) {
+        this.groundUniforms.uAirport0Off.value = this.getAirportSite('earth', 0).sx;
+      }
+    }
+    const hasAtmoAirports = this.hasSurfaceAirports(F.ref);
+    const apAnchor = hasAtmoAirports ? this.getNearestAirportAnchor(F.ref, F.sx || 0, S.z || 0) : { sx: 0, sz: 0, h: 0 };
+    const apDist = hasAtmoAirports
+      ? Math.hypot(this.bodyDeltaX(F.ref, F.sx || 0, apAnchor.sx + 1040), (S.z || 0) - (apAnchor.sz || 0))
+      : Infinity;
+    const showAirport = hasAtmoAirports && Math.abs(F.alt - apAnchor.h) < 60000 && apDist < 55000;
+    if (this.airport && showAirport) {
+      this.airport.position.set(0, 0, 0);
+      if (this.subAirports) {
+        for (let i = 0; i < this.subAirports.length; i++) {
+          const site = this.getAirportSite(F.ref, i);
+          const wx = F.ref === 'earth'
+            ? site.sx
+            : ((F.sx || 0) + this.bodyDeltaX(F.ref, site.sx, F.sx || 0));
+          this.subAirports[i].position.set(wx, site.h, site.sz);
+        }
+      }
+      if (this.airportFoundations) {
+        const showFoundations = F.ref !== 'earth';
+        for (let i = 0; i < this.airportFoundations.length; i++) {
+          this.airportFoundations[i].visible = showFoundations;
+        }
+      }
+    }
+    for (const c of this.worldStatic) {
+      if (c === this.pad) c.visible = near && !isPlaneMode && !isRoverMode && this.selectedAirportBody !== 'earth';
+      else if (c === this.airport) c.visible = showAirport;
+      else if (c === this.harbor) c.visible = near;
+      else c.visible = near;
+    }
+    this.ship.visible = near && this.shipX !== null;
+    this.trees.visible = near && F.alt < 20000;
+    if (this.snowTrees) this.snowTrees.visible = near && F.alt < 20000;
+    if (this.snowIceMeshes) {
+      for (const im of this.snowIceMeshes) im.visible = near && F.alt < 20000;
+    }
+    this.updateSnowTracks(F);
+    if (this.snowFlakes) {
+      const snowHere = near && F.alt < 2800 ? this.earthSnowAmount(F.sx, S.z || 0) : 0;
+      this.snowFlakes.visible = snowHere > 0.25;
+      if (this.snowFlakes.visible) {
+        this.snowFlakes.position.set(this.camera.position.x, Math.max(0, this.camera.position.y - 35), this.camera.position.z);
+        this.snowFlakes.material.opacity = Math.min(0.88, (snowHere - 0.25) * 1.3);
+        const posAttr = this.snowFlakes.geometry.attributes.position;
+        const arr = posAttr.array;
+        const fallStep = 0.22;
+        for (let fi = 0; fi < arr.length; fi += 3) {
+          arr[fi] += Math.sin(this.time * 1.4 + fi) * 0.04;
+          arr[fi + 1] -= fallStep;
+          arr[fi + 2] += Math.cos(this.time * 1.1 + fi * 0.7) * 0.04;
+          if (arr[fi + 1] < 0) arr[fi + 1] += 90;
+        }
+        posAttr.needsUpdate = true;
+      }
+    }
+    this.clouds.visible = near;
+    const gSnap = F.alt < 250 ? 4 : 200;
+    const gx = Math.round(F.sx / gSnap) * gSnap;
+    const gz = Math.round((S.z || 0) / gSnap) * gSnap;
+    const cx = Math.round(F.sx / 200) * 200;
+    const cz = Math.round((S.z || 0) / 200) * 200;
+    this.ground.position.set(gx, 0, gz);
+    this.groundUniforms.uOff.value.set(gx, -gz);
+    this.clouds.position.set(cx, 2800, cz);
+    this.cloudMat.uniforms.uOff.value.set(cx, -cz);
+    // sun light follows the focus
+    this.sun.position.copy(this.sunDir).multiplyScalar(400);
+    this.sun.target.position.set(0, 0, 0);
+    this.sun.target.updateMatrixWorld();
+  }
+
+  envForView(cam, F) {
+    const earthRef = F.ref === 'earth';
+    const camAlt = Math.max(0, F.alt + cam.position.y);
+    this.viewCamAlt = camAlt;
+    this.skyMat.uniforms.uAlt.value = earthRef ? Math.max(1, camAlt) : 1e7;
+    this.skyMat.uniforms.uSteps.value = earthRef ? this.app.qualityCfg.skySteps : 4;
+    this.sky.position.copy(cam.position);
+    this.stars.position.copy(cam.position);
+    this.stars.material.uniforms.uFade.value = earthRef ? THREE.MathUtils.smoothstep(camAlt, 30000, 90000) : 1;
+    this.stars.material.uniforms.uPR.value = this.app.renderer.getPixelRatio();
+    const eu = this.earth.material.uniforms;
+    eu.uCamRel.value.copy(cam.position).sub(this.earth.position);
+    eu.uOpacity.value = earthRef ? THREE.MathUtils.smoothstep(camAlt, 5000, 22000) : 1;
+    eu.uTime.value = this.time;
+    this.earth.visible = earthRef && camAlt > 4000;
+    const gOp = earthRef ? 1 - THREE.MathUtils.smoothstep(camAlt, 12000, 32000) : 0;
+    const wantTrans = gOp < 0.999;
+    if (this.groundMat.transparent !== wantTrans) {
+      this.groundMat.transparent = wantTrans;
+      this.groundMat.depthWrite = !wantTrans;
+      this.ground.renderOrder = wantTrans ? 2 : 0;
+      this.groundMat.needsUpdate = true;
+    }
+    this.groundMat.opacity = gOp;
+    this.ground.visible = gOp > 0.001 && F.alt < 60000 && earthRef;
+    this.nearPlane = THREE.MathUtils.clamp(camAlt * 0.25, 1, 5e4);
+  }
+
+  spaceLighting() {
+    this.sun.color.setRGB(1, 0.98, 0.94);
+    this.sun.intensity = 4.6;
+    this.hemi.color.setRGB(0.28, 0.34, 0.44); this.hemi.groundColor.setRGB(0.16, 0.14, 0.12);
+    this.hemi.intensity = 0.22;
+    this.scene.fog.density = 0;
+    const sm = this.smoke.material.uniforms;
+    sm.uSunColor.value.setRGB(1, 0.98, 0.94); sm.uAmbient.value.setRGB(0.05, 0.05, 0.06); sm.uFogDensity.value = 0;
+    this.fire.material.uniforms.uFogDensity.value = 0;
+    this.scene.environmentIntensity = 0.18;
+  }
+
+  /** dual-layer render: far pass (sky, stars, planets) then near pass (ground, vessels) */
+  renderView(renderer, target, cam, F, rect) {
+    const minCamY = this.getMinCameraSceneY(cam.position.x, cam.position.z, F);
+    if (cam.position.y < minCamY) {
+      cam.position.y = minCamY;
+      if (cam !== this.camera || this.camMode !== 2) cam.lookAt(0, 0, 0);
+    }
+    this.placeScene(F);
+    this.scene.updateMatrixWorld(true);
+    this.updateNightSiteLighting(F);
+    this.envForView(cam, F);
+    if (F.ref === 'earth') this.scene.environmentIntensity = 1;
+    const prevAuto = renderer.autoClear, prevShadow = renderer.shadowMap.autoUpdate;
+    const oldNear = cam.near, oldFar = cam.far;
+    if (rect) {
+      target.viewport.set(rect.x, rect.y, rect.w, rect.h);
+      target.scissor.set(rect.x, rect.y, rect.w, rect.h);
+      target.scissorTest = true;
+    }
+    renderer.setRenderTarget(target);
+    renderer.autoClear = false;
+    renderer.clear(true, true, true);
+    // far pass
+    cam.layers.disableAll(); cam.layers.enable(1);
+    cam.near = this.nearPlane; cam.far = 2e9; cam.updateProjectionMatrix();
+    renderer.shadowMap.autoUpdate = false;
+    renderer.render(this.scene, cam);
+    renderer.shadowMap.autoUpdate = prevShadow;
+    renderer.clearDepth();
+    // near pass
+    cam.layers.disableAll(); cam.layers.enable(0);
+    const camDist = cam.position.length();
+    const safeNear = (cam === this.camera && this.camMode === 2)
+      ? 0.5
+      : THREE.MathUtils.clamp(Math.min((this.viewCamAlt || 0) * 0.25, Math.max(0, camDist - 220) * 0.2), 0.5, 250);
+    cam.near = safeNear; cam.far = 3e5; cam.updateProjectionMatrix();
+    renderer.render(this.scene, cam);
+    cam.layers.enable(1);
+    cam.near = oldNear; cam.far = oldFar; cam.updateProjectionMatrix();
+    renderer.autoClear = prevAuto;
+    if (rect) { target.scissorTest = false; target.viewport.set(0, 0, target.width, target.height); target.scissor.set(0, 0, target.width, target.height); }
+  }
+
+  /** called by the compositor instead of a plain RenderPass */
+  render(renderer, target) {
+    this.renderView(renderer, target, this.camera, this.focus, null);
+    // picture-in-picture: booster (or ship) view
+    const pip = this.pipTarget;
+    const el = $('pip');
+    if (pip && !pip.dead && !el.classList.contains('hidden') && target) {
+      const pr = renderer.getPixelRatio();
+      const r = el.getBoundingClientRect();
+      const rect = { x: Math.round(r.left * pr), y: Math.round((innerHeight - r.bottom) * pr), w: Math.round(r.width * pr), h: Math.round(r.height * pr) };
+      const pc = this.pipCamera;
+      pc.aspect = rect.w / Math.max(1, rect.h); pc.updateProjectionMatrix();
+      const dist = clamp((pip.height || 40) * 1.6 + 20, 30, 140);
+      const ang = this.time * 0.15;
+      pc.position.set(Math.cos(ang) * dist * 0.55, dist * 0.12, Math.sin(ang) * dist * 0.55 + dist * 0.8);
+      pc.lookAt(0, 0, 0);
+      const keep = this.focus;
+      this.renderView(renderer, target, pc, pip, rect);
+      this.placeScene(keep);
+    }
+  }
+
+  // =================================================================== EFFECTS
+  airRatio(v) { return v.ref === 'earth' ? Math.exp(-Math.max(0, v.alt) / 5600) : 0; }
+
+  updateEffects(dt, simDt) {
+    const F = this.focus, P = this.player;
+    const qual = this.app.qualityCfg.particles;
+    const owner = {};
+    for (const v of this.vessels) { if (v.dead) continue; for (const k of v.segIdx) owner[k] = v; }
+    for (const v of this.vessels) if (!v.dead) v._plist = this.plumes.filter((pp) => pp.nz.seg === v.activeSeg && !pp.nz.booster);
+    const ramp = this.phase === 'countdown' ? THREE.MathUtils.clamp((this.met + 3) / 2.5, 0, 1) : 1;
+    const tmp = new THREE.Vector3(), haze = new THREE.Vector3();
+    let hazeN = 0, focusThr = 0, trailN = 0;
+    const trails = new Map();
+    const fsx = F.sx, fal = F.alt, fz = F.s.z;
+    const sameBody = (v) => v.ref === F.ref;
+    for (const p of this.plumes) {
+      const nz = p.nz, v = owner[nz.seg];
+      let on = 0;
+      if (v && !v.isBoat && !p.detached && !v.crashed && v.engineOn && nz.seg === v.activeSeg) {
+        if (nz.booster) {
+          const b = this.rocket.boosters.find((bb) => bb.objs.includes(nz.booster));
+          on = b && b.attached && b.fuel > 0 ? 1 : 0;
+        } else if (v.coreFiring) {
+          const list = v._plist, hasC = list.some((x) => x.nz.center);
+          let ok = true;
+          if (hasC && v.engMode === 'center') ok = !!nz.center;
+          else if (hasC && v.engMode === 'three') ok = list.indexOf(p) < 3;
+          const stInfo = this.segInfo[nz.seg];
+          const isSciFiNz = nz.style === 'antigrav' || nz.style === 'laser';
+          if (stInfo) {
+            if (isSciFiNz && !stInfo.useBatteryFuel) ok = false;
+            else if (!isSciFiNz && !stInfo.useChemFuel) ok = false;
+          }
+          on = ok ? v.throttle : 0;
+        }
+      }
+      if (v === P) on *= ramp;
+      const pr = v ? this.airRatio(v) : 0;
+      const expand = THREE.MathUtils.clamp(1 - pr * 1.6, 0, 1);
+      const flick = on > 0 ? 0.92 + Math.random() * 0.08 : 0;
+      p.update(this.time, on * flick, expand, nz.style);
+      p.heat += ((on > 0 ? 0.5 + on * 0.5 : 0) - p.heat) * (1 - Math.exp(-dt * (on > 0 ? 0.6 : 0.15)));
+
+      if (nz.style === 'antigrav') {
+        // Anti-gravity engine light & glow: Turn ON when engine opened, Turn OFF when engine shut off
+        const isFiring = on > 0.005;
+        const agIntensity = isFiring ? (2.8 * on + Math.sin(this.time * 24.0) * 0.4 * on) : 0;
+        const viIntensity = isFiring ? (2.2 * on + Math.cos(this.time * 20.0) * 0.3 * on) : 0;
+        if (nz.bellMats) {
+          for (const m of nz.bellMats) {
+            if (m === nz.violetGlow) m.emissiveIntensity = viIntensity;
+            else m.emissiveIntensity = agIntensity;
+          }
+        }
+        if (nz.agLight) {
+          nz.agLight.intensity = isFiring ? (2.8e4 * on * (0.92 + Math.random() * 0.16)) : 0;
+        }
+      } else if (nz.switchableUfoEngine && nz.style === 'laser') {
+        const isFiring = on > 0.005;
+        const lzIntensity = isFiring ? (3.5 * on + Math.sin(this.time * 42.0) * 0.55 * on) : 0;
+        if (nz.bellMats) {
+          for (const m of nz.bellMats) m.emissiveIntensity = lzIntensity;
+        }
+        if (nz.agLight) {
+          nz.agLight.intensity = isFiring ? (3.2e4 * on * (0.92 + Math.random() * 0.16)) : 0;
+        }
+      } else {
+        const bellDescentGlow = v ? (v.descentGlow || 0) * 1.65 : 0;
+        for (const m of nz.bellMats) m.emissiveIntensity = Math.pow(p.heat, 2) * 2.5 + bellDescentGlow;
+      }
+
+      if (v === F && on > 0) focusThr += on * (nz.booster ? 0.8 : 1) * nz.r;
+      if (on <= 0 || !v || v.isBoat || nz.style === 'antigrav') continue;
+      nz.node.getWorldPosition(tmp);
+      if (v === F) { haze.add(tmp); hazeN++; }
+      if (!sameBody(v)) continue;
+      const wx = tmp.x + fsx, wy = tmp.y + fal, wz = tmp.z + fz;
+      const axisA = v.beta - F.phi;
+      const exX = v.dir3D ? -v.dir3D.x : -Math.sin(axisA);
+      const exY = v.dir3D ? -v.dir3D.y : -Math.cos(axisA);
+      const exZ = v.dir3D ? -v.dir3D.z : 0;
+      const vE = v.vSurf.e, vU = v.vSurf.u;
+      const earth = v.ref === 'earth';
+      const groundH = earth ? (Math.abs(wx) < PAD_RADIUS ? 6 : 0) : 0;
+      const hag = wy - groundH;
+      const isSciFi = nz.style === 'antigrav' || nz.style === 'laser';
+      if (!isSciFi) {
+        const tr = trails.get(v) || { x: 0, y: 0, z: 0, n: 0, r2: 0 };
+        tr.x += wx; tr.y += wy; tr.z += wz; tr.n++; tr.r2 += nz.r * nz.r * on; trails.set(v, tr);
+      }
+      if (earth && pr > 0.0005) {
+        const nf = this.poisson((isSciFi ? 22 : 40) * on * nz.r * qual * simDt);
+        const fCol = nz.style === 'antigrav' ? [0.6, 4.8, 7.2] : nz.style === 'laser' ? [7.5, 0.8, 2.2] : [5, 2.6, 1.0];
+        for (let i = 0; i < nf; i++) {
+          const sp = (isSciFi ? 95 : 60) + Math.random() * 80;
+          this.fire.emit(wx, wy, wz, vE + exX * sp + (Math.random() - 0.5) * 10, vU + exY * sp + (Math.random() - 0.5) * 10, exZ * sp + (Math.random() - 0.5) * 10, { life: 0.15 + Math.random() * 0.25, size0: nz.r * (isSciFi ? 1.5 : 2.2), size1: nz.r * (isSciFi ? 3.2 : 5), alpha: 0.6, drag: 2, buoy: 0, color: fCol });
+        }
+      }
+      const range = earth ? 120 : 90;
+      if (!isSciFi && hag < range && (earth || hag > -5)) {
+        const prox = clamp(1 - hag / range, 0, 1);
+        const gY = earth ? (Math.abs(wx) < PAD_RADIUS ? 6.5 : 0.5) : Math.max(0, wy - hag);
+        const nG = this.poisson((earth ? 150 : 110) * on * prox * qual * nz.r * simDt);
+        const onPad = earth && Math.abs(wx) < PAD_RADIUS && hag < 30;
+        for (let i = 0; i < nG; i++) {
+          let vx, vz, x0 = wx, z0 = wz, y0 = gY;
+          if (onPad && Math.random() < 0.65) {
+            const side = Math.random() < 0.5 ? -1 : 1;
+            x0 = side * (PAD_RADIUS + 8); y0 = 2; z0 = (Math.random() - 0.5) * 6;
+            vx = side * (35 + Math.random() * 45); vz = (Math.random() - 0.5) * 30;
+          } else {
+            const a = Math.random() * Math.PI * 2, s = (earth ? 20 : 30) + Math.random() * 45;
+            vx = Math.cos(a) * s; vz = Math.sin(a) * s;
+          }
+          if (earth) this.smoke.emit(x0, y0, z0, vx, 4 + Math.random() * 10, vz, { life: 9 + Math.random() * 9, size0: 7, size1: 32 + Math.random() * 30, alpha: 0.75, drag: 0.55, buoy: 1.4, heat: 1.0, spin: 0.3, color: [0.86, 0.85, 0.84] });
+          else this.smoke.emit(x0, y0 + 0.5, z0, vx * 1.4, 2 + Math.random() * 14, vz * 1.4, { life: 14 + Math.random() * 10, size0: 2.5, size1: 10 + Math.random() * 10, alpha: 0.5 * prox + 0.1, drag: 0.04, buoy: -1.63, color: [0.5, 0.48, 0.45] });
+        }
+        if (earth) {
+          const nGF = this.poisson(70 * on * prox * qual * nz.r * simDt);
+          for (let i = 0; i < nGF; i++) {
+            const a = Math.random() * Math.PI * 2, s = 30 + Math.random() * 50;
+            this.fire.emit(wx, gY + 1, wz, Math.cos(a) * s, 2 + Math.random() * 6, Math.sin(a) * s, { life: 0.35 + Math.random() * 0.4, size0: 4, size1: 14, alpha: 0.7, drag: 2.5, buoy: 2, color: [5, 2.4, 0.9] });
+          }
+        }
+      }
+    }
+    // continuous exhaust trail (earth atmosphere only)
+    this.trailPrev = this.trailPrev || new Map();
+    for (const [v, tr] of trails) {
+      if (v.ref !== 'earth' || this.phase === 'countdown') continue;
+      const pr = this.airRatio(v);
+      if (pr < 0.002) continue;
+      const cur = [tr.x / tr.n, tr.y / tr.n, tr.z / tr.n], rEff = Math.sqrt(tr.r2);
+      const prev = this.trailPrev.get(v) || cur;
+      this.trailPrev.set(v, cur);
+      const dist = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+      const spacing = Math.max(rEff * 0.8, 0.6) / Math.max(0.35, qual);
+      const growth = 1 + (1 - pr) * 5;
+      const n = Math.min(14, Math.floor(dist / spacing + Math.random()));
+      const ap = 0.5 * Math.min(1, pr * 1.6 + 0.12);
+      const axisA = v.beta - F.phi;
+      const exX = v.dir3D ? -v.dir3D.x : -Math.sin(axisA);
+      const exY = v.dir3D ? -v.dir3D.y : -Math.cos(axisA);
+      const exZ = v.dir3D ? -v.dir3D.z : 0;
+      const s = 4 + 6 * pr;
+      for (let i = 0; i < n; i++) {
+        const f = (i + Math.random()) / Math.max(n, 1);
+        this.smoke.emit(prev[0] + (cur[0] - prev[0]) * f + exX * rEff * 3, prev[1] + (cur[1] - prev[1]) * f + exY * rEff * 3, prev[2] + (cur[2] - prev[2]) * f + exZ * rEff * 3,
+          exX * 25 + (Math.random() - 0.5) * s, exY * 25 + (Math.random() - 0.5) * s, exZ * 25 + (Math.random() - 0.5) * s,
+          { life: 12 + Math.random() * 10, size0: rEff * 3.2, size1: rEff * (16 + Math.random() * 12) * growth, alpha: ap, drag: 1.2 * pr + 0.03, buoy: 0.5 * pr, heat: 1.0, spin: 0.25, color: [0.93, 0.92, 0.9] });
+      }
+    }
+    for (const v of [...this.trailPrev.keys()]) if (!trails.has(v)) this.trailPrev.delete(v);
+    // re-entry atmospheric friction plasma & descent-speed glow for heat shields and all rocket parts
+    if (this.rocket) {
+      this._hsColdCol = this._hsColdCol || [
+        new THREE.Color(0x5c2406),
+        new THREE.Color(0x451a03),
+        new THREE.Color(0x78350f),
+        new THREE.Color(0x92400e),
+      ];
+      this._hsWarmCol = this._hsWarmCol || new THREE.Color(0xf59e0b);
+      this._hsHotCol = this._hsHotCol || new THREE.Color(0xfef08a);
+      this._hsEmissiveDark = this._hsEmissiveDark || new THREE.Color(0x3b1502);
+      this._hsEmissiveMid = this._hsEmissiveMid || new THREE.Color(0xff9e00);
+      this._hsEmissiveHot = this._hsEmissiveHot || new THREE.Color(0xfffbeb);
+      this._tmpGlowCol = this._tmpGlowCol || new THREE.Color();
+
+      if (this.rocket.heatShields) {
+        for (const hs of this.rocket.heatShields) {
+          const owner = this.vessels.find((v) => !v.dead && !v.crashed && v.owns(hs.seg));
+          const dg = owner ? Math.min(4.5, owner.descentGlow || 0) : 0;
+          if (hs.shieldGlowMats) {
+            const tWarm = THREE.MathUtils.clamp(dg / 1.4, 0, 1);
+            const tHot = THREE.MathUtils.clamp((dg - 1.1) / 2.2, 0, 1);
+            for (let mi = 0; mi < hs.shieldGlowMats.length; mi++) {
+              const m = hs.shieldGlowMats[mi];
+              if (!m) continue;
+              const baseCol = this._hsColdCol[mi] || this._hsColdCol[0];
+              m.color.copy(baseCol).lerp(this._hsWarmCol, tWarm).lerp(this._hsHotCol, tHot * 0.75);
+              m.emissive.copy(this._hsEmissiveDark).lerp(this._hsEmissiveMid, tWarm).lerp(this._hsEmissiveHot, tHot);
+              const scale = mi === 3 ? 1.35 : mi === 2 ? 1.15 : mi === 0 ? 1.0 : 0.85;
+              // Darker when slow/stopped (0.0), brighter the faster the rocket falls through the atmosphere
+              m.emissiveIntensity = dg <= 0.002 ? 0.0 : dg * 2.05 * scale;
+            }
+          }
+        }
+      }
+
+      if (this.rocket.partGlowMats) {
+        for (const pg of this.rocket.partGlowMats) {
+          const m = pg.mat;
+          if (!m || !m.userData) continue;
+          const owner = this.vessels.find((v) => !v.dead && !v.crashed && v.owns(pg.seg));
+          const dg = owner ? Math.min(4.5, owner.descentGlow || 0) : 0;
+          if (dg <= 0.002) {
+            if (m.userData._wasGlowing) {
+              if (m.userData._baseColor) m.color.copy(m.userData._baseColor);
+              if (m.userData._baseEmissive) m.emissive.copy(m.userData._baseEmissive);
+              m.emissiveIntensity = m.userData._baseEmissiveIntensity ?? 0;
+              m.userData._wasGlowing = false;
+            }
+          } else {
+            m.userData._wasGlowing = true;
+            const tWarm = THREE.MathUtils.clamp(dg / 1.3, 0, 1);
+            const tHot = THREE.MathUtils.clamp((dg - 1.0) / 2.2, 0, 1);
+            this._tmpGlowCol.copy(this._hsEmissiveDark).lerp(this._hsEmissiveMid, tWarm).lerp(this._hsEmissiveHot, tHot);
+            if (m.userData._baseColor) {
+              m.color.copy(m.userData._baseColor).lerp(this._tmpGlowCol, THREE.MathUtils.clamp(dg * 0.38, 0, 0.72));
+            }
+            if (m.userData._baseEmissive) {
+              m.emissive.copy(m.userData._baseEmissive).lerp(this._tmpGlowCol, THREE.MathUtils.clamp(dg * 1.35, 0, 1));
+            }
+            m.emissiveIntensity = (m.userData._baseEmissiveIntensity ?? 0) + dg * 1.75;
+          }
+        }
+      }
+    }
+    for (const v of this.vessels) {
+      const vB = BODIES[v.ref] || BODIES.earth;
+      const maxAtm = (vB.atm || 0) > 0 && (vB.rho0 || 0) > 0 ? vB.atm : 0;
+      if (v.dead || v.crashed || v.ref !== F.ref || maxAtm <= 0 || v.heatFlux < 0.32 || v.alt > maxAtm) continue;
+      const hf = Math.min(3, v.heatFlux);
+      const hasShield = v.hasHeatShield();
+      const n = this.poisson(hf * 75 * qual * simDt);
+      const leadY = v.alt + (v.com ? (v.com.minY - v.com.y) * 0.75 : -1.5);
+      for (let i = 0; i < n; i++) {
+        const sp = (Math.random() - 0.5) * 22;
+        const spread = hasShield ? 3.8 : 2.8;
+        const col = hasShield
+          ? [6.5, 3.6 + Math.random() * 1.2, 0.45] // Rich golden-amber heat shield bow-shock plasma
+          : [6.0, 2.0 + Math.random(), 0.7];
+        this.fire.emit(
+          v.sx + (Math.random() - 0.5) * spread,
+          leadY + (Math.random() - 0.5) * 2.5,
+          (v.s.z || 0) + (Math.random() - 0.5) * spread,
+          v.vSurf.e * 0.06 + sp,
+          v.vSurf.u * 0.06 + sp,
+          sp,
+          { life: 0.65 + Math.random() * 1.0, size0: 4.5, size1: 15 + hf * 6.5, alpha: 0.85, drag: 1.3, buoy: 0, color: col }
+        );
+      }
+      if (v === F) this.heatGlow = hf;
+    }
+    if (!(F.heatFlux >= 0.32)) this.heatGlow = 0;
+    // countdown venting
+    if ((this.phase === 'countdown' && !this.ignited) || this.phase === 'ready') {
+      if (Math.random() < 0.35 * qual) {
+        const y = P.alt + (P.com.maxY - P.com.y) * 0.6;
+        this.smoke.emit(P.sx + CORE_R, y, (Math.random() - 0.5), 2 + Math.random() * 2, -1.5, (Math.random() - 0.5) * 2, { life: 3, size0: 0.6, size1: 4, alpha: 0.35, drag: 1, buoy: -0.6, color: [1, 1, 1] });
+      }
+    }
+    // Rover wheel dust & plasma ground glints + Airplane wingtip vapor trails
+    if (F && !F.dead && !F.crashed) {
+      if (F.isRover && F.landed && Math.abs(F.groundSpeed || 0) > 2.2) {
+        const gSpd = Math.abs(F.groundSpeed || 0);
+        const nDust = this.poisson(Math.min(55, gSpd * 1.4) * qual * simDt);
+        const hYaw = F.heading || 0;
+        const backX = -Math.cos(hYaw);
+        const backZ = Math.sin(hYaw);
+        const rightX = Math.sin(hYaw);
+        const rightZ = Math.cos(hYaw);
+        const rB = BODIES[F.ref] || BODIES.earth;
+        const dustCol = F.ref === 'mars' ? [0.85, 0.42, 0.24] : F.ref === 'earth' ? [0.72, 0.66, 0.54] : [0.68, 0.72, 0.78];
+        const baseY = (F.alt || 0) - F.bottomOffset() + 0.28;
+        for (let i = 0; i < nDust; i++) {
+          const side = Math.random() < 0.5 ? -1.78 : 1.78;
+          const axOff = Math.random() < 0.5 ? -1.4 : 1.3;
+          const wx = (F.sx || 0) + backX * (-axOff) + rightX * side;
+          const wz = (F.s?.z || 0) + backZ * (-axOff) + rightZ * side;
+          this.smoke.emit(
+            wx,
+            baseY,
+            wz,
+            backX * gSpd * 0.28 + (Math.random() - 0.5) * 3,
+            1.2 + Math.random() * 2.8,
+            backZ * gSpd * 0.28 + (Math.random() - 0.5) * 3,
+            { life: 1.4 + Math.random() * 1.2, size0: 0.45, size1: 2.2 + Math.min(2.4, gSpd * 0.05), alpha: 0.36, drag: 1.4, buoy: rB.g > 5 ? 0.3 : -0.4, color: dustCol }
+          );
+        }
+      } else if (F.isPlane && !F.landed && !F.clamped) {
+        const prF = this.airRatio(F);
+        const spdF = F.speedSurf || 0;
+        const gLoad = Math.abs(F.bank || 0) * 2.2 + Math.abs(F.ctl?.drive || 0) * 0.8;
+        if (prF > 0.015 && spdF > 48) {
+          const vapRate = Math.min(95, (spdF - 45) * 0.55 * (0.45 + gLoad)) * prF;
+          const nVap = this.poisson(vapRate * qual * simDt);
+          const tipVec = this._tmpWingTip || (this._tmpWingTip = new THREE.Vector3());
+          for (let i = 0; i < nVap; i++) {
+            for (const sgn of [-1, 1]) {
+              tipVec.set(sgn * 4.18, -0.55, 0).applyQuaternion(F.root.quaternion);
+              this.smoke.emit(
+                (F.sx || 0) + tipVec.x,
+                (F.alt || 0) + tipVec.y,
+                (F.s?.z || 0) + tipVec.z,
+                (Math.random() - 0.5) * 1.6,
+                (Math.random() - 0.5) * 1.6,
+                (Math.random() - 0.5) * 1.6,
+                { life: 0.45 + Math.random() * 0.45, size0: 0.22, size1: 0.95, alpha: Math.min(0.45, 0.18 + gLoad * 0.16), drag: 2.2, buoy: 0, color: [0.90, 0.97, 1.0] }
+              );
+            }
+          }
+        }
+      }
+    }
+    // engine light & audio & haze
+    const fInfo = F.info;
+    if (F.isRover) this.engineLight.color.setHex(0x38bdf8);
+    else if (fInfo && fInfo.antiGrav) this.engineLight.color.setHex(0x38bdf8);
+    else if (fInfo && fInfo.laser) this.engineLight.color.setHex(0xff2a55);
+    else if (F.isPlane) this.engineLight.color.setHex(0xff9e3d);
+    else this.engineLight.color.setHex(0xff8a3a);
+    const lowest = new THREE.Vector3(0, F.com.minY - F.com.y - (F.isRover ? 0.6 : 3), 0).applyQuaternion(F.root.quaternion);
+    this.engineLight.position.copy(lowest);
+    if (F.isRover && !F.crashed) {
+      this.engineLight.intensity = 1.6e4 + Math.min(2.2e4, Math.abs(F.groundSpeed || 0) * 850);
+    } else if (F.isPlane && !F.crashed) {
+      this.engineLight.intensity = Math.max(focusThr * 2.5e4 * (0.92 + Math.random() * 0.16), 6.5e3);
+    } else {
+      this.engineLight.intensity = focusThr * 2.2e4 * (0.9 + Math.random() * 0.2);
+    }
+    this.thrNorm = Math.min(1, focusThr / 2);
+    const pr = this.airRatio(F);
+    const near = THREE.MathUtils.clamp(1.4 - this.camera.position.length() / 1500, 0.25, 1);
+    audio.engine(Math.min(1, focusThr / 1.6), pr, near);
+    audio.wind(Math.max(F.qNow || 0, (F.heatFlux || 0) * 18000));
+    const fx = this.app.finalPass.uniforms;
+    if (hazeN > 0 && this.camMode !== 2) {
+      haze.multiplyScalar(1 / hazeN);
+      const exh = F.dir3D ? F.dir3D.clone().negate() : new THREE.Vector3(-Math.sin(F.beta - F.phi), -Math.cos(F.beta - F.phi), 0);
+      const p1 = haze.clone().project(this.camera), p2 = haze.clone().addScaledVector(exh, 10).project(this.camera);
+      if (p1.z < 1 && p1.z > -1) {
+        fx.uHazePos.value.set(p1.x * 0.5 + 0.5, p1.y * 0.5 + 0.5);
+        fx.uHazeDir.value.set(p2.x - p1.x, p2.y - p1.y).normalize();
+        const dist = haze.distanceTo(this.camera.position);
+        fx.uHazeRadius.value = THREE.MathUtils.clamp((CORE_R * 2.2 / dist) / Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 0.5, 0.005, 0.3);
+        fx.uHaze.value = Math.min(1, focusThr) * (0.3 + 0.7 * pr);
+      } else fx.uHaze.value = 0;
+    } else fx.uHaze.value = 0;
+    fx.uFlash.value = this.flash * 0.6 + (this.heatGlow || 0) * 0.08;
+  }
+
+  poisson(lambda) {
+    const n = Math.floor(lambda);
+    return n + (Math.random() < lambda - n ? 1 : 0);
+  }
+
+  // =================================================================== CAMERA
+  getMinCameraSceneY(camX, camZ, F = this.focus) {
+    if (!F || F.ref === 'sun' || BODIES[F.ref]?.gasGiant || F.alt > 25000) return -Infinity;
+    if (F.ref === 'earth') {
+      const camSx = (F.sx || 0) + camX;
+      const camSz = (F.s?.z || 0) + camZ;
+      const showPad = (this.player?.isPlane || this.player?.isRover) ? 0.0 : 1.0;
+      const showAirport = this.player?.isPlane ? 1.0 : 0.0;
+      let surfH = this.earthGroundWave(camSx, camSz, showPad, showAirport);
+      if (showPad > 0.5) {
+        const rPad = Math.hypot(camSx, camSz);
+        if (rPad < PAD_RADIUS + 22) {
+          surfH = Math.max(surfH, 6.0 * THREE.MathUtils.clamp((PAD_RADIUS + 22 - rPad) / 22, 0, 1));
+        }
+      }
+      if (showAirport > 0.5 && camSx > -180 && camSx < 2260 && Math.abs(camSz) < 28) {
+        surfH = Math.max(surfH, 0.28);
+      }
+      if (Math.hypot(camSx - LZ_X, camSz) < 40) {
+        surfH = Math.max(surfH, 1.0);
+      }
+      const bendDrop = (camX * camX + camZ * camZ) * BEND;
+      return (surfH - F.alt - bendDrop) + 1.8;
+    }
+    const B = BODIES[F.ref] || BODIES.moon;
+    const camSx = (F.sx || 0) + camX;
+    const camSz = (F.s?.z || 0) + camZ;
+    const camPsi = (F.phiRot || 0) + camX / B.R;
+    const surf = this.surfaceAt(F.ref, camSx, camPsi, camSz);
+    const bendDrop = (camX * camX + camZ * camZ) / (2 * B.R);
+    return ((surf ? surf.h : 0) - F.alt - bendDrop) + 1.8;
+  }
+
+  updateCamera(dt) {
+    const cam = this.camera, F = this.focus;
+    cam.position.sub(this.shake);
+    const h = F.height || this.rocketHeight;
+    let mode = this.camMode;
+    if (mode === 1 && !(F.ref === 'earth' && Math.abs(F.sx) < 5000 && F.alt < 40000)) mode = 0;
+    if (mode === 0) {
+      if ((F.isPlane || F.isRover || F.isBoat) && F.turnYawRate) {
+        const followFactor = (F.isRover || F.isBoat) ? 0.75 : 1.0;
+        cam.position.applyAxisAngle(this._yAxis || (this._yAxis = new THREE.Vector3(0, 1, 0)), F.turnYawRate * followFactor * dt);
+      }
+      this.controls.target.set(0, 0, 0);
+      const minCamYPre = this.getMinCameraSceneY(cam.position.x, cam.position.z, F);
+      if (isFinite(minCamYPre)) {
+        const dist = Math.max(1, cam.position.length());
+        const cosLim = THREE.MathUtils.clamp((minCamYPre - this.controls.target.y) / dist, -0.98, 0.96);
+        this.controls.maxPolarAngle = Math.acos(cosLim);
+      } else {
+        this.controls.maxPolarAngle = Math.PI;
+      }
+      this.controls.update();
+      const minCamYPost = this.getMinCameraSceneY(cam.position.x, cam.position.z, F);
+      if (cam.position.y < minCamYPost) {
+        cam.position.y = minCamYPost;
+        cam.lookAt(this.controls.target);
+      }
+    } else if (mode === 1) {
+      const dx = -260 - F.sx, dz = 380 - F.s.z;
+      cam.position.set(dx, 14 - F.alt - (dx * dx + dz * dz) * BEND, dz);
+      cam.lookAt(0, 0, 0);
+      const dist = cam.position.length();
+      cam.fov = THREE.MathUtils.clamp(THREE.MathUtils.radToDeg(2 * Math.atan((h * 2.2 + 30) / dist)), 0.3, 50);
+      cam.updateProjectionMatrix();
+    } else if (mode === 2) {
+      const root = F.root;
+      const top = F.com.maxY - F.com.y;
+      const p = root.localToWorld(new THREE.Vector3(CORE_R + 0.5, top - 3, 0.9));
+      const look = root.localToWorld(new THREE.Vector3(CORE_R + 0.2, F.com.minY - F.com.y - 40, 0.2));
+      cam.position.copy(p);
+      const a = F.beta - F.phi;
+      cam.up.set(Math.sin(a), Math.cos(a), 0);
+      cam.lookAt(look);
+      cam.up.set(0, 1, 0);
+      if (cam.fov !== 70) { cam.fov = 70; cam.updateProjectionMatrix(); }
+    } else {
+      this.cineAngle = (this.cineAngle || 0) + dt * 0.12;
+      const r = h * 2.2 + 40;
+      cam.position.set(Math.cos(this.cineAngle) * r, Math.sin(this.time * 0.2) * h * 0.4 - h * 0.2, Math.sin(this.cineAngle) * r);
+      cam.lookAt(0, 0, 0);
+      if (cam.fov !== 45) { cam.fov = 45; cam.updateProjectionMatrix(); }
+    }
+    if (mode !== 1 && this.camMode === 1 && cam.fov !== 50) { cam.fov = 50; cam.updateProjectionMatrix(); }
+    const pr = this.airRatio(F);
+    const groundProx = THREE.MathUtils.clamp(1 - (F.agl ?? F.alt) / 600, 0, 1);
+    this.shakeBoost = Math.max(0, (this.shakeBoost || 0) - dt * 1.2);
+    let amp = (this.thrNorm || 0) * (0.05 + 0.4 * groundProx * pr) + Math.min(0.3, (F.qNow || 0) / 120000) + this.shakeBoost;
+    if (mode === 1) amp *= 0.2 * (cam.fov / 50);
+    const s = this.shake.set((Math.random() - 0.5) * amp, (Math.random() - 0.5) * amp, (Math.random() - 0.5) * amp);
+    if (mode === 2) s.multiplyScalar(0.2);
+    cam.position.add(s);
+    const minCamYFinal = this.getMinCameraSceneY(cam.position.x, cam.position.z, F);
+    if (cam.position.y < minCamYFinal) {
+      cam.position.y = minCamYFinal;
+      if (mode !== 2) cam.lookAt(0, 0, 0);
+    }
+  }
+
+  // =================================================================== HUD
+  updateMap() {
+    const P = this.player, t = this.simT;
+    const el = vesselElements(P);
+    this.mapT = (this.mapT || 0) - 1;
+    if (this.mapT <= 0) {
+      this.mapT = 12;
+      if (P.landed || P.crashed || P.clamped) this.mapPred = null;
+      else {
+        const isClosed = el.e < 1 && isFinite(el.period);
+        const maxTime = isClosed
+          ? el.period * 1.05
+          : Math.max(5e7, (Math.hypot(P.s.x, P.s.y) / Math.max(100, P.speedOrb || 1000)) * 50);
+        const baseStep = Math.max(0.5, coastStep(P.s.x, P.s.y, P.s.z, t));
+        const stepScale = isClosed
+          ? Math.max(1.8, (el.period / 2600) / baseStep)
+          : 3.5;
+        const useIssTarget = this.mission.id === 'iss' && P.ref === 'earth' && el.ap < R_E + 2000e3;
+        this.mapPred = predict(P.s.x, P.s.y, P.s.z, P.s.vx, P.s.vy, P.s.vz, t, {
+          maxTime,
+          maxSteps: 3600,
+          stepScale,
+          target: useIssTarget ? this.issOrbit : null,
+          targetStep: 20,
+        });
+      }
+    }
+    const pred = this.mapPred;
+    const bp = { x: 0, y: 0, z: 0 };
+    bodyState(P.ref, t, bp, { x: 0, y: 0, z: 0 });
+    const markers = [];
+    const R = P.body.R;
+    if (el.e < 1) {
+      const sa = Math.sin(el.argPe), ca = Math.cos(el.argPe);
+      markers.push({ x: bp.x - sa * el.ap, y: bp.y - ca * el.ap, z: bp.z, type: 'ap', text: 'Ap ' + fmt((el.ap - R) / 1000, 0) + ' km', color: '#ffb347' });
+      markers.push({ x: bp.x + sa * el.pe, y: bp.y + ca * el.pe, z: bp.z, type: 'pe', text: 'Pe ' + fmt((el.pe - R) / 1000, 0) + ' km', color: '#7dffc8' });
+    }
+    const ip = this.issOrbit.pos(t);
+    const craftName = P.label || this.app?.build?.getRocketName?.() || tr('Tàu hiện tại', 'Current Craft');
+    const activeIsUfo = this.vesselHasUfoPart(P);
+    const activeIsUfoKing = this.vesselIsUfoKing(P, craftName);
+    this.sanitizeSpaceObjectsForSingleUfoKing();
+
+    let seenKingOnMap = activeIsUfoKing;
+    let seenQueenOnMap = false;
+    const liveOthers = this.vessels
+      .filter((v) => v !== P && !v.dead && !v.crashed && !v.archived)
+      .map((v) => {
+        const stageIsKing = this.vesselIsUfoKing(v, v.label);
+        if (stageIsKing && seenKingOnMap) return null;
+        if (stageIsKing) seenKingOnMap = true;
+        return {
+          id: v.mapId || ('live_' + v.id),
+          x: v.s.x,
+          y: v.s.y,
+          z: v.s.z || 0,
+          alt: v.alt,
+          speedOrb: v.speedOrb,
+          beta: v.beta,
+          ref: v.ref || 'earth',
+          kind: v.kind === 'booster' ? 'booster' : 'stage',
+          isUfo: this.vesselHasUfoPart(v),
+          isUfoKing: stageIsKing,
+          name: v.label || (v.kind === 'booster' ? tr('Tầng 1', 'Stage 1') : tr('Tầng tách', 'Separated Stage')),
+          color: stageIsKing ? '#facc15' : '#ff7a3a',
+          el: vesselElements(v),
+          deletable: true,
+        };
+      })
+      .filter(Boolean);
+    const persistedOthers = (this.spaceObjects || [])
+      .filter((obj) => !obj?.isUfoKing && !this.isUfoKingName(obj?.name))
+      .map((obj) => {
+        const st = this.evalSpaceObject(obj, t);
+        return {
+          id: obj.id,
+          x: st.x,
+          y: st.y,
+          z: st.z || 0,
+          alt: st.alt,
+          speedOrb: st.speedOrb,
+          beta: st.beta,
+          ref: obj.ref || 'earth',
+          kind: obj.kind || 'vessel',
+          isUfo: !!obj.isUfo || /ufo/i.test(obj.name || ''),
+          name: obj.name || tr('Tên lửa vũ trụ', 'Spacecraft'),
+          color: obj.kind === 'vessel' ? '#a78bfa' : '#ff7a3a',
+          el: st.el,
+          deletable: true,
+        };
+      });
+
+    // Live Aliens near the player vessel (when in space or at another planet/moon)
+    const E = P.east, U = P.up;
+    let hasLiveKingAlien = false;
+    let hasLiveQueenAlien = false;
+    const liveAlienMapObjs = [];
+    for (let idx = 0; idx < (this.aliens || []).length; idx++) {
+      const a = this.aliens[idx];
+      if (!a || a.dead) continue;
+      const isKingAlien = a.tier === 'king';
+      const isQueenAlien = a.tier === 'queen';
+      if (isKingAlien) {
+        if (hasLiveKingAlien) continue;
+        hasLiveKingAlien = true;
+      } else if (isQueenAlien) {
+        if (hasLiveQueenAlien) continue;
+        hasLiveQueenAlien = true;
+      }
+      const rx = a.relPos.x, ry = a.relPos.y, rz = a.relPos.z;
+      const relX = E.x * rx + U.x * ry;
+      const relY = E.y * rx + U.y * ry;
+      const relZ = rz || 0;
+      const ax = P.s.x + relX;
+      const ay = P.s.y + relY;
+      const az = (P.s.z || 0) + relZ;
+      const curHp = Math.max(0, Math.round(a.hp));
+      let aLabel = tr(a.labelVi || `UFO Alien #${idx + 1}`, a.labelEn || `Alien UFO #${idx + 1}`);
+      if (isKingAlien) {
+        aLabel = seenKingOnMap
+          ? tr('Alien Vua Khổng Lồ · Siêu Trùm 1 Tỷ km', 'Colossal Alien King · 1B km Mega-Boss')
+          : tr('UFO Vua · Siêu Trùm 1 Tỷ km', 'King UFO · 1B km Mega-Boss');
+        seenKingOnMap = true;
+      } else if (isQueenAlien) {
+        aLabel = seenQueenOnMap
+          ? tr('Alien Hoàng Hậu Khổng Lồ · Siêu Trùm 1 Tỷ km', 'Colossal Alien Queen · 1B km Mega-Boss')
+          : tr('UFO Hoàng Hậu · Siêu Trùm 1 Tỷ km', 'Queen UFO · 1B km Mega-Boss');
+        seenQueenOnMap = true;
+      }
+      liveAlienMapObjs.push({
+        id: a.id,
+        x: ax,
+        y: ay,
+        z: az,
+        relX,
+        relY,
+        relZ,
+        isLiveAlien: true,
+        tier: a.tier || 'scout',
+        isKingUfo: isKingAlien,
+        isQueenUfo: isQueenAlien,
+        isRoyalAlien: !!a.isRoyal,
+        alt: Math.max(0, P.alt + ry),
+        speedOrb: P.speedOrb,
+        beta: a.orbitAngle,
+        ref: P.ref || 'earth',
+        kind: 'alien',
+        name: `${aLabel} (${curHp}/${a.maxHp} HP • +10 HP/s)`,
+        color: a.mapColor || '#4ade80',
+        el: null,
+        deletable: false,
+      });
+    }
+
+    // Ensure there is exactly 1 King UFO boss marker on the map at 1,000,000,000 km (unless defeated or already live)
+    const royalKingMapObjs = [];
+    if (!this.flags?.killKing && !hasLiveKingAlien) {
+      const sunPhi = Math.atan2(SUN_ECI.x, SUN_ECI.y) - 0.35;
+      const rKing = R_E + (this.startAlt || 0) + 1000000000 * 1000;
+      const kingLabel = seenKingOnMap
+        ? tr('Alien Vua Khổng Lồ · 1.000.000.000 km (100.000 HP)', 'Colossal Alien King · 1,000,000,000 km (100,000 HP)')
+        : tr('UFO Vua · 1.000.000.000 km (100.000 HP)', 'King UFO · 1,000,000,000 km (100,000 HP)');
+      seenKingOnMap = true;
+      royalKingMapObjs.push({
+        id: 'alien_king_boss',
+        x: Math.sin(sunPhi) * rKing,
+        y: Math.cos(sunPhi) * rKing,
+        z: 0,
+        alt: 1000000000 * 1000,
+        speedOrb: 18062,
+        beta: t * 0.2,
+        ref: 'earth',
+        kind: 'alien',
+        tier: 'king',
+        isKingUfo: true,
+        isRoyalAlien: true,
+        isRoyalDomainMarker: true,
+        name: kingLabel,
+        color: '#facc15',
+        el: null,
+        deletable: false,
+      });
+    }
+    if (!this.flags?.killQueen && !hasLiveQueenAlien) {
+      const sunPhiQ = Math.atan2(SUN_ECI.x, SUN_ECI.y) + 0.35;
+      const rQueen = R_E + (this.startAlt || 0) + 1000000000 * 1000;
+      const queenLabel = seenQueenOnMap
+        ? tr('Alien Hoàng Hậu Khổng Lồ · 1.000.000.000 km (90.500 HP)', 'Colossal Alien Queen · 1,000,000,000 km (90,500 HP)')
+        : tr('UFO Hoàng Hậu · 1.000.000.000 km (90.500 HP)', 'Queen UFO · 1,000,000,000 km (90,500 HP)');
+      seenQueenOnMap = true;
+      royalKingMapObjs.push({
+        id: 'alien_queen_boss',
+        x: Math.sin(sunPhiQ) * rQueen,
+        y: Math.cos(sunPhiQ) * rQueen,
+        z: 0,
+        alt: 1000000000 * 1000,
+        speedOrb: 18062,
+        beta: -t * 0.2,
+        ref: 'earth',
+        kind: 'alien',
+        tier: 'queen',
+        isQueenUfo: true,
+        isRoyalAlien: true,
+        isRoyalDomainMarker: true,
+        name: queenLabel,
+        color: '#f472b6',
+        el: null,
+        deletable: false,
+      });
+    }
+
+    // Solar System Alien Patrols (stationed in outer space & around planets/moons; more Aliens the further from Earth)
+    if (!this.mapAlienFleet) {
+      this.mapAlienFleet = [
+        // Near Earth & Moon (fewest)
+        { id: 'alien_space_leo', ref: 'earth', alt: 220e3, e: 0.01, argPe: 0.9, nu0: 1.2, hSign: 1, t0: 0, vi: 'UFO Alien · Vũ trụ', en: 'Alien UFO · Outer Space' },
+        { id: 'alien_moon_1', ref: 'moon', alt: 35e3, e: 0.02, argPe: 2.1, nu0: 0.5, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Mặt Trăng', en: 'Alien UFO #1 · Moon' },
+        { id: 'alien_moon_2', ref: 'moon', alt: 62e3, e: 0.015, argPe: 0.6, nu0: 3.6, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Mặt Trăng', en: 'Alien UFO #2 · Moon' },
+        // Inner planets (Venus, Mars, Mercury)
+        { id: 'alien_venus_1', ref: 'venus', alt: 75e3, e: 0.015, argPe: 0.4, nu0: 3.1, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Kim', en: 'Alien UFO #1 · Venus' },
+        { id: 'alien_venus_2', ref: 'venus', alt: 110e3, e: 0.02, argPe: 2.2, nu0: 1.0, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Kim', en: 'Alien UFO #2 · Venus' },
+        { id: 'alien_mars_1', ref: 'mars', alt: 48e3, e: 0.02, argPe: 1.4, nu0: 2.3, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Hỏa', en: 'Alien UFO #1 · Mars' },
+        { id: 'alien_mars_2', ref: 'mars', alt: 85e3, e: 0.018, argPe: 3.0, nu0: 0.4, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Hỏa', en: 'Alien UFO #2 · Mars' },
+        { id: 'alien_phobos', ref: 'phobos', alt: 18e3, e: 0.01, argPe: 1.1, nu0: 2.0, hSign: 1, t0: 0, vi: 'UFO Alien · Phobos', en: 'Alien UFO · Phobos' },
+        { id: 'alien_mercury_1', ref: 'mercury', alt: 28e3, e: 0.02, argPe: 2.8, nu0: 1.7, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Thủy', en: 'Alien UFO #1 · Mercury' },
+        { id: 'alien_mercury_2', ref: 'mercury', alt: 52e3, e: 0.015, argPe: 0.9, nu0: 4.2, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Thủy', en: 'Alien UFO #2 · Mercury' },
+        // Asteroid belt (Ceres)
+        { id: 'alien_ceres_1', ref: 'ceres', alt: 24e3, e: 0.015, argPe: 1.8, nu0: 0.9, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Ceres', en: 'Alien UFO #1 · Ceres' },
+        { id: 'alien_ceres_2', ref: 'ceres', alt: 44e3, e: 0.02, argPe: 0.3, nu0: 2.9, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Ceres', en: 'Alien UFO #2 · Ceres' },
+        { id: 'alien_ceres_3', ref: 'ceres', alt: 68e3, e: 0.01, argPe: 2.6, nu0: 4.8, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Ceres', en: 'Alien UFO #3 · Ceres' },
+        // Jupiter system
+        { id: 'alien_jupiter_1', ref: 'jupiter', alt: 160e3, e: 0.02, argPe: 0.5, nu0: 1.1, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Mộc', en: 'Alien UFO #1 · Jupiter' },
+        { id: 'alien_jupiter_2', ref: 'jupiter', alt: 280e3, e: 0.015, argPe: 2.4, nu0: 3.7, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Mộc', en: 'Alien UFO #2 · Jupiter' },
+        { id: 'alien_io', ref: 'io', alt: 25e3, e: 0.01, argPe: 1.6, nu0: 0.4, hSign: 1, t0: 0, vi: 'UFO Alien · Io', en: 'Alien UFO · Io' },
+        { id: 'alien_europa', ref: 'europa', alt: 22e3, e: 0.01, argPe: 1.1, nu0: 0.8, hSign: 1, t0: 0, vi: 'UFO Alien · Europa', en: 'Alien UFO · Europa' },
+        { id: 'alien_ganymede', ref: 'ganymede', alt: 32e3, e: 0.015, argPe: 2.9, nu0: 2.2, hSign: -1, t0: 0, vi: 'UFO Alien · Ganymede', en: 'Alien UFO · Ganymede' },
+        // Saturn system
+        { id: 'alien_saturn_1', ref: 'saturn', alt: 150e3, e: 0.02, argPe: 0.8, nu0: 0.6, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Thổ', en: 'Alien UFO #1 · Saturn' },
+        { id: 'alien_saturn_2', ref: 'saturn', alt: 260e3, e: 0.018, argPe: 2.7, nu0: 2.9, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Thổ', en: 'Alien UFO #2 · Saturn' },
+        { id: 'alien_saturn_3', ref: 'saturn', alt: 380e3, e: 0.012, argPe: 1.4, nu0: 4.9, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Sao Thổ', en: 'Alien UFO #3 · Saturn' },
+        { id: 'alien_enceladus', ref: 'enceladus', alt: 18e3, e: 0.01, argPe: 0.4, nu0: 1.5, hSign: 1, t0: 0, vi: 'UFO Alien · Enceladus', en: 'Alien UFO · Enceladus' },
+        { id: 'alien_titan_1', ref: 'titan', alt: 55e3, e: 0.015, argPe: 2.5, nu0: 2.0, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Titan', en: 'Alien UFO #1 · Titan' },
+        { id: 'alien_titan_2', ref: 'titan', alt: 90e3, e: 0.02, argPe: 0.9, nu0: 5.1, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Titan', en: 'Alien UFO #2 · Titan' },
+        // Uranus system
+        { id: 'alien_uranus_1', ref: 'uranus', alt: 120e3, e: 0.02, argPe: 1.2, nu0: 0.7, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Thiên Vương', en: 'Alien UFO #1 · Uranus' },
+        { id: 'alien_uranus_2', ref: 'uranus', alt: 210e3, e: 0.015, argPe: 3.1, nu0: 2.6, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Thiên Vương', en: 'Alien UFO #2 · Uranus' },
+        { id: 'alien_uranus_3', ref: 'uranus', alt: 310e3, e: 0.018, argPe: 0.3, nu0: 4.5, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Sao Thiên Vương', en: 'Alien UFO #3 · Uranus' },
+        { id: 'alien_miranda', ref: 'miranda', alt: 16e3, e: 0.01, argPe: 1.9, nu0: 1.1, hSign: 1, t0: 0, vi: 'UFO Alien · Miranda', en: 'Alien UFO · Miranda' },
+        { id: 'alien_titania', ref: 'titania', alt: 24e3, e: 0.015, argPe: 2.4, nu0: 3.3, hSign: -1, t0: 0, vi: 'UFO Alien · Titania', en: 'Alien UFO · Titania' },
+        // Neptune system
+        { id: 'alien_neptune_1', ref: 'neptune', alt: 110e3, e: 0.02, argPe: 0.6, nu0: 0.9, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Sao Hải Vương', en: 'Alien UFO #1 · Neptune' },
+        { id: 'alien_neptune_2', ref: 'neptune', alt: 195e3, e: 0.016, argPe: 2.1, nu0: 2.8, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Sao Hải Vương', en: 'Alien UFO #2 · Neptune' },
+        { id: 'alien_neptune_3', ref: 'neptune', alt: 290e3, e: 0.014, argPe: 1.3, nu0: 4.4, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Sao Hải Vương', en: 'Alien UFO #3 · Neptune' },
+        { id: 'alien_neptune_4', ref: 'neptune', alt: 390e3, e: 0.02, argPe: 2.9, nu0: 5.7, hSign: -1, t0: 0, vi: 'UFO Alien #4 · Sao Hải Vương', en: 'Alien UFO #4 · Neptune' },
+        { id: 'alien_triton_1', ref: 'triton', alt: 24e3, e: 0.015, argPe: 0.7, nu0: 1.6, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Triton', en: 'Alien UFO #1 · Triton' },
+        { id: 'alien_triton_2', ref: 'triton', alt: 46e3, e: 0.02, argPe: 2.6, nu0: 4.1, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Triton', en: 'Alien UFO #2 · Triton' },
+        // Pluto (furthest planet -> dense Alien presence)
+        { id: 'alien_pluto_1', ref: 'pluto', alt: 20e3, e: 0.02, argPe: 0.7, nu0: 0.5, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Diêm Vương', en: 'Alien UFO #1 · Pluto' },
+        { id: 'alien_pluto_2', ref: 'pluto', alt: 34e3, e: 0.015, argPe: 1.8, nu0: 1.7, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Diêm Vương', en: 'Alien UFO #2 · Pluto' },
+        { id: 'alien_pluto_3', ref: 'pluto', alt: 50e3, e: 0.018, argPe: 2.9, nu0: 2.9, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Diêm Vương', en: 'Alien UFO #3 · Pluto' },
+        { id: 'alien_pluto_4', ref: 'pluto', alt: 68e3, e: 0.02, argPe: 0.4, nu0: 4.1, hSign: -1, t0: 0, vi: 'UFO Alien #4 · Diêm Vương', en: 'Alien UFO #4 · Pluto' },
+        { id: 'alien_pluto_5', ref: 'pluto', alt: 88e3, e: 0.015, argPe: 1.5, nu0: 5.3, hSign: 1, t0: 0, vi: 'UFO Alien #5 · Diêm Vương', en: 'Alien UFO #5 · Pluto' },
+        { id: 'alien_pluto_6', ref: 'pluto', alt: 112e3, e: 0.02, argPe: 2.4, nu0: 6.0, hSign: -1, t0: 0, vi: 'UFO Alien #6 · Diêm Vương', en: 'Alien UFO #6 · Pluto' },
+        // Haumea (Kuiper Belt dwarf planet)
+        { id: 'alien_haumea_1', ref: 'haumea', alt: 22e3, e: 0.015, argPe: 0.6, nu0: 0.8, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Haumea', en: 'Alien UFO #1 · Haumea' },
+        { id: 'alien_haumea_2', ref: 'haumea', alt: 38e3, e: 0.02, argPe: 1.9, nu0: 2.3, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Haumea', en: 'Alien UFO #2 · Haumea' },
+        { id: 'alien_haumea_3', ref: 'haumea', alt: 58e3, e: 0.015, argPe: 2.8, nu0: 4.1, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Haumea', en: 'Alien UFO #3 · Haumea' },
+        { id: 'alien_haumea_4', ref: 'haumea', alt: 82e3, e: 0.018, argPe: 0.3, nu0: 5.5, hSign: -1, t0: 0, vi: 'UFO Alien #4 · Haumea', en: 'Alien UFO #4 · Haumea' },
+        // Makemake & Eris (outer Kuiper Belt & Scattered Disc dwarf planets)
+        { id: 'alien_makemake_1', ref: 'makemake', alt: 24e3, e: 0.015, argPe: 1.1, nu0: 0.9, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Makemake', en: 'Alien UFO #1 · Makemake' },
+        { id: 'alien_makemake_2', ref: 'makemake', alt: 42e3, e: 0.02, argPe: 2.4, nu0: 2.7, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Makemake', en: 'Alien UFO #2 · Makemake' },
+        { id: 'alien_makemake_3', ref: 'makemake', alt: 64e3, e: 0.015, argPe: 0.5, nu0: 4.6, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Makemake', en: 'Alien UFO #3 · Makemake' },
+        { id: 'alien_eris_1', ref: 'eris', alt: 26e3, e: 0.018, argPe: 0.8, nu0: 0.6, hSign: 1, t0: 0, vi: 'UFO Alien #1 · Eris', en: 'Alien UFO #1 · Eris' },
+        { id: 'alien_eris_2', ref: 'eris', alt: 46e3, e: 0.015, argPe: 2.1, nu0: 2.1, hSign: -1, t0: 0, vi: 'UFO Alien #2 · Eris', en: 'Alien UFO #2 · Eris' },
+        { id: 'alien_eris_3', ref: 'eris', alt: 70e3, e: 0.02, argPe: 1.4, nu0: 3.8, hSign: 1, t0: 0, vi: 'UFO Alien #3 · Eris', en: 'Alien UFO #3 · Eris' },
+        { id: 'alien_eris_4', ref: 'eris', alt: 96e3, e: 0.016, argPe: 2.9, nu0: 5.4, hSign: -1, t0: 0, vi: 'UFO Alien #4 · Eris', en: 'Alien UFO #4 · Eris' },
+      ];
+    }
+    const patrolAlienObjs = this.mapAlienFleet.map((pat) => {
+      const B = BODIES[pat.ref] || BODIES.earth;
+      const st = this.evalSpaceObject({ ...pat, a: B.R + pat.alt }, t);
+      return {
+        id: pat.id,
+        x: st.x,
+        y: st.y,
+        z: st.z || 0,
+        alt: st.alt,
+        speedOrb: st.speedOrb,
+        beta: st.beta,
+        ref: pat.ref,
+        kind: 'alien',
+        isPatrolAlien: true,
+        name: tr(pat.vi, pat.en),
+        color: '#4ade80',
+        el: st.el,
+        deletable: false,
+      };
+    });
+
+    const others = [...royalKingMapObjs, ...liveOthers, ...persistedOthers, ...liveAlienMapObjs, ...patrolAlienObjs];
+    const refLabel = (BODIES[P.ref] || BODIES.earth).label;
+    const _sunP = { x: 0, y: 0, z: 0 };
+    bodyPos('sun', t, _sunP);
+    const rSunNow = Math.hypot(P.s.x - _sunP.x, P.s.y - _sunP.y, (P.s.z || 0) - (_sunP.z || 0));
+    const isInterstellar = rSunNow >= SUN_SOI;
+    const locDesc = isInterstellar
+      ? tr(`🌌 Không gian Liên sao · Cách Mặt Trời ${fmt(rSunNow / 1000, 0)} km`, `🌌 Interstellar Space · ${fmt(rSunNow / 1000, 0)} km from Sun`)
+      : tr(`Quanh ${refLabel} · độ cao ${fmt(P.alt / 1000, 1)} km`, `Orbiting ${refLabel} · altitude ${fmt(P.alt / 1000, 1)} km`);
+    const info = [
+      locDesc,
+      tr(`Vận tốc quỹ đạo ${fmt(P.speedOrb)} m/s`, `Orbital velocity ${fmt(P.speedOrb)} m/s`),
+    ];
+    if (pred && pred.bodyCA && P.ref === 'earth') {
+      for (const name of Object.keys(pred.bodyCA)) {
+        if (name === 'sun') continue;
+        const ca = pred.bodyCA[name];
+        const B = BODIES[name];
+        if (B && ca && ca.d < B.soi * 2.5) info.push(tr(`Tiếp cận ${B.label}: ${fmt((ca.d - B.R) / 1000, 0)} km (sau ${fmt((ca.t - t) / 3600, 1)} giờ)`, `Closest approach ${B.label}: ${fmt((ca.d - B.R) / 1000, 0)} km (in ${fmt((ca.t - t) / 3600, 1)} h)`));
+      }
+    }
+    if (pred && pred.targetCA && pred.targetCA.d < 1e7 && this.mission.id === 'iss') info.push(tr(`Tiếp cận ISS: ${fmt(pred.targetCA.d / 1000, 1)} km (sau ${fmt((pred.targetCA.t - t) / 60, 1)} phút)`, `ISS approach: ${fmt(pred.targetCA.d / 1000, 1)} km (in ${fmt((pred.targetCA.t - t) / 60, 1)} min)`));
+    this.map.draw({ t, vessel: { x: P.s.x, y: P.s.y, z: P.s.z || 0, vx: P.s.vx, vy: P.s.vy, vz: P.s.vz, alt: P.alt, speedOrb: P.speedOrb, phi: P.phi, beta: P.beta, deletable: !P.clamped, isPlane: !!P.isPlane, isUfo: activeIsUfo, isUfoKing: activeIsUfoKing }, beta: P.beta, name: craftName, ref: P.ref, apR: el.e < 1 ? el.ap : 4e7, soiT: pred ? pred.soiT : null, sun: { x: SUN_ECI.x, y: SUN_ECI.y, z: SUN_ECI.z }, padAngle: OMEGA_E * t, iss: { r: ISS_R, x: ip.x, y: ip.y, z: ip.z || 0 }, pred, markers, others, info, el });
+  }
+
+  fmtTime(sec) {
+    if (!isFinite(sec)) return '—';
+    const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+    if (m >= 60) return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+    return `${m}m ${String(s).padStart(2, '0')}s`;
+  }
+
+  updateHUD(dt) {
+    if (this.map.visible) this.updateMap();
+    if (this.pipKeep > 0) this.pipKeep -= dt;
+    const P = this.player;
+    this.updateAirportCompass(P);
+    const b = this.vessels.find((v) => v.kind === 'booster' && !v.dead);
+    let showPip = false;
+    this.pipTarget = null;
+    if (b && this.phase !== 'ready') {
+      const active = b.rec && b.rec.phase !== 'done' && b.rec.phase !== 'lost' && !b.crashed;
+      showPip = active || this.pipKeep > 0;
+      this.pipTarget = this.focus === b ? P : b;
+    }
+    $('pip').classList.toggle('hidden', !showPip);
+    this.hudTimer = (this.hudTimer || 0) - dt;
+    if (this.hudTimer > 0) return;
+    this.hudTimer = 0.066;
+    if (showPip && b) {
+      $('pip-label').textContent = this.focus === b ? tr('TÀU CHÍNH', 'MAIN CRAFT') : tr('TẦNG 1', 'STAGE 1');
+      const tgt = this.pipTarget;
+      $('pip-status').textContent = `${b.rec ? b.rec.status() : ''} · ${tgt === b ? fmt(b.alt / 1000, 1) + ' km' : fmt(b.alt) + ' m'} · ${fmt(b.speedSurf)} m/s`;
+    }
+    const low = (P.ref === 'earth' && P.alt < ATM_TOP) || (P.ref !== 'earth' && P.alt < Math.max(30000, P.body.atm || 0));
+    const altV = P.ref === 'earth'
+      ? (P.alt - this.startAlt)
+      : (P.alt - (P.bottomOffset ? P.bottomOffset() : 0));
+    const altEl = $('h-alt');
+    if (Math.abs(altV) >= 10000) { altEl.textContent = fmt(altV / 1000, 2); $('h-alt-u').textContent = 'km'; }
+    else { altEl.textContent = fmt(altV, 0); $('h-alt-u').textContent = 'm'; }
+    $('h-vel-l').textContent = low ? tr('⚡ MẶT ĐẤT', '⚡ SURF') : tr('⚡ QUỸ ĐẠO', '⚡ ORB');
+    $('h-vel').textContent = fmt(low ? P.speedSurf : P.speedOrb);
+    const vu = low ? P.vSurf.u : P.vOrb.u, ve = low ? Math.hypot(P.vSurf.e, P.vSurf.z || 0) : P.vOrb.e;
+    $('h-vs').textContent = fmt(vu, 1) + ' m/s';
+    $('h-hs').textContent = fmt(ve, 1) + ' m/s';
+    $('h-mach').textContent = fmt(P.machNow || 0, 2);
+    $('h-g').textContent = fmt(this.released ? P.accelNow || 0 : 1, 2) + ' G';
+    if ((P.heatFlux || 0) >= 0.32) {
+      const shieldTag = P.hasHeatShield() ? ' 🛡️' : ' ⚠️';
+      $('h-q').textContent = `${fmt((P.qNow || 0) / 1000, 1)} kPa · 🔥${Math.round(P.reentryTemp || 20)}°C${shieldTag}`;
+    } else {
+      $('h-q').textContent = fmt((P.qNow || 0) / 1000, 1) + ' kPa';
+    }
+    $('h-pitch').textContent = fmt(THREE.MathUtils.radToDeg(P.ang), 1) + '°';
+    const m = this.met;
+    $('h-met').textContent = `T${m < 0 ? '-' : '+'}${String(Math.floor(Math.abs(m) / 3600)).padStart(2, '0')}:${String(Math.floor(Math.abs(m) / 60) % 60).padStart(2, '0')}:${String(Math.floor(Math.abs(m)) % 60).padStart(2, '0')}`;
+    // orbit
+    const el = vesselElements(P), R = P.body.R;
+    const curB = BODIES[P.ref] || BODIES.earth;
+    const curParent = curB.parent && curB.parent !== 'sun' ? BODIES[curB.parent] : null;
+    $('h-body').textContent = curParent ? `${curB.label} (${curParent.label})` : curB.label;
+    $('h-ap-alt').textContent = el.e < 1 ? fmt((el.ap - R) / 1000, 1) + ' km' : '∞';
+    $('h-pe-alt').textContent = (el.pe - R < 0 ? '−' : '') + fmt(Math.abs(el.pe - R) / 1000, 1) + ' km';
+    $('h-period').textContent = el.e < 1 ? this.fmtTime(el.period) : '—';
+    // target
+    const showT = (this.mission.id === 'iss' && !!this.flags.orbit) || !!this.docked;
+    $('h-target-box').classList.toggle('hidden', !showT);
+    if (showT) {
+      const ip = this.issOrbit.pos(this.simT), iv = this.issOrbit.vel(this.simT);
+      const d = this.docked ? 0 : Math.hypot(ip.x - P.s.x, ip.y - P.s.y, P.s.z);
+      const rv = this.docked ? 0 : Math.hypot(P.s.vx - iv.x, P.s.vy - iv.y, P.s.vz);
+      $('h-target-name').textContent = this.docked ? tr('🛰 ĐÃ GẮN ISS', '🛰 DOCKED · ISS') : '🎯 ISS';
+      $('h-tdist').textContent = this.docked ? tr('0.0 m (Khóa)', '0.0 m (Locked)') : (d >= 10000 ? fmt(d / 1000, 1) + ' km' : fmt(d, d < 100 ? 1 : 0) + ' m');
+      $('h-trel').textContent = fmt(rv, rv < 10 ? 2 : 0) + ' m/s';
+    }
+    // docking HUD
+    const dockShow = (this.mission.id === 'iss' && !!this.flags.orbit && (this.docked || (this.dockDist !== undefined && this.dockDist < 600))) || !!this.docked;
+    $('dock-hud').classList.toggle('hidden', !dockShow);
+    if (dockShow) {
+      const g = this.dockGeometry();
+      const ex = g.portV.x - g.portS.x, ey = g.portV.y - g.portS.y, ez = g.portV.z - g.portS.z;
+      const a = this.issOrbit.angle(this.simT), ux = Math.sin(a), uy = Math.cos(a);
+      const latY = ex * ux + ey * uy, along = ex * g.axisS.x + ey * g.axisS.y;
+      const rv = Math.hypot(P.s.vx - g.velS.x, P.s.vy - g.velS.y, P.s.vz - g.velS.z);
+      const att = THREE.MathUtils.radToDeg(wrapPi(P.beta - g.beta));
+      const sc = clamp(90 / Math.max(2, Math.abs(along), Math.abs(latY) * 3, Math.abs(ez) * 3), 0.5, 40);
+      $('dk-dot').style.transform = `translate(${clamp(ez * sc, -90, 90)}px, ${clamp(-latY * sc, -90, 90)}px)`;
+      $('dk-info').innerHTML = this.docked ? tr('🛰 ĐÃ GHÉP NỐI · ĐANG BAY CÙNG ISS', '🛰 DOCKED · ORBITING WITH ISS') : tr(`Khoảng cách <b>${fmt(Math.max(0, along), 1)} m</b> · lệch <b>${fmt(Math.hypot(latY, ez), 2)} m</b> · tốc độ <b>${fmt(rv, 2)} m/s</b> · góc <b>${fmt(att, 1)}°</b>`, `Dist <b>${fmt(Math.max(0, along), 1)} m</b> · offset <b>${fmt(Math.hypot(latY, ez), 2)} m</b> · vel <b>${fmt(rv, 2)} m/s</b> · ang <b>${fmt(att, 1)}°</b>`);
+    }
+    // systems
+    const sasModes = tr(SAS_MODES_VI, SAS_MODES_EN);
+    const camModes = tr(CAM_MODES_VI, CAM_MODES_EN);
+    $('h-sas').textContent = this.sas ? tr('BẬT', 'ON') : tr('TẮT', 'OFF');
+    $('h-sas').style.color = this.sas ? 'var(--ok)' : 'var(--danger)';
+    $('h-sasmode').textContent = sasModes[this.sasMode];
+    const isAutopilotLocked = !this.mission || this.mission.id === 'free' || !!this.mission.noAutopilot;
+    $('h-ap').textContent = isAutopilotLocked
+      ? '🔒'
+      : this.program
+        ? tr('BẬT', 'ON')
+        : tr('TẮT', 'OFF');
+    $('h-ap').style.color = isAutopilotLocked ? 'var(--danger)' : this.program ? 'var(--ok)' : 'var(--muted)';
+    const btnAp = $('btn-autopilot');
+    if (btnAp) {
+      if (isAutopilotLocked) {
+        const targetCount = this.mission?.id === 'alien5000' ? 5000 : this.mission?.id === 'alien1500' ? 1500 : this.mission?.id === 'alien500' ? 500 : 100;
+        btnAp.innerHTML = `🚫 ${tr('Khóa', 'Locked')} <kbd>G</kbd>`;
+        btnAp.title = this.mission?.category === 'rover'
+          ? tr('Nhiệm vụ Xe Rover không hỗ trợ tự lái', 'Autopilot disabled for Rover missions')
+          : this.mission?.noAutopilot
+            ? tr(`Nhiệm vụ diệt ${targetCount} Alien không hỗ trợ tự lái`, `Autopilot disabled for ${targetCount} Aliens mission`)
+            : tr('Chế độ bay tự do không hỗ trợ tự lái', 'Autopilot disabled in Free Flight');
+        btnAp.style.background = 'rgba(239,68,68,0.12)';
+        btnAp.style.borderColor = 'rgba(239,68,68,0.4)';
+        btnAp.style.color = '#f87171';
+        btnAp.style.opacity = '0.75';
+        btnAp.style.cursor = 'not-allowed';
+      } else {
+        btnAp.innerHTML = this.program
+          ? `🤖 ${tr('Đang lái', 'Active')} <kbd>G</kbd>`
+          : `🤖 ${tr('Tự lái', 'Auto')} <kbd>G</kbd>`;
+        btnAp.title = tr('Bật/tắt tự lái nhiệm vụ (G)', 'Toggle Mission Autopilot (G)');
+        btnAp.style.background = this.program ? 'rgba(74,222,128,0.28)' : 'rgba(74,222,128,0.12)';
+        btnAp.style.borderColor = this.program ? 'rgba(74,222,128,0.8)' : 'rgba(74,222,128,0.38)';
+        btnAp.style.color = '#86efac';
+        btnAp.style.opacity = '1';
+        btnAp.style.cursor = 'pointer';
+      }
+    }
+    $('h-warp').textContent = fmt(this.warp) + '×';
+    $('h-cam').textContent = camModes[this.camMode];
+    const killsEl = $('h-alien-kills');
+    if (killsEl) {
+      killsEl.textContent = this.aliensDisabled ? tr('TẮT', 'OFF') : String(this.aliensKilled || 0);
+      killsEl.style.color = this.aliensDisabled ? '#fbbf24' : '#4ade80';
+    }
+    this.syncAlienToggleUI();
+    const info = this.getCrewRoleInfo();
+    const maxAstro = this.maxAstronauts || 10;
+    const astroBar = $('astronaut-bar');
+    if (astroBar) {
+      astroBar.classList.toggle('hidden', !!info.hidden);
+      const barLbl = astroBar.querySelector('.astro-bar-label');
+      if (barLbl && !info.hidden) {
+        barLbl.textContent = tr(info.labelVi, info.labelEn);
+      }
+    }
+    const canBoardOnPad = !info.hidden && !!P && !P.crashed && (
+      P.isPlane
+        ? (!!P.landed && P.ref === 'earth' && Math.abs(P.planeRollSpeed || 0) < 15)
+        : P.isBoat
+          ? (!!P.landed && P.ref === 'earth')
+          : (this.phase === 'ready' && !this.lifted)
+    );
+    const isOnLaunchpad = !P?.isPlane && !P?.isBoat && (this.phase === 'ready' || this.phase === 'countdown' || (!this.lifted && P && P.ref === 'earth' && (P.clamped || (P.landed && P.landed.site === 'pad'))));
+    const isGasGiant = !!(P && BODIES[P.ref]?.gasGiant);
+    const curBodyDeployed = (this.deployedAstronauts || []).filter((a) => a.body === P?.ref).length;
+    const canShowDeploy = !info.hidden && !isOnLaunchpad && !!P && !P.crashed && P.ref !== 'sun' && !isGasGiant && !!P.landed && (!P.isPlane || Math.abs(P.planeRollSpeed || 0) < 15) && this.astronautsAboard > 0 && curBodyDeployed < maxAstro;
+    const fireMul = this.getCrewFireRateMultiplier();
+    const fireMulStr = Number.isInteger(fireMul) ? `${fireMul}.0` : fireMul.toFixed(1);
+    const fireRateTag = this.astronautsAboard > 0 ? ` ⚡${fireMulStr}×` : '';
+    const astroEl = $('h-astronauts');
+    if (astroEl) {
+      if (astroEl.parentElement) {
+        astroEl.parentElement.classList.toggle('hidden', !!info.hidden);
+        const sysLbl = astroEl.parentElement.querySelector('[data-i18n="launch.sysAstronauts"]');
+        if (sysLbl && !info.hidden) {
+          sysLbl.textContent = tr(info.hudLabelVi, info.hudLabelEn);
+        }
+      }
+      astroEl.textContent = curBodyDeployed > 0
+        ? `${this.astronautsAboard}/${maxAstro} (↓${curBodyDeployed})${fireRateTag}`
+        : `${this.astronautsAboard}/${maxAstro}${fireRateTag}`;
+    }
+    const astroBadge = $('astro-count-badge');
+    if (astroBadge) {
+      astroBadge.textContent = curBodyDeployed > 0
+        ? `${this.astronautsAboard}/${maxAstro} (↓${curBodyDeployed})${fireRateTag}`
+        : `${this.astronautsAboard}/${maxAstro}${fireRateTag}`;
+    }
+    const astroPadBox = $('astro-pad-btns');
+    if (astroPadBox) {
+      astroPadBox.classList.toggle('hidden', !canBoardOnPad);
+      astroPadBox.querySelectorAll('button[data-add-astro]').forEach((btn) => {
+        btn.disabled = !canBoardOnPad || this.astronautsAboard >= maxAstro;
+        if (!info.hidden) {
+          const n = btn.dataset.addAstro || '1';
+          btn.title = tr(
+            `Thêm ${n} ${info.nameVi} lên ${info.vesselVi} (Tối đa 10)`,
+            `Board ${n} ${info.namePluralEn} (Max 10)`
+          );
+        }
+      });
+    }
+    const astroDeployBox = $('astro-deploy-btns');
+    if (astroDeployBox) {
+      astroDeployBox.classList.toggle('hidden', !canShowDeploy);
+    }
+    const btnAstroDeploy = $('btn-astro-deploy');
+    if (btnAstroDeploy && canShowDeploy) {
+      const bLabel = (BODIES[P.ref] || BODIES.earth).label;
+      const toDeploy = Math.min(this.astronautsAboard, maxAstro - curBodyDeployed);
+      btnAstroDeploy.textContent = `${info.icon} ${tr('Thả', 'Deploy')} (${toDeploy})`;
+      btnAstroDeploy.title = `${bLabel} · ${this.astronautsAboard}/${maxAstro} ${info.icon}`;
+    }
+    const btnUfoEng = $('btn-ufo-engine');
+    if (btnUfoEng) {
+      const canSwitchUfoEng = this.hasRoyalUfoEngine(P);
+      btnUfoEng.classList.toggle('hidden', !canSwitchUfoEng);
+      if (canSwitchUfoEng) {
+        const isLaser = this.getUfoEngineMode(P) === 'laser';
+        btnUfoEng.classList.toggle('mode-laser', isLaser);
+        btnUfoEng.innerHTML = isLaser
+          ? `🔴 ${tr('Động Cơ Lazer', 'Laser Engine')} <kbd>E</kbd>`
+          : `🌀 ${tr('Phản Hấp Dẫn', 'Anti-Grav')} <kbd>E</kbd>`;
+        btnUfoEng.title = isLaser
+          ? tr('Đang dùng Động Cơ Lazer (càng tối bay càng nhanh, tối đa 3.25×) · Nhấn E để đổi sang Động Cơ Phản Hấp Dẫn', 'Active: Laser Engine (faster in darkness, up to 3.25×) · Press E to switch to Anti-Gravity Engine')
+          : tr('Đang dùng Động Cơ Phản Hấp Dẫn (trọng lực càng mạnh bay càng nhanh) · Nhấn E để đổi sang Động Cơ Lazer', 'Active: Anti-Gravity Engine (faster in strong gravity) · Press E to switch to Laser Engine');
+      }
+    }
+    const btnFire = $('btn-fire-weapon');
+    if (btnFire) {
+      const activeWeapons = this.getActivePlayerWeapons();
+      const wNames = [];
+      if (activeWeapons.some((w) => w.weaponType === 'laser')) wNames.push(tr('LAZER', 'LASER'));
+      if (activeWeapons.some((w) => w.weaponType === 'water')) wNames.push(tr('NƯỚC 1M PSI', '1M PSI WATER'));
+      if (activeWeapons.some((w) => w.weaponType === 'acid')) wNames.push(tr('AXIT', 'ACID'));
+      if (activeWeapons.some((w) => w.weaponType === 'electric')) wNames.push(tr('ĐIỆN 1M WATT', '1M WATT ELECTRIC'));
+      const wTag = wNames.length ? wNames.join(' + ') : tr('DỰ PHÒNG', 'BACKUP');
+      btnFire.innerHTML = `🔫 ${tr('Bắn', 'Fire')} <kbd>V</kbd>`;
+      const crewSuffix = info.hidden ? '' : ` (${this.astronautsAboard}/${maxAstro} ${info.icon})`;
+      btnFire.title = `${tr('Vũ khí', 'Weapons')}: ${wTag} · ${tr('Tốc độ bắn', 'Fire Rate')}: ${fireMulStr}×${crewSuffix}`;
+    }
+    const thr = this.docked ? 0 : (this.program ? (P.engineOn ? P.throttle : 0) : this.throttle);
+    $('h-thr').style.width = thr * 100 + '%';
+    $('h-thr-v').textContent = Math.round(thr * 100) + '%';
+    const prog = $('h-prog');
+    const lines = [];
+    if (this.docked) lines.push(`<b>🛰 ${tr('Đã gắn ISS', 'Docked · ISS')}</b><br>${tr('Đang bay cùng quỹ đạo ISS', 'Orbiting with ISS')}`);
+    else if (this.program && this.program.status) lines.push(`<b>${this.program.label || tr('Tự lái', 'Autopilot')}</b><br>${this.program.status() || ''}${this.program.wait && (this.program.phase === 'phasing' || this.program.phase === 'tliWait') ? ' · ' + this.fmtTime(this.program.wait) : ''}`);
+    if (b && b.rec) lines.push(`<b>S1</b> · ${b.rec.status()}`);
+    prog.innerHTML = lines.join('<hr>');
+    prog.classList.toggle('hidden', !lines.length);
+    // stages
+    let html = '';
+    const attached = (k) => P.owns(k);
+    for (let k = this.segs.length - 1; k >= 0; k--) {
+      const att = attached(k);
+      const active = k === P.activeSeg && att;
+      const f = this.fuelMax[k] > 0 ? this.fuel[k] / this.fuelMax[k] : 0;
+      const sInf = this.segInfo ? this.segInfo[k] : null;
+      const hasSolarBat = att && sInf && sInf.solarOnBattery > 0 && sInf.batteryCount > 0;
+      const chgRate = hasSolarBat && P.solarChargeRate ? (P.solarChargeRate[k] || 0) : 0;
+      const solarBadge = hasSolarBat
+        ? (chgRate > 0.01 && this.fuel[k] < this.fuelMax[k] - 0.05
+          ? ` <span style="color:#4ade80;font-size:10px;font-weight:700">☀️⚡+${fmt(chgRate, 1)}t/s</span>`
+          : ` <span style="color:#38bdf8;font-size:10px" title="${tr('Pin tự hồi năng lượng nhờ Solar Panel', 'Battery auto-recharges via Solar Panel')}">☀️⚡</span>`)
+        : '';
+      const hasGunBat = att && sInf && sInf.hasGunBattery;
+      const gunBatBadge = hasGunBat
+        ? ` <span style="color:#22d3ee;font-size:10px" title="${tr('Pin Siêu Siêu Nhỏ cấp điện cho Súng', 'Ultra-Tiny Gun Battery powering Weapons')}">🔋🔫</span>`
+        : '';
+      const alienDrain = active ? this.getAlienFuelDrainInfo(P) : null;
+      const alienDrainBadge = alienDrain && alienDrain.count > 0 && this.fuelMax[k] > 0
+        ? ` <span style="color:#fb7185;font-size:10px;font-weight:700" title="${tr(`Có ${alienDrain.count} Alien xung quanh làm hao nhiên liệu/pin nhanh gấp ${fmt(alienDrain.drainMul, 2)}×!`, `${alienDrain.count} nearby Aliens accelerating fuel/battery drain by ${fmt(alienDrain.drainMul, 2)}×!`)}">👽⚡-${fmt(alienDrain.drainMul, 1)}×</span>`
+        : '';
+      const royalModeBadge = att && sInf && sInf.hasRoyalUfo
+        ? (sInf.ufoEngineMode === 'laser'
+          ? ` <span style="color:#fb7185;font-size:10px;font-weight:700" title="${tr('Động cơ Lazer (Phím E để chuyển sang Phản Hấp Dẫn)', 'Laser Engine (Press E to switch to Anti-Gravity)')}">🔴LZ</span>`
+          : ` <span style="color:#38bdf8;font-size:10px;font-weight:700" title="${tr('Động cơ Phản Hấp Dẫn (Phím E để chuyển sang Lazer)', 'Anti-Gravity Engine (Press E to switch to Laser)')}">🌀AG</span>`)
+        : '';
+      const barStyle = hasSolarBat && chgRate > 0.5 && this.fuel[k] < this.fuelMax[k] - 0.05
+        ? `width:${f * 100}%;background:linear-gradient(90deg,#22d3ee,#4ade80);box-shadow:0 0 8px rgba(74,222,128,0.65)`
+        : `width:${f * 100}%`;
+      const isBatStage = !!(sInf && sInf.useBatteryFuel);
+      const fuelValTxt = this.fuelMax[k] > 0
+        ? `${isBatStage ? '🔋 ' : ''}${fmt(this.fuel[k], 1)} t`
+        : '—';
+      html += `<div class="fuel-row ${active ? 'active' : ''} ${att ? '' : 'gone'}"><div class="fr-top"><span>S${this.segs.length - k}${active ? ' ▶' : ''}${royalModeBadge}${solarBadge}${gunBatBadge}${alienDrainBadge}</span><span>${fuelValTxt}</span></div><div class="fr-bar"><div style="${barStyle}"></div></div>`;
+      for (const bb of this.rocket.boosters) if (bb.seg === k) {
+        html += `<div class="fr-top" style="margin-top:3px;font-size:10px;opacity:${bb.attached ? 1 : 0.35}"><span>↳ SRB</span><span>${fmt(bb.fuel, 1)} t</span></div><div class="fr-bar boost"><div style="width:${(bb.fuel / bb.fuelMax) * 100}%"></div></div>`;
+      }
+      html += '</div>';
+    }
+    $('h-stages').innerHTML = html;
+  }
+}

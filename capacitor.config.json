@@ -1,0 +1,19 @@
+{
+  "appId": "xyz.benteck.rocketforge",
+  "appName": "Rocket Forge",
+  "webDir": "dist",
+  "backgroundColor": "#050811",
+  "ios": {
+    "contentInset": "never",
+    "allowsLinkPreview": false,
+    "scrollEnabled": false,
+    "preferredContentMode": "mobile",
+    "limitsNavigationsToAppBoundDomains": false
+  },
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": true,
+      "style": "DARK"
+    }
+  }
+}

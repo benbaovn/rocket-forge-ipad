@@ -1,0 +1,2616 @@
+// 3D Orbital Tracking Station Map View (Three.js WebGL + 2D HUD Overlay)
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { R_E, R_M, R_SUN, EARTH_A, EARTH_SOI, SUN_SOI, ASTEROID_BELT_INNER, ASTEROID_BELT_OUTER, KUIPER_BELT_INNER, KUIPER_BELT_OUTER, OORT_CLOUD_INNER, OORT_CLOUD_OUTER, MOON_A, MOON_SOI, ATM_TOP, ISS_R, BODIES, NON_EARTH_BODIES } from '../sim/constants.js';
+import { moonPos, moonAngle, bodyPos, bodyAngle, helioPos } from '../sim/orbit.js';
+import { createRealEarthTexture, FLORIDA_LAT_DEG } from '../fx/earth.js';
+import { tr, getLang } from '../i18n.js';
+
+// 1 unit in 3D scene = 1 kilometre (1,000 metres) inside the Solar System.
+// Beyond the Solar System (SUN_SOI), radial distance is smoothly compressed logarithmically
+// so interstellar spacecraft (even at 10^17 km) stay visible right outside the Oort Cloud
+// without shrinking the Solar System into a single pixel or breaking 32-bit WebGL float precision.
+const SCALE = 0.001;
+const CERES_MAP_Y = -22800; // Ceres positioned 6x lower underneath the Asteroid Belt (Vành đai đá) on the 3D Map
+const R_INTERSTELLAR_START = SUN_SOI * SCALE * 1.02;
+const R_INTERSTELLAR_SPAN = 220000;
+const to3D = (x, y, z = 0, out = new THREE.Vector3()) => {
+  let vx = x * SCALE;
+  let vy = (z || 0) * SCALE;
+  let vz = -(y || 0) * SCALE;
+  const r = Math.hypot(vx, vy, vz);
+  if (r > R_INTERSTELLAR_START && isFinite(r)) {
+    const excess = (r - R_INTERSTELLAR_START) / R_INTERSTELLAR_START;
+    const rCompressed = R_INTERSTELLAR_START + R_INTERSTELLAR_SPAN * Math.log10(1 + excess);
+    const k = rCompressed / r;
+    vx *= k;
+    vy *= k;
+    vz *= k;
+  }
+  return out.set(vx, vy, vz);
+};
+const fmtKm = (m) => (m >= 1e6 ? (m / 1e6).toFixed(2) + ' Mm' : m >= 1e4 ? (m / 1000).toFixed(0) + ' km' : (m / 1000).toFixed(1) + ' km');
+const fmt = (v, d = 0) => (typeof v === 'number' && isFinite(v) ? v.toLocaleString('vi-VN', { maximumFractionDigits: d, minimumFractionDigits: d }) : '—');
+
+/** Real-world Earth surface texture (equirectangular, aligned with Cape Canaveral, Florida launchpad) */
+function createEarthTexture() {
+  return createRealEarthTexture({ forMapView: true });
+}
+
+/** Procedural lunar surface texture */
+function createMoonTexture() {
+  const w = 512, h = 256;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+
+  const img = ctx.createImageData(w, h);
+  const data = img.data;
+  for (let y = 0; y < h; y++) {
+    const lat = (y / h - 0.5) * Math.PI;
+    const cosLat = Math.cos(lat);
+    for (let x = 0; x < w; x++) {
+      const lon = (x / w - 0.5) * Math.PI * 2;
+      const idx = (y * w + x) * 4;
+
+      const nx = cosLat * Math.sin(lon);
+      const ny = Math.sin(lat);
+      const nz = cosLat * Math.cos(lon);
+
+      let n = Math.sin(nx * 3.0 + 1.2) * Math.cos(ny * 3.0) + Math.sin(nz * 2.5) * 0.38;
+      n += Math.sin(nx * 7.5) * Math.cos(ny * 8.2) * 0.18;
+      n += Math.sin(nx * 20.0 + nz * 18.0) * 0.08;
+
+      let v = 155 + n * 45;
+      if (n < -0.12) v = 80 + (n + 0.12) * 28; // lunar maria
+      v = Math.max(45, Math.min(240, v));
+
+      data[idx] = v; data[idx + 1] = v * 0.98; data[idx + 2] = v * 0.95; data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // Lunar impact craters
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+  ctx.fillStyle = 'rgba(30, 30, 30, 0.35)';
+  for (let i = 0; i < 30; i++) {
+    const cx = (i * 71) % w;
+    const cy = (i * 113) % h;
+    const r = 3 + (i % 6) * 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Thick screen-space Orbit Ring Line2 that never gets occluded and is visible from all angles */
+function createOrbitLine2(radius, color = 0x38bdf8, linewidth = 2.0, opacity = 0.5, segments = 160) {
+  const pts = [];
+  for (let i = 0; i <= segments; i++) {
+    const th = (i / segments) * Math.PI * 2;
+    pts.push(Math.cos(th) * radius, 0, Math.sin(th) * radius);
+  }
+  const geo = new LineGeometry();
+  geo.setPositions(pts);
+  const mat = new LineMaterial({
+    color,
+    linewidth,
+    transparent: true,
+    opacity,
+    depthTest: false,
+    depthWrite: false,
+  });
+  mat.resolution.set(innerWidth, innerHeight);
+  const line = new Line2(geo, mat);
+  line.frustumCulled = false;
+  line.renderOrder = 992;
+  return line;
+}
+
+export class MapView {
+  constructor(containerOrCanvas, legend) {
+    this.container = containerOrCanvas;
+    this.legend = legend;
+    this.visible = false;
+    this.focus = 'vessel'; // 'vessel' | 'earth' | 'moon' | 'iss'
+    this.lastState = null;
+    this.lineMaterials = [];
+
+    // Resolve DOM elements
+    if (this.container.tagName === 'CANVAS') {
+      this.glCanvas = this.container;
+      this.hudCanvas = document.createElement('canvas');
+      this.hudCanvas.id = 'map-hud';
+      this.container.parentElement.appendChild(this.hudCanvas);
+    } else {
+      this.glCanvas = this.container.querySelector('#map-gl') || this.container.querySelector('canvas');
+      this.hudCanvas = this.container.querySelector('#map-hud');
+      this.focusBar = this.container.querySelector('#map-focus-bar');
+      this.telemetryBox = this.container.querySelector('#map-tel-rows');
+      this.objListBox = this.container.querySelector('#map-obj-list');
+      this.objPopup = this.container.querySelector('#map-obj-popup');
+      this.mopName = this.container.querySelector('#mop-name');
+      this.mopMeta = this.container.querySelector('#mop-meta');
+      this.btnDeleteObj = this.container.querySelector('#btn-map-delete');
+      this.btnMapTeleport = this.container.querySelector('#btn-map-teleport');
+      this.closeBtn = this.container.querySelector('#map-close-btn');
+    }
+    this.selectedObjectId = null;
+    this.onDeleteObject = null;
+    this.onTeleport = null;
+    this.otherPool = [];
+
+    if (!this.hudCanvas) {
+      this.hudCanvas = document.createElement('canvas');
+      this.hudCanvas.id = 'map-hud';
+      this.container.appendChild(this.hudCanvas);
+    }
+    this.hudCtx = this.hudCanvas.getContext('2d');
+
+    // Setup Three.js WebGL Scene
+    this.initThree();
+
+    // Hook DOM UI events
+    this.initEvents();
+  }
+
+  initThree() {
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x02050e);
+
+    // Camera
+    const aspect = innerWidth / innerHeight;
+    this.camera = new THREE.PerspectiveCamera(45, aspect, 5, 1e12);
+    this.camera.position.set(0, 15000, 25000);
+    this.maxOrbitExtent = 1e6;
+
+    // Renderer
+    this.renderer = new THREE.WebGLRenderer({
+      canvas: this.glCanvas,
+      antialias: true,
+      alpha: false,
+      powerPreference: 'high-performance',
+    });
+    this.renderer.setSize(innerWidth, innerHeight);
+    // second WebGL context: keep it at 1× pixel ratio and shrink to 1×1 while hidden to save VRAM
+    this.renderer.setPixelRatio(1);
+    this.renderer.setSize(1, 1, false);
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 0.90;
+
+    // Controls
+    this.controls = new OrbitControls(this.camera, this.glCanvas);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+    this.controls.minDistance = 5;
+    this.controls.maxDistance = Infinity;
+    this.controls.enablePan = true;
+    this.controls.screenSpacePanning = true;
+
+    // Lights
+    this.ambientLight = new THREE.AmbientLight(0x4b6584, 0.85);
+    this.scene.add(this.ambientLight);
+
+    this.sunLight = new THREE.PointLight(0xfff4d6, 2.0, 0, 0);
+    this.sunLight.position.set(0, 0, 0);
+    this.scene.add(this.sunLight);
+
+    this.camLight = new THREE.DirectionalLight(0xe2e8f0, 0.65);
+    this.scene.add(this.camLight);
+
+    // Starfield
+    this.initStarfield();
+
+    // Celestial Bodies & Hierarchical Solar System
+    this.initSun();
+    this.initEarth();
+    this.initMoon();
+    this.initPlanets();
+    this.initISS();
+    this.initGrid();
+    this.initVesselMarker();
+    this.initTrajectoryObjects();
+
+    // Dynamic targets registry for HUD projection
+    this.hudTargets = [];
+  }
+
+  initStarfield() {
+    const starCount = 2200;
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(starCount * 3);
+    const col = new Float32Array(starCount * 3);
+    const r = 3.2e6;
+
+    for (let i = 0; i < starCount; i++) {
+      const u = Math.random(), v = Math.random();
+      const th = u * Math.PI * 2, ph = Math.acos(2 * v - 1);
+      pos[i * 3] = r * Math.sin(ph) * Math.cos(th);
+      pos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+      pos[i * 3 + 2] = r * Math.cos(ph);
+
+      const tint = 0.75 + Math.random() * 0.25;
+      col[i * 3] = tint * 0.95;
+      col[i * 3 + 1] = tint * 0.98;
+      col[i * 3 + 2] = tint;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    const mat = new THREE.PointsMaterial({ size: 2.2, vertexColors: true, sizeAttenuation: false, transparent: true, opacity: 0.8, depthTest: false, depthWrite: false });
+    this.starfield = new THREE.Points(geo, mat);
+    this.starfield.frustumCulled = false;
+    this.starfield.renderOrder = -10;
+    this.scene.add(this.starfield);
+  }
+
+  initSun() {
+    this.sunGroup = new THREE.Group();
+    this.scene.add(this.sunGroup);
+
+    const sunR = R_SUN * SCALE;
+    const sunGeo = new THREE.SphereGeometry(sunR, 64, 32);
+    const sunTex = this.createPlanetTexture('sun');
+    const sunMat = new THREE.MeshBasicMaterial({
+      map: sunTex,
+    });
+    this.sunMesh = new THREE.Mesh(sunGeo, sunMat);
+    this.sunGroup.add(this.sunMesh);
+
+    // Glowing Solar Corona Halo
+    const coronaGeo = new THREE.SphereGeometry(sunR * 1.38, 48, 24);
+    const coronaMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      vertexShader: `
+        varying vec3 vNormal;
+        varying vec3 vWorld;
+        void main() {
+          vNormal = normalize(mat3(modelMatrix) * normal);
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorld = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vNormal;
+        varying vec3 vWorld;
+        void main() {
+          vec3 V = normalize(cameraPosition - vWorld);
+          float rim = max(0.0, dot(V, -normalize(vNormal)));
+          float glow = pow(rim, 2.5);
+          vec3 col = mix(vec3(1.0, 0.42, 0.08), vec3(1.0, 0.92, 0.45), glow);
+          gl_FragColor = vec4(col, glow * 0.9);
+        }
+      `,
+    });
+    this.sunCorona = new THREE.Mesh(coronaGeo, coronaMat);
+    this.sunGroup.add(this.sunCorona);
+
+    // Sun Sphere of Influence (SOI) 3D wireframe shell encompassing the entire Solar System
+    const sunSoiGeo = new THREE.SphereGeometry(SUN_SOI * SCALE, 44, 22);
+    const sunSoiMat = new THREE.MeshBasicMaterial({
+      color: 0xfacc15,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.16,
+      depthTest: false,
+    });
+    this.sunSOI = new THREE.Mesh(sunSoiGeo, sunSoiMat);
+    this.sunSOI.renderOrder = 983;
+    this.sunGroup.add(this.sunSOI);
+
+    // Main Asteroid Belt between Mars (67,000 km) and Jupiter (115,000 km)
+    this.initAsteroidBelt();
+    // Outer Kuiper Belt encompassing Pluto, Haumea, Makemake & Eris
+    this.initKuiperBelt();
+    // Spherical 3D Oort Cloud (Hills Cloud & Outer Cometary Shell) at the edge of the Solar System
+    this.initOortCloud();
+  }
+
+  initOortCloud() {
+    this.oortCloudGroup = new THREE.Group();
+    this.sunGroup.add(this.oortCloudGroup);
+
+    const rInner = OORT_CLOUD_INNER * SCALE;
+    const rOuter = OORT_CLOUD_OUTER * SCALE;
+    const rHillsOuter = rInner + (rOuter - rInner) * 0.42;
+
+    // 1. Inner Hills Cloud torus disc band near the ecliptic plane
+    const cv = document.createElement('canvas');
+    cv.width = 512;
+    cv.height = 32;
+    const ctx = cv.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 512, 0);
+    grad.addColorStop(0.0, 'rgba(165,243,252,0)');
+    grad.addColorStop(0.18, 'rgba(165,243,252,0.18)');
+    grad.addColorStop(0.45, 'rgba(192,132,252,0.22)');
+    grad.addColorStop(0.76, 'rgba(125,211,252,0.14)');
+    grad.addColorStop(1.0, 'rgba(165,243,252,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 512, 32);
+    const hillsTex = new THREE.CanvasTexture(cv);
+
+    const hillsGeo = new THREE.RingGeometry(rInner, rHillsOuter, 180, 2);
+    const hPos = hillsGeo.attributes.position;
+    const hUv = hillsGeo.attributes.uv;
+    for (let i = 0; i < hPos.count; i++) {
+      const vx = hPos.getX(i), vy = hPos.getY(i);
+      const u = (Math.hypot(vx, vy) - rInner) / Math.max(1e-5, rHillsOuter - rInner);
+      hUv.setXY(i, u, 0.5);
+    }
+    hillsGeo.rotateX(-Math.PI / 2);
+    const hillsMat = new THREE.MeshBasicMaterial({
+      map: hillsTex,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.65,
+      depthWrite: false,
+    });
+    this.oortCloudGroup.add(new THREE.Mesh(hillsGeo, hillsMat));
+
+    // 2. 3D Faceted Icy Cometary Nuclei (InstancedMesh across both the Hills Torus and Full 3D Spherical Shell)
+    const makeCometGeo = (seed) => {
+      const g = new THREE.IcosahedronGeometry(1, 1);
+      const p = g.attributes.position;
+      const v = new THREE.Vector3();
+      for (let i = 0; i < p.count; i++) {
+        v.fromBufferAttribute(p, i);
+        const n = v.clone().normalize();
+        const noise =
+          1 +
+          0.34 * Math.sin(n.x * 4.1 + seed) * Math.cos(n.y * 3.8 - seed) +
+          0.20 * Math.cos(n.z * 5.7 + seed * 1.3);
+        v.copy(n).multiplyScalar(noise);
+        v.x *= 1.22; // elongated bilobed cometary nucleus shape (like 67P)
+        v.y *= 0.76;
+        p.setXYZ(i, v.x, v.y, v.z);
+      }
+      g.computeVertexNormals();
+      return g;
+    };
+
+    const cometMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.55,
+      metalness: 0.18,
+      emissive: 0x0f172a,
+      flatShading: true,
+    });
+
+    let seed = 91827;
+    const rnd = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+
+    const N_PER_SHAPE = 720;
+    const dummy = new THREE.Object3D();
+    const col = new THREE.Color();
+    for (let sIdx = 0; sIdx < 3; sIdx++) {
+      const geo = makeCometGeo(sIdx * 6.3 + 1.9);
+      const im = new THREE.InstancedMesh(geo, cometMat, N_PER_SHAPE);
+      for (let i = 0; i < N_PER_SHAPE; i++) {
+        const theta = rnd() * Math.PI * 2;
+        const isHills = i < N_PER_SHAPE * 0.36;
+        let r, x, y, z;
+        if (isHills) {
+          // Inner Hills Cloud thick torus
+          r = rInner + Math.pow(rnd(), 0.85) * (rHillsOuter - rInner);
+          const lat = (rnd() - 0.5) * 0.58;
+          x = r * Math.cos(lat) * Math.cos(theta);
+          y = r * Math.sin(lat);
+          z = r * Math.cos(lat) * Math.sin(theta);
+        } else {
+          // Full 3D Outer Spherical Oort Cloud shell surrounding the entire Solar System
+          r = rInner + rnd() * (rOuter - rInner);
+          const cosPhi = 2 * rnd() - 1;
+          const sinPhi = Math.sqrt(Math.max(0, 1 - cosPhi * cosPhi));
+          x = r * sinPhi * Math.cos(theta);
+          y = r * cosPhi;
+          z = r * sinPhi * Math.sin(theta);
+        }
+        dummy.position.set(x, y, z);
+        dummy.rotation.set(rnd() * Math.PI * 2, rnd() * Math.PI * 2, rnd() * Math.PI * 2);
+        const sizeBase = rnd() < 0.08 ? 820 + rnd() * 680 : 210 + Math.pow(rnd(), 1.8) * 540;
+        dummy.scale.set(
+          sizeBase * (0.8 + rnd() * 0.6),
+          sizeBase * (0.7 + rnd() * 0.5),
+          sizeBase * (0.8 + rnd() * 0.6)
+        );
+        dummy.updateMatrix();
+        im.setMatrixAt(i, dummy.matrix);
+
+        const cPick = rnd();
+        if (cPick < 0.28) {
+          // Pale violet-cyan cometary volatile ice (CH4 / CO / NH3)
+          col.setRGB(0.76 + rnd() * 0.2, 0.72 + rnd() * 0.22, 0.96 + rnd() * 0.04);
+        } else if (cPick < 0.45) {
+          // Dark organic / dusty cometary crust
+          const d = 0.52 + rnd() * 0.25;
+          col.setRGB(d * 0.92, d * 0.96, d * 1.05);
+        } else {
+          // Bright pristine H2O / N2 ice comet nucleus
+          const shade = 0.74 + rnd() * 0.26;
+          col.setRGB(shade * 0.82, shade * 0.96, Math.min(1, shade * 1.08));
+        }
+        im.setColorAt(i, col);
+      }
+      im.instanceMatrix.needsUpdate = true;
+      if (im.instanceColor) im.instanceColor.needsUpdate = true;
+      this.oortCloudGroup.add(im);
+    }
+
+    // 4. Shimmering 3D Spherical Cometary Dust & Micro-Comet Cloud (Points)
+    const dustCount = 2600;
+    const dustGeo = new THREE.BufferGeometry();
+    const dustPos = new Float32Array(dustCount * 3);
+    const dustCol = new Float32Array(dustCount * 3);
+    for (let i = 0; i < dustCount; i++) {
+      const theta = rnd() * Math.PI * 2;
+      const r = rInner + rnd() * (rOuter - rInner);
+      const cosPhi = 2 * rnd() - 1;
+      const sinPhi = Math.sqrt(Math.max(0, 1 - cosPhi * cosPhi));
+      dustPos[i * 3] = r * sinPhi * Math.cos(theta);
+      dustPos[i * 3 + 1] = r * cosPhi;
+      dustPos[i * 3 + 2] = r * sinPhi * Math.sin(theta);
+
+      const tint = 0.72 + rnd() * 0.28;
+      dustCol[i * 3] = tint * 0.75;
+      dustCol[i * 3 + 1] = tint * 0.94;
+      dustCol[i * 3 + 2] = tint;
+    }
+    dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+    dustGeo.setAttribute('color', new THREE.BufferAttribute(dustCol, 3));
+    const dustMat = new THREE.PointsMaterial({
+      size: 2.6,
+      vertexColors: true,
+      sizeAttenuation: false,
+      transparent: true,
+      opacity: 0.68,
+      depthWrite: false,
+    });
+    const dustPoints = new THREE.Points(dustGeo, dustMat);
+    this.oortCloudGroup.add(dustPoints);
+  }
+
+  initKuiperBelt() {
+    this.kuiperBeltGroup = new THREE.Group();
+    this.sunGroup.add(this.kuiperBeltGroup);
+
+    const rInner = KUIPER_BELT_INNER * SCALE;
+    const rOuter = KUIPER_BELT_OUTER * SCALE;
+
+    // 1. Icy concentric Kuiper Belt band with resonant gaps (2:3 plutinos, classical belt, 1:2 twotinos, scattered disc)
+    const cv = document.createElement('canvas');
+    cv.width = 512;
+    cv.height = 32;
+    const ctx = cv.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 512, 0);
+    grad.addColorStop(0.0, 'rgba(125,211,252,0)');
+    grad.addColorStop(0.12, 'rgba(186,230,253,0.22)');
+    grad.addColorStop(0.28, 'rgba(224,242,254,0.34)');
+    grad.addColorStop(0.39, 'rgba(56,189,248,0.06)'); // resonant gap
+    grad.addColorStop(0.54, 'rgba(186,230,253,0.36)');
+    grad.addColorStop(0.68, 'rgba(71,85,105,0.08)');  // Kuiper cliff gap
+    grad.addColorStop(0.84, 'rgba(147,197,253,0.25)');
+    grad.addColorStop(1.0, 'rgba(125,211,252,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 512, 32);
+    const beltTex = new THREE.CanvasTexture(cv);
+
+    const bandGeo = new THREE.RingGeometry(rInner, rOuter, 180, 2);
+    const pos = bandGeo.attributes.position;
+    const uv = bandGeo.attributes.uv;
+    for (let i = 0; i < pos.count; i++) {
+      const vx = pos.getX(i), vy = pos.getY(i);
+      const u = (Math.hypot(vx, vy) - rInner) / Math.max(1e-5, rOuter - rInner);
+      uv.setXY(i, u, 0.5);
+    }
+    bandGeo.rotateX(-Math.PI / 2);
+    bandGeo.translate(0, 420, 0);
+    const bandMat = new THREE.MeshBasicMaterial({
+      map: beltTex,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.72,
+      depthWrite: false,
+    });
+    this.kuiperBeltGroup.add(new THREE.Mesh(bandGeo, bandMat));
+
+    // 2. 3D Faceted Icy Kuiper Belt Objects (KBOs / Cometary Nuclei)
+    const makeIceGeo = (seed) => {
+      const g = new THREE.IcosahedronGeometry(1, 1);
+      const p = g.attributes.position;
+      const v = new THREE.Vector3();
+      for (let i = 0; i < p.count; i++) {
+        v.fromBufferAttribute(p, i);
+        const n = v.clone().normalize();
+        const noise =
+          1 +
+          0.30 * Math.sin(n.x * 3.9 + seed) * Math.cos(n.y * 4.3 - seed) +
+          0.16 * Math.cos(n.z * 6.1 + seed * 1.5);
+        v.copy(n).multiplyScalar(noise);
+        v.y *= 0.72;
+        p.setXYZ(i, v.x, v.y, v.z);
+      }
+      g.computeVertexNormals();
+      return g;
+    };
+
+    const iceMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.62,
+      metalness: 0.16,
+      flatShading: true,
+    });
+
+    let seed = 7331;
+    const rnd = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+
+    const N_PER_SHAPE = 520;
+    const dummy = new THREE.Object3D();
+    const col = new THREE.Color();
+    for (let sIdx = 0; sIdx < 3; sIdx++) {
+      const geo = makeIceGeo(sIdx * 5.1 + 2.3);
+      const im = new THREE.InstancedMesh(geo, iceMat, N_PER_SHAPE);
+      for (let i = 0; i < N_PER_SHAPE; i++) {
+        const ang = rnd() * Math.PI * 2;
+        const u = 0.5 + (rnd() - 0.5) * 0.68 + (rnd() - 0.5) * 0.32;
+        const r = rInner + Math.max(0.01, Math.min(0.99, u)) * (rOuter - rInner);
+        const ySpread = (rnd() - 0.5) * 6500;
+        dummy.position.set(Math.cos(ang) * r, ySpread, Math.sin(ang) * r);
+        dummy.rotation.set(rnd() * Math.PI * 2, rnd() * Math.PI * 2, rnd() * Math.PI * 2);
+        const sizeBase = rnd() < 0.06 ? 420 + rnd() * 380 : 95 + Math.pow(rnd(), 2.0) * 320;
+        dummy.scale.set(
+          sizeBase * (0.75 + rnd() * 0.6),
+          sizeBase * (0.65 + rnd() * 0.5),
+          sizeBase * (0.75 + rnd() * 0.6)
+        );
+        dummy.updateMatrix();
+        im.setMatrixAt(i, dummy.matrix);
+
+        if (rnd() < 0.22) {
+          // Reddish tholin-coated KBO
+          col.setRGB(0.84 + rnd() * 0.15, 0.48 + rnd() * 0.16, 0.36 + rnd() * 0.12);
+        } else {
+          // Frosty cyan-white icy KBO
+          const shade = 0.65 + rnd() * 0.34;
+          col.setRGB(shade * 0.86, shade * 0.95, Math.min(1, shade * 1.06));
+        }
+        im.setColorAt(i, col);
+      }
+      im.instanceMatrix.needsUpdate = true;
+      if (im.instanceColor) im.instanceColor.needsUpdate = true;
+      this.kuiperBeltGroup.add(im);
+    }
+  }
+
+  initAsteroidBelt() {
+    this.asteroidBeltGroup = new THREE.Group();
+    this.sunGroup.add(this.asteroidBeltGroup);
+
+    const rInner = ASTEROID_BELT_INNER * SCALE;
+    const rOuter = ASTEROID_BELT_OUTER * SCALE;
+
+    // 1. Dusty concentric gravel/debris band with Kirkwood gaps
+    const cv = document.createElement('canvas');
+    cv.width = 512;
+    cv.height = 32;
+    const ctx = cv.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 512, 0);
+    grad.addColorStop(0.0, 'rgba(168,162,158,0)');
+    grad.addColorStop(0.14, 'rgba(180,168,152,0.22)');
+    grad.addColorStop(0.32, 'rgba(214,211,209,0.34)');
+    grad.addColorStop(0.41, 'rgba(90,85,80,0.06)'); // Kirkwood gap
+    grad.addColorStop(0.55, 'rgba(195,184,168,0.36)');
+    grad.addColorStop(0.71, 'rgba(100,94,88,0.08)'); // Kirkwood gap
+    grad.addColorStop(0.84, 'rgba(175,166,154,0.26)');
+    grad.addColorStop(1.0, 'rgba(168,162,158,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 512, 32);
+    const beltTex = new THREE.CanvasTexture(cv);
+
+    const bandGeo = new THREE.RingGeometry(rInner, rOuter, 144, 2);
+    const pos = bandGeo.attributes.position;
+    const uv = bandGeo.attributes.uv;
+    for (let i = 0; i < pos.count; i++) {
+      const vx = pos.getX(i), vy = pos.getY(i);
+      const u = (Math.hypot(vx, vy) - rInner) / Math.max(1e-5, rOuter - rInner);
+      uv.setXY(i, u, 0.5);
+    }
+    bandGeo.rotateX(-Math.PI / 2);
+    bandGeo.translate(0, 550, 0);
+    const bandMat = new THREE.MeshBasicMaterial({
+      map: beltTex,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.75,
+      depthWrite: false,
+    });
+    this.asteroidBeltGroup.add(new THREE.Mesh(bandGeo, bandMat));
+
+    // 2. 3D Faceted Rocky Asteroids (InstancedMesh)
+    const makeRockGeo = (seed) => {
+      const g = new THREE.IcosahedronGeometry(1, 1);
+      const p = g.attributes.position;
+      const v = new THREE.Vector3();
+      for (let i = 0; i < p.count; i++) {
+        v.fromBufferAttribute(p, i);
+        const n = v.clone().normalize();
+        const noise =
+          1 +
+          0.32 * Math.sin(n.x * 3.7 + seed) * Math.cos(n.y * 4.1 - seed) +
+          0.18 * Math.cos(n.z * 6.3 + seed * 1.7);
+        v.copy(n).multiplyScalar(noise);
+        v.y *= 0.68;
+        p.setXYZ(i, v.x, v.y, v.z);
+      }
+      g.computeVertexNormals();
+      return g;
+    };
+
+    const rockMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.92,
+      metalness: 0.12,
+      flatShading: true,
+    });
+
+    let seed = 1337;
+    const rnd = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+
+    const N_PER_SHAPE = 380;
+    const dummy = new THREE.Object3D();
+    const col = new THREE.Color();
+    for (let sIdx = 0; sIdx < 3; sIdx++) {
+      const geo = makeRockGeo(sIdx * 4.3 + 1.1);
+      const im = new THREE.InstancedMesh(geo, rockMat, N_PER_SHAPE);
+      for (let i = 0; i < N_PER_SHAPE; i++) {
+        const ang = rnd() * Math.PI * 2;
+        // Concentrate slightly toward middle of belt with natural radial spread
+        const u = 0.5 + (rnd() - 0.5) * 0.65 + (rnd() - 0.5) * 0.35;
+        const r = rInner + Math.max(0.02, Math.min(0.98, u)) * (rOuter - rInner);
+        const ySpread = 220 + rnd() * 2100;
+        dummy.position.set(Math.cos(ang) * r, ySpread, Math.sin(ang) * r);
+        dummy.rotation.set(rnd() * Math.PI * 2, rnd() * Math.PI * 2, rnd() * Math.PI * 2);
+        // Power-law size distribution with a few large dwarf/Ceres-like boulders
+        const sizeBase = rnd() < 0.04 ? 260 + rnd() * 220 : 48 + Math.pow(rnd(), 2.2) * 190;
+        dummy.scale.set(
+          sizeBase * (0.75 + rnd() * 0.6),
+          sizeBase * (0.65 + rnd() * 0.5),
+          sizeBase * (0.75 + rnd() * 0.6)
+        );
+        dummy.updateMatrix();
+        im.setMatrixAt(i, dummy.matrix);
+
+        const shade = 0.48 + rnd() * 0.42;
+        const warm = rnd() * 0.08;
+        col.setRGB(shade + warm, shade + warm * 0.4, shade - warm * 0.3);
+        im.setColorAt(i, col);
+      }
+      im.instanceMatrix.needsUpdate = true;
+      if (im.instanceColor) im.instanceColor.needsUpdate = true;
+      this.asteroidBeltGroup.add(im);
+    }
+  }
+
+  initEarth() {
+    this.earthGroup = new THREE.Group();
+    this.scene.add(this.earthGroup);
+
+    // Earth Orbit Ring around the Sun
+    this.earthOrbitRing = createOrbitLine2(EARTH_A * SCALE, 0x38bdf8, 2.2, 0.55, 240);
+    this.lineMaterials.push(this.earthOrbitRing.material);
+    this.scene.add(this.earthOrbitRing);
+
+    const earthR = R_E * SCALE;
+    const earthGeo = new THREE.SphereGeometry(earthR, 64, 32);
+    const earthTex = createEarthTexture();
+    const earthMat = new THREE.MeshStandardMaterial({
+      map: earthTex,
+      roughness: 0.7,
+      metalness: 0.1,
+    });
+    this.earthMesh = new THREE.Mesh(earthGeo, earthMat);
+    this.earthGroup.add(this.earthMesh);
+
+    // Earth Sphere of Influence (SOI) 3D wireframe shell (single large gravity sphere)
+    const earthSoiGeo = new THREE.SphereGeometry(EARTH_SOI * SCALE, 32, 16);
+    const earthSoiMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.15,
+      depthTest: false,
+    });
+    this.earthSOI = new THREE.Mesh(earthSoiGeo, earthSoiMat);
+    this.earthSOI.renderOrder = 985;
+    this.earthGroup.add(this.earthSOI);
+
+    // Atmospheric limb glow
+    const atmoGeo = new THREE.SphereGeometry(earthR * 1.025, 48, 24);
+    const atmoMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      uniforms: {
+        uColor: { value: new THREE.Color(0x38bdf8) },
+        uSunDir: { value: new THREE.Vector3(1, 0, 0) },
+      },
+      vertexShader: `
+        varying vec3 vNormal;
+        varying vec3 vWorld;
+        void main() {
+          vNormal = normalize(normalMatrix * normal);
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorld = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 uColor;
+        uniform vec3 uSunDir;
+        varying vec3 vNormal;
+        varying vec3 vWorld;
+        void main() {
+          vec3 V = normalize(cameraPosition - vWorld);
+          float rim = 1.0 - max(0.0, dot(V, -vNormal));
+          rim = pow(rim, 3.2);
+          gl_FragColor = vec4(uColor, rim * 0.75);
+        }
+      `,
+    });
+    this.earthAtmo = new THREE.Mesh(atmoGeo, atmoMat);
+    this.earthGroup.add(this.earthAtmo);
+
+    // Launch Pad 3D Marker
+    const padPinGeo = new THREE.CylinderGeometry(8, 2, 45, 12);
+    padPinGeo.translate(0, 22.5, 0);
+    const padPinMat = new THREE.MeshBasicMaterial({ color: 0xff7a3a, depthTest: false });
+    this.padMarker = new THREE.Mesh(padPinGeo, padPinMat);
+    this.padMarker.renderOrder = 999;
+    this.scene.add(this.padMarker);
+  }
+
+  initMoon() {
+    this.moonGroup = new THREE.Group();
+    this.scene.add(this.moonGroup);
+
+    const moonR = R_M * SCALE;
+    const moonGeo = new THREE.SphereGeometry(moonR, 48, 24);
+    const moonTex = createMoonTexture();
+    const moonMat = new THREE.MeshStandardMaterial({
+      map: moonTex,
+      roughness: 0.85,
+      metalness: 0.05,
+    });
+    this.moonMesh = new THREE.Mesh(moonGeo, moonMat);
+    this.moonGroup.add(this.moonMesh);
+
+    // Moon Orbit Loop in 3D centered on EarthGroup so it travels with Earth around the Sun
+    this.moonOrbitRing = createOrbitLine2(MOON_A * SCALE, 0x94a3b8, 2.0, 0.5, 192);
+    this.lineMaterials.push(this.moonOrbitRing.material);
+    this.earthGroup.add(this.moonOrbitRing);
+
+    // Moon Sphere of Influence (SOI) 3D Shell
+    const soiGeo = new THREE.SphereGeometry(MOON_SOI * SCALE, 32, 16);
+    const soiMat = new THREE.MeshBasicMaterial({
+      color: 0xfbbf24,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.15,
+      depthTest: false,
+    });
+    this.moonSOI = new THREE.Mesh(soiGeo, soiMat);
+    this.moonSOI.renderOrder = 985;
+    this.moonGroup.add(this.moonSOI);
+  }
+
+  createPlanetTexture(name) {
+    const B = BODIES[name];
+    const isMoon = B && B.parent && B.parent !== 'sun';
+    const w = isMoon ? 256 : 512, h = isMoon ? 128 : 256;
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    const data = img.data;
+    for (let y = 0; y < h; y++) {
+      const lat = (y / h - 0.5) * Math.PI;
+      const cosLat = Math.cos(lat);
+      for (let x = 0; x < w; x++) {
+        const lon = (x / w - 0.5) * Math.PI * 2;
+        const idx = (y * w + x) * 4;
+        const nx = cosLat * Math.sin(lon);
+        const ny = Math.sin(lat);
+        const nz = cosLat * Math.cos(lon);
+        let n = Math.sin(nx * 3.2 + 0.9) * Math.cos(ny * 2.8) + Math.sin(nz * 2.6) * 0.4;
+        n += Math.sin(nx * 8.0 + ny * 6.5) * 0.2;
+        n += Math.sin(nx * 18.0 + nz * 15.0) * 0.08;
+
+        if (name === 'sun') {
+          const g = Math.sin(nx * 14.0 + ny * 12.0) * 0.25 + Math.cos(nz * 16.0 - nx * 9.0) * 0.25 + n * 0.4;
+          const k = Math.max(0, Math.min(1, 0.55 + g * 0.55));
+          data[idx] = 255;
+          data[idx + 1] = Math.round(165 + k * 85);
+          data[idx + 2] = Math.round(35 + k * 145);
+          data[idx + 3] = 255;
+        } else if (name === 'mars') {
+          const isPolar = Math.abs(lat) > 1.38;
+          if (isPolar) {
+            data[idx] = 240; data[idx + 1] = 236; data[idx + 2] = 232; data[idx + 3] = 255;
+          } else if (n < -0.15) {
+            data[idx] = 115; data[idx + 1] = 56; data[idx + 2] = 36; data[idx + 3] = 255;
+          } else {
+            const k = Math.max(0, Math.min(1, (n + 0.15) / 1.1));
+            data[idx] = Math.round(185 + k * 55);
+            data[idx + 1] = Math.round(78 + k * 55);
+            data[idx + 2] = Math.round(38 + k * 30);
+            data[idx + 3] = 255;
+          }
+        } else if (name === 'venus') {
+          const band = Math.sin(lat * 10.0 + Math.sin(lon * 2.0) * 1.2) * 0.5 + 0.5;
+          const swirl = Math.max(0, Math.min(1, 0.5 + n * 0.35 + (band - 0.5) * 0.35));
+          data[idx] = Math.round(205 + swirl * 40);
+          data[idx + 1] = Math.round(160 + swirl * 55);
+          data[idx + 2] = Math.round(75 + swirl * 55);
+          data[idx + 3] = 255;
+        } else if (name === 'titan') {
+          const k = Math.max(0, Math.min(1, 0.5 + n * 0.45));
+          data[idx] = Math.round(195 + k * 45);
+          data[idx + 1] = Math.round(135 + k * 38);
+          data[idx + 2] = Math.round(52 + k * 28);
+          data[idx + 3] = 255;
+        } else if (name === 'jupiter') {
+          const b1 = Math.sin(lat * 18.0 + Math.sin(lon * 3.0 + lat * 4.0) * 0.45);
+          const b2 = Math.cos(lat * 9.0 - Math.sin(lon * 2.0) * 0.3);
+          const spotDist = Math.hypot((lon - 0.6) * 0.7, (lat + 0.38) * 1.8);
+          const isGRS = spotDist < 0.28;
+          if (isGRS) {
+            const s = 1 - spotDist / 0.28;
+            data[idx] = Math.round(215 + s * 35);
+            data[idx + 1] = Math.round(85 + s * 25);
+            data[idx + 2] = Math.round(48 + s * 18);
+          } else if (b1 > 0.25) {
+            data[idx] = Math.round(238 + n * 14);
+            data[idx + 1] = Math.round(218 + n * 16);
+            data[idx + 2] = Math.round(186 + n * 18);
+          } else if (b2 < -0.2) {
+            data[idx] = Math.round(168 + n * 22);
+            data[idx + 1] = Math.round(98 + n * 18);
+            data[idx + 2] = Math.round(58 + n * 14);
+          } else {
+            data[idx] = Math.round(212 + n * 20);
+            data[idx + 1] = Math.round(152 + n * 20);
+            data[idx + 2] = Math.round(102 + n * 16);
+          }
+          data[idx + 3] = 255;
+        } else if (name === 'saturn') {
+          const b = Math.sin(lat * 16.0 + n * 0.6) * 0.5 + 0.5;
+          data[idx] = Math.round(210 + b * 38);
+          data[idx + 1] = Math.round(182 + b * 42);
+          data[idx + 2] = Math.round(118 + b * 45);
+          data[idx + 3] = 255;
+        } else if (name === 'uranus') {
+          const b = Math.sin(lat * 8.0 + n * 0.35) * 0.5 + 0.5;
+          data[idx] = Math.round(125 + b * 45);
+          data[idx + 1] = Math.round(220 + b * 30);
+          data[idx + 2] = Math.round(235 + b * 20);
+          data[idx + 3] = 255;
+        } else if (name === 'neptune') {
+          const b = Math.sin(lat * 12.0 + Math.cos(lon * 2.0) * 0.4 + n * 0.5) * 0.5 + 0.5;
+          data[idx] = Math.round(38 + b * 45);
+          data[idx + 1] = Math.round(96 + b * 68);
+          data[idx + 2] = Math.round(205 + b * 48);
+          data[idx + 3] = 255;
+        } else if (name === 'pluto') {
+          const heart = Math.hypot((lon - 0.3) * 0.9, (lat - 0.1) * 1.4) < 0.42;
+          if (heart) {
+            data[idx] = 242; data[idx + 1] = 232; data[idx + 2] = 216;
+          } else {
+            const k = Math.max(0, Math.min(1, 0.5 + n * 0.45));
+            data[idx] = Math.round(145 + k * 68);
+            data[idx + 1] = Math.round(105 + k * 56);
+            data[idx + 2] = Math.round(78 + k * 46);
+          }
+          data[idx + 3] = 255;
+        } else if (name === 'haumea') {
+          // Haumea: bright crystalline water-ice surface with famous Dark Red Spot
+          const redSpot = Math.hypot((lon - 0.35) * 0.95, (lat + 0.12) * 1.45);
+          if (redSpot < 0.36) {
+            const s = 1 - redSpot / 0.36;
+            const ice = Math.round(215 + n * 24);
+            data[idx] = Math.round(ice * (1 - s * 0.32) + 145 * (s * 0.32));
+            data[idx + 1] = Math.round(ice * (1 - s * 0.68) + 48 * (s * 0.68));
+            data[idx + 2] = Math.round(ice * (1 - s * 0.72) + 42 * (s * 0.72));
+          } else {
+            const v = Math.max(175, Math.min(252, Math.round(224 + n * 24)));
+            data[idx] = v;
+            data[idx + 1] = Math.min(255, v + 4);
+            data[idx + 2] = Math.min(255, v + 10);
+          }
+          data[idx + 3] = 255;
+        } else if (name === 'makemake') {
+          // Makemake: warm reddish-amber tholin & methane ice terrain
+          const k = Math.max(0, Math.min(1, 0.52 + n * 0.48));
+          data[idx] = Math.round(172 + k * 72);
+          data[idx + 1] = Math.round(88 + k * 66);
+          data[idx + 2] = Math.round(54 + k * 48);
+          data[idx + 3] = 255;
+        } else if (name === 'eris') {
+          // Eris: ultra-high-albedo snow-white / icy-silver frozen nitrogen surface
+          const v = Math.max(188, Math.min(254, Math.round(232 + n * 22)));
+          data[idx] = v;
+          data[idx + 1] = Math.min(255, v + 3);
+          data[idx + 2] = Math.min(255, v + 8);
+          data[idx + 3] = 255;
+        } else if (name === 'ceres') {
+          // Ceres: dark carbonaceous surface + Occator Crater bright salt deposits (Cerealia & Vinalia Faculae)
+          const ocDist = Math.hypot((lon - 0.45) * 0.95, (lat - 0.22) * 1.25);
+          if (ocDist < 0.045) {
+            data[idx] = 248; data[idx + 1] = 252; data[idx + 2] = 255;
+          } else if (ocDist < 0.14) {
+            const rim = ocDist > 0.105 ? 18 : -16;
+            const v = Math.max(48, Math.min(210, 92 + n * 28 + rim));
+            data[idx] = Math.round(v * 0.96);
+            data[idx + 1] = Math.round(v * 0.98);
+            data[idx + 2] = Math.round(v * 1.04);
+          } else {
+            const v = Math.max(52, Math.min(185, 102 + n * 34));
+            data[idx] = Math.round(v * 0.95);
+            data[idx + 1] = Math.round(v * 0.98);
+            data[idx + 2] = Math.round(v * 1.04);
+          }
+          data[idx + 3] = 255;
+        } else if (name === 'io') {
+          const k = Math.max(0, Math.min(1, 0.5 + n * 0.55));
+          data[idx] = Math.round(220 + k * 35);
+          data[idx + 1] = Math.round(145 + k * 85);
+          data[idx + 2] = Math.round(25 + k * 45);
+          data[idx + 3] = 255;
+        } else if (name === 'europa' || name === 'enceladus') {
+          const crack = Math.abs(Math.sin(lon * 9.0 + lat * 11.0 + n * 2.0)) < 0.08;
+          if (crack) {
+            data[idx] = name === 'europa' ? 168 : 95;
+            data[idx + 1] = name === 'europa' ? 112 : 195;
+            data[idx + 2] = name === 'europa' ? 88 : 245;
+          } else {
+            const v = Math.round(225 + n * 22);
+            data[idx] = Math.min(255, v);
+            data[idx + 1] = Math.min(255, v + 4);
+            data[idx + 2] = Math.min(255, v + 10);
+          }
+          data[idx + 3] = 255;
+        } else if (name === 'triton') {
+          const v = Math.max(140, Math.min(245, 205 + n * 35));
+          data[idx] = Math.round(v * 1.04);
+          data[idx + 1] = Math.round(v * 0.92);
+          data[idx + 2] = Math.round(v * 0.96);
+          data[idx + 3] = 255;
+        } else if (name === 'iapetus') {
+          const darkSide = lon > -0.8 && lon < 0.8 && Math.abs(lat) < 1.1;
+          const v = darkSide ? (65 + n * 25) : (210 + n * 30);
+          data[idx] = Math.round(v); data[idx + 1] = Math.round(v * 0.96); data[idx + 2] = Math.round(v * 0.90);
+          data[idx + 3] = 255;
+        } else if (name === 'phobos' || name === 'deimos' || isMoon) {
+          const groove = Math.sin(lon * 12.0 + lat * 8.0) * 10;
+          const baseV = (name === 'umbriel' || name === 'callisto' || name === 'oberon') ? 105 : 162;
+          let v = baseV + n * 42 + groove;
+          v = Math.max(45, Math.min(235, v));
+          data[idx] = Math.round(v * 1.03);
+          data[idx + 1] = Math.round(v * 0.98);
+          data[idx + 2] = Math.round(v * 0.93);
+          data[idx + 3] = 255;
+        } else {
+          // mercury
+          let v = 135 + n * 48;
+          if (n < -0.1) v = 88 + (n + 0.1) * 30;
+          v = Math.max(50, Math.min(225, v));
+          data[idx] = Math.round(v * 1.04);
+          data[idx + 1] = Math.round(v * 0.98);
+          data[idx + 2] = Math.round(v * 0.90);
+          data[idx + 3] = 255;
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    const hasAtmClouds = ['sun', 'venus', 'jupiter', 'saturn', 'uranus', 'neptune'].includes(name);
+    if (!hasAtmClouds) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.26)';
+      ctx.fillStyle = 'rgba(25, 20, 18, 0.26)';
+      for (let i = 0; i < 22; i++) {
+        const cx = (i * 79) % w;
+        const cy = 18 + ((i * 107) % (h - 36));
+        const r = (isMoon ? 2 : 3) + (i % 5) * 1.8;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  initPlanets() {
+    this.planetGroups = {};
+    this.planetMeshes = {};
+    this.planetSOIs = {};
+    // Create planets first (in NON_EARTH_BODIES, PLANET_LIST comes before EXTRA_MOON_LIST)
+    for (const name of NON_EARTH_BODIES) {
+      const B = BODIES[name];
+      const isMoon = B.parent && B.parent !== 'sun';
+      const g = new THREE.Group();
+      this.scene.add(g);
+      this.planetGroups[name] = g;
+
+      const pR = B.R * SCALE;
+      const geo = new THREE.SphereGeometry(pR, isMoon ? 32 : 48, isMoon ? 16 : 24);
+      const tex = this.createPlanetTexture(name);
+      const mat = new THREE.MeshStandardMaterial({
+        map: tex,
+        roughness: (B.atm || 0) > 0 ? 0.55 : 0.82,
+        metalness: 0.05,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      if (name === 'phobos' || name === 'deimos') {
+        mesh.scale.set(1.18, 0.88, 0.96);
+      } else if (name === 'haumea') {
+        mesh.scale.set(1.48, 0.78, 1.04);
+      }
+      if (name === 'mars') {
+        // 3D Olympus Mons Shield Volcano & Caldera on the Mars Map Globe
+        const omGroup = new THREE.Group();
+        const omAngle = 0.855;
+        omGroup.position.set(Math.sin(omAngle) * pR * 0.985, 0, Math.cos(omAngle) * pR * 0.985);
+        omGroup.lookAt(Math.sin(omAngle) * pR * 2, 0, Math.cos(omAngle) * pR * 2);
+        const coneGeo = new THREE.CylinderGeometry(pR * 0.065, pR * 0.22, pR * 0.085, 32, 1);
+        coneGeo.rotateX(Math.PI / 2);
+        coneGeo.translate(0, 0, pR * 0.035);
+        const coneMat = new THREE.MeshStandardMaterial({
+          color: 0x9a3412,
+          emissive: 0x431407,
+          roughness: 0.75,
+        });
+        omGroup.add(new THREE.Mesh(coneGeo, coneMat));
+        const rimGeo = new THREE.RingGeometry(pR * 0.042, pR * 0.072, 32);
+        rimGeo.translate(0, 0, pR * 0.079);
+        const rimMat = new THREE.MeshBasicMaterial({ color: 0xfef08a, side: THREE.DoubleSide });
+        omGroup.add(new THREE.Mesh(rimGeo, rimMat));
+        const lavaGeo = new THREE.CircleGeometry(pR * 0.04, 24);
+        lavaGeo.translate(0, 0, pR * 0.078);
+        const lavaMat = new THREE.MeshBasicMaterial({ color: 0xff4500, side: THREE.DoubleSide });
+        omGroup.add(new THREE.Mesh(lavaGeo, lavaMat));
+        mesh.add(omGroup);
+      }
+      g.add(mesh);
+      this.planetMeshes[name] = mesh;
+
+      // Iconic planetary ring systems for Saturn, Uranus, and Haumea
+      if (name === 'saturn' || name === 'uranus' || name === 'haumea') {
+        const innerR = pR * (name === 'saturn' ? 1.32 : name === 'uranus' ? 1.45 : 1.72);
+        const outerR = pR * (name === 'saturn' ? 2.38 : name === 'uranus' ? 1.78 : 1.96);
+        const rGeo = new THREE.RingGeometry(innerR, outerR, 96);
+        rGeo.rotateX(Math.PI / 2);
+        const rMat = new THREE.MeshBasicMaterial({
+          color: name === 'saturn' ? 0xfde68a : name === 'uranus' ? 0x67e8f9 : 0xe2e8f0,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: name === 'saturn' ? 0.62 : name === 'uranus' ? 0.28 : 0.42,
+          depthWrite: false,
+        });
+        const rMesh = new THREE.Mesh(rGeo, rMat);
+        rMesh.rotation.z = name === 'saturn' ? 0.42 : name === 'uranus' ? 1.25 : 0.28;
+        g.add(rMesh);
+      }
+
+      // Orbit ring around parent body (Sun for planets, parent planet for moons)
+      const ring = createOrbitLine2(B.a * SCALE, B.hex, isMoon ? 1.6 : 2.2, isMoon ? 0.55 : 0.55, isMoon ? 128 : 240);
+      if (name === 'ceres') ring.position.y = CERES_MAP_Y;
+      this.lineMaterials.push(ring.material);
+      if (isMoon && this.planetGroups[B.parent]) {
+        this.planetGroups[B.parent].add(ring);
+      } else {
+        this.scene.add(ring);
+      }
+
+      // SOI wireframe shell
+      const soiGeo = new THREE.SphereGeometry(B.soi * SCALE, isMoon ? 20 : 28, isMoon ? 10 : 14);
+      const soiMat = new THREE.MeshBasicMaterial({
+        color: B.hex,
+        wireframe: true,
+        transparent: true,
+        opacity: isMoon ? 0.16 : 0.14,
+        depthTest: false,
+      });
+      const soiMesh = new THREE.Mesh(soiGeo, soiMat);
+      soiMesh.renderOrder = 985;
+      g.add(soiMesh);
+      this.planetSOIs[name] = soiMesh;
+    }
+  }
+
+  initISS() {
+    // ISS Orbit Ring centered on EarthGroup (alt 400 km) so it moves with Earth around the Sun
+    this.issOrbitRing = createOrbitLine2(ISS_R * SCALE, 0x34d399, 2.5, 0.7, 140);
+    this.lineMaterials.push(this.issOrbitRing.material);
+    this.earthGroup.add(this.issOrbitRing);
+
+    // ISS 3D marker
+    this.issGroup = new THREE.Group();
+    const bodyGeo = new THREE.CylinderGeometry(8, 8, 28, 12);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0xd1d5db, metalness: 0.8, roughness: 0.3 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.rotation.z = Math.PI / 2;
+    this.issGroup.add(body);
+
+    // Solar panels
+    const panelGeo = new THREE.BoxGeometry(45, 1, 14);
+    const panelMat = new THREE.MeshStandardMaterial({ color: 0x1d4ed8, metalness: 0.6, roughness: 0.2 });
+    const panels = new THREE.Mesh(panelGeo, panelMat);
+    this.issGroup.add(panels);
+
+    this.scene.add(this.issGroup);
+  }
+
+  initGrid() {
+    this.gridGroup = new THREE.Group();
+    this.scene.add(this.gridGroup);
+
+    // Faint solar-system ecliptic reference rings around the Sun
+    const rings = [
+      { r: 50000, col: 0x475569, op: 0.08 },
+      { r: 100000, col: 0x475569, op: 0.08 },
+      { r: 150000, col: 0x334155, op: 0.06 },
+    ];
+
+    for (const r of rings) {
+      const ring = createOrbitLine2(r.r, r.col, 1.1, r.op, 128);
+      this.lineMaterials.push(ring.material);
+      this.gridGroup.add(ring);
+    }
+
+    // Cross axes
+    const axisGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-450000, 0, 0), new THREE.Vector3(450000, 0, 0),
+      new THREE.Vector3(0, 0, -450000), new THREE.Vector3(0, 0, 450000),
+    ]);
+    const axisMat = new THREE.LineBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.22, depthTest: false });
+    const axisLines = new THREE.LineSegments(axisGeo, axisMat);
+    axisLines.renderOrder = 980;
+    this.gridGroup.add(axisLines);
+  }
+
+  initVesselMarker() {
+    this.vesselGroup = new THREE.Group();
+    this.vesselRocketGroup = new THREE.Group();
+
+    // Stylized 3D spacecraft mesh
+    const bodyGeo = new THREE.CylinderGeometry(5, 7, 30, 16);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.3, metalness: 0.4 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.position.y = 15;
+    this.vesselRocketGroup.add(body);
+
+    const noseGeo = new THREE.ConeGeometry(5, 12, 16);
+    const noseMat = new THREE.MeshStandardMaterial({ color: 0x0284c7, roughness: 0.4 });
+    const nose = new THREE.Mesh(noseGeo, noseMat);
+    nose.position.y = 36;
+    this.vesselRocketGroup.add(nose);
+
+    // Wings
+    const finGeo = new THREE.BoxGeometry(22, 1.5, 6);
+    const finMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.4 });
+    const fin = new THREE.Mesh(finGeo, finMat);
+    fin.position.y = 8;
+    this.vesselRocketGroup.add(fin);
+
+    // Attitude direction cone / beam
+    const beamGeo = new THREE.ConeGeometry(3, 20, 8);
+    beamGeo.translate(0, 10, 0);
+    const beamMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.75, depthTest: false });
+    this.vesselBeam = new THREE.Mesh(beamGeo, beamMat);
+    this.vesselBeam.renderOrder = 999;
+    this.vesselRocketGroup.add(this.vesselBeam);
+    this.vesselGroup.add(this.vesselRocketGroup);
+
+    // 3D UFO Saucer marker when player craft is a UFO (with golden crown/halo for UFO Vua)
+    this.vesselUfoGroup = new THREE.Group();
+    this.vesselSaucerMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, depthTest: false });
+    const vSaucerDisc = new THREE.Mesh(new THREE.CylinderGeometry(17, 17, 3.8, 28), this.vesselSaucerMat);
+    vSaucerDisc.renderOrder = 999;
+    this.vesselUfoGroup.add(vSaucerDisc);
+    const vSaucerDome = new THREE.Mesh(new THREE.SphereGeometry(9.0, 18, 12), new THREE.MeshBasicMaterial({ color: 0xe0f2fe, depthTest: false }));
+    vSaucerDome.position.y = 3.4;
+    vSaucerDome.renderOrder = 999;
+    this.vesselUfoGroup.add(vSaucerDome);
+
+    this.vesselKingCrown = new THREE.Group();
+    const vHalo = new THREE.Mesh(new THREE.TorusGeometry(23, 1.3, 10, 36), new THREE.MeshBasicMaterial({ color: 0xfef08a, depthTest: false }));
+    vHalo.rotation.x = Math.PI / 2;
+    vHalo.position.y = 1.6;
+    vHalo.renderOrder = 999;
+    this.vesselKingCrown.add(vHalo);
+    const vCrown = new THREE.Mesh(new THREE.CylinderGeometry(6.8, 5.2, 4.6, 8, 1, true), new THREE.MeshBasicMaterial({ color: 0xfacc15, side: THREE.DoubleSide, depthTest: false }));
+    vCrown.position.y = 13.5;
+    vCrown.renderOrder = 999;
+    this.vesselKingCrown.add(vCrown);
+    this.vesselKingCrown.visible = false;
+    this.vesselUfoGroup.add(this.vesselKingCrown);
+    this.vesselUfoGroup.visible = false;
+    this.vesselGroup.add(this.vesselUfoGroup);
+
+    this.scene.add(this.vesselGroup);
+
+    // Pool for separated stages & persistent space vessels
+    this.othersRoot = new THREE.Group();
+    this.scene.add(this.othersRoot);
+  }
+
+  ensureOtherSlot(idx) {
+    while (this.otherPool.length <= idx) {
+      const group = new THREE.Group();
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0xff7a3a, roughness: 0.35, metalness: 0.4, depthTest: false });
+      const bodyMesh = new THREE.Mesh(new THREE.CylinderGeometry(4.5, 5.8, 26, 12), bodyMat);
+      bodyMesh.position.y = 13;
+      bodyMesh.renderOrder = 999;
+      group.add(bodyMesh);
+
+      const noseMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.4, depthTest: false });
+      const noseMesh = new THREE.Mesh(new THREE.ConeGeometry(4.5, 9, 12), noseMat);
+      noseMesh.position.y = 30.5;
+      noseMesh.renderOrder = 999;
+      group.add(noseMesh);
+
+      // 3D Alien / Saved UFO Saucer marker for map
+      const ufoGroup = new THREE.Group();
+      const saucerMat = new THREE.MeshBasicMaterial({ color: 0x4ade80, depthTest: false });
+      const saucerDisc = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 3.5, 24), saucerMat);
+      saucerDisc.renderOrder = 999;
+      ufoGroup.add(saucerDisc);
+      const domeMat = new THREE.MeshBasicMaterial({ color: 0xa855f7, depthTest: false });
+      const saucerDome = new THREE.Mesh(new THREE.SphereGeometry(8.5, 16, 12), domeMat);
+      saucerDome.position.y = 3.2;
+      saucerDome.renderOrder = 999;
+      ufoGroup.add(saucerDome);
+
+      // Golden imperial halo & crown exclusively for the 1 King UFO
+      const kingCrownGroup = new THREE.Group();
+      const kingHalo = new THREE.Mesh(new THREE.TorusGeometry(22.5, 1.35, 10, 36), new THREE.MeshBasicMaterial({ color: 0xfef08a, depthTest: false }));
+      kingHalo.rotation.x = Math.PI / 2;
+      kingHalo.position.y = 1.6;
+      kingHalo.renderOrder = 999;
+      kingCrownGroup.add(kingHalo);
+      const kingOuterHalo = new THREE.Mesh(new THREE.TorusGeometry(27.5, 0.9, 8, 36), new THREE.MeshBasicMaterial({ color: 0xfb7185, depthTest: false }));
+      kingOuterHalo.rotation.x = Math.PI / 2;
+      kingOuterHalo.position.y = 2.8;
+      kingOuterHalo.renderOrder = 999;
+      kingCrownGroup.add(kingOuterHalo);
+      const kingCrown = new THREE.Mesh(new THREE.CylinderGeometry(6.8, 5.0, 4.6, 8, 1, true), new THREE.MeshBasicMaterial({ color: 0xfacc15, side: THREE.DoubleSide, depthTest: false }));
+      kingCrown.position.y = 13.5;
+      kingCrown.renderOrder = 999;
+      kingCrownGroup.add(kingCrown);
+      kingCrownGroup.visible = false;
+      ufoGroup.add(kingCrownGroup);
+
+      ufoGroup.visible = false;
+      group.add(ufoGroup);
+
+      group.renderOrder = 999;
+      group.visible = false;
+      this.othersRoot.add(group);
+
+      const orbitGeo = new LineGeometry();
+      orbitGeo.setPositions([0, 0, 0, 1, 0, 1]);
+      const orbitMat = new LineMaterial({
+        color: 0xff7a3a,
+        linewidth: 2.2,
+        transparent: true,
+        opacity: 0.72,
+        depthTest: false,
+        depthWrite: false,
+      });
+      orbitMat.resolution.set(innerWidth, innerHeight);
+      this.lineMaterials.push(orbitMat);
+      const orbitLine = new Line2(orbitGeo, orbitMat);
+      orbitLine.frustumCulled = false;
+      orbitLine.renderOrder = 994;
+      orbitLine.visible = false;
+      this.othersRoot.add(orbitLine);
+
+      this.otherPool.push({ group, bodyMat, bodyMesh, noseMesh, ufoGroup, saucerMat, domeMat, kingCrownGroup, orbitGeo, orbitMat, orbitLine });
+    }
+    return this.otherPool[idx];
+  }
+
+  initTrajectoryObjects() {
+    // 1. Predicted Trajectory Core Line2 (depthTest: false ensures 100% visibility from ANY angle)
+    this.trajGeo = new LineGeometry();
+    this.trajGeo.setPositions([0, 0, 0, 1, 0, 1]);
+    this.trajGeo.setColors([1, 1, 1, 1, 1, 1]);
+
+    this.trajMat = new LineMaterial({
+      linewidth: 3.8, // crisp thick line on screen
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.trajMat.resolution.set(innerWidth, innerHeight);
+    this.lineMaterials.push(this.trajMat);
+
+    this.trajLine = new Line2(this.trajGeo, this.trajMat);
+    this.trajLine.frustumCulled = false;
+    this.trajLine.renderOrder = 999;
+    this.scene.add(this.trajLine);
+
+    // Glowing bloom halo around the predicted path
+    this.trajGlowMat = new LineMaterial({
+      linewidth: 8.0,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.35,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.trajGlowMat.resolution.set(innerWidth, innerHeight);
+    this.lineMaterials.push(this.trajGlowMat);
+
+    this.trajGlowLine = new Line2(this.trajGeo, this.trajGlowMat);
+    this.trajGlowLine.frustumCulled = false;
+    this.trajGlowLine.renderOrder = 998;
+    this.scene.add(this.trajGlowLine);
+
+    // 2. Full Closed Keplerian Orbit Ellipse Line2
+    this.keplerGeo = new LineGeometry();
+    this.keplerGeo.setPositions([0, 0, 0, 1, 0, 1]);
+
+    this.keplerMat = new LineMaterial({
+      color: 0x38bdf8,
+      linewidth: 3.2,
+      transparent: true,
+      opacity: 0.85,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.keplerMat.resolution.set(innerWidth, innerHeight);
+    this.lineMaterials.push(this.keplerMat);
+
+    this.keplerLine = new Line2(this.keplerGeo, this.keplerMat);
+    this.keplerLine.frustumCulled = false;
+    this.keplerLine.renderOrder = 996;
+    this.keplerLine.visible = false;
+    this.scene.add(this.keplerLine);
+
+    // Glow for closed Keplerian ellipse
+    this.keplerGlowMat = new LineMaterial({
+      color: 0x38bdf8,
+      linewidth: 7.0,
+      transparent: true,
+      opacity: 0.3,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.keplerGlowMat.resolution.set(innerWidth, innerHeight);
+    this.lineMaterials.push(this.keplerGlowMat);
+
+    this.keplerGlowLine = new Line2(this.keplerGeo, this.keplerGlowMat);
+    this.keplerGlowLine.frustumCulled = false;
+    this.keplerGlowLine.renderOrder = 995;
+    this.keplerGlowLine.visible = false;
+    this.scene.add(this.keplerGlowLine);
+
+    // 3. Impact 3D Marker (depthTest: false so it's never occluded on horizon)
+    const impGeo = new THREE.RingGeometry(8, 24, 20);
+    impGeo.rotateX(-Math.PI / 2);
+    const impMat = new THREE.MeshBasicMaterial({ color: 0xef4444, side: THREE.DoubleSide, depthTest: false });
+    this.impactMarker = new THREE.Mesh(impGeo, impMat);
+    this.impactMarker.renderOrder = 999;
+    this.impactMarker.visible = false;
+    this.scene.add(this.impactMarker);
+  }
+
+  initEvents() {
+    // Focus buttons click handling
+    if (this.focusBar) {
+      this.focusBar.querySelectorAll('.map-fbtn').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const target = btn.dataset.focus;
+          if (target) this.setFocus(target);
+        });
+      });
+    }
+
+    // Close button
+    if (this.closeBtn) {
+      this.closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.toggle(false);
+      });
+    }
+
+    // Teleport button in map telemetry card
+    if (this.btnMapTeleport) {
+      this.btnMapTeleport.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!this.onTeleport) return;
+        const isKingBossFocus =
+          this.focus === 'obj:alien_king_boss' ||
+          (this.focus === 'king' && !this.lastState?.vessel?.isUfoKing && (this.lastState?.others || []).some((o) => o.isKingUfo));
+        if (isKingBossFocus) {
+          this.onTeleport('royal1b');
+        } else if (this.focus === 'iss' || this.focus === 'oort' || BODIES[this.focus]) {
+          this.onTeleport(this.focus);
+        }
+      });
+    }
+
+    // Delete button in popup
+    if (this.btnDeleteObj) {
+      this.btnDeleteObj.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (this.selectedObjectId && this.onDeleteObject) {
+          const idToDel = this.selectedObjectId;
+          this.selectedObjectId = null;
+          if (this.objPopup) this.objPopup.classList.add('hidden');
+          if (this.focus === 'obj:' + idToDel || (idToDel === 'vessel' && this.focus === 'vessel')) {
+            this.setFocus('earth');
+          }
+          this.onDeleteObject(idToDel);
+        }
+      });
+    }
+
+    // Delegated click handler on object list in telemetry panel
+    if (this.objListBox) {
+      this.objListBox.addEventListener('click', (e) => {
+        const delBtn = e.target.closest('[data-del-id]');
+        if (delBtn) {
+          e.stopPropagation();
+          const delId = delBtn.dataset.delId;
+          if (delId && this.onDeleteObject) {
+            if (this.selectedObjectId === delId) {
+              this.selectedObjectId = null;
+              if (this.objPopup) this.objPopup.classList.add('hidden');
+            }
+            if (this.focus === 'obj:' + delId) this.setFocus('earth');
+            this.onDeleteObject(delId);
+          }
+          return;
+        }
+        const item = e.target.closest('[data-obj-id]');
+        if (item) {
+          e.stopPropagation();
+          const objId = item.dataset.objId;
+          if (objId) {
+            this.setFocus(objId === 'vessel' ? 'vessel' : 'obj:' + objId, true);
+          }
+        }
+      });
+    }
+
+    // Canvas click to select target if clicking on a HUD badge pill or marker dot
+    this.glCanvas.addEventListener('click', (e) => {
+      const rect = this.glCanvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      let hit = null;
+      // 1. Check exact badge pill bounding boxes first
+      for (let i = this.hudTargets.length - 1; i >= 0; i--) {
+        const t = this.hudTargets[i];
+        const inPill = t.bx !== undefined && mx >= t.bx - 4 && mx <= t.bx + t.bw + 4 && my >= t.by - 4 && my <= t.by + t.bh + 4;
+        if (inPill && t.focus) {
+          hit = t;
+          break;
+        }
+      }
+      // 2. Fallback to marker dot radius
+      if (!hit) {
+        for (let i = this.hudTargets.length - 1; i >= 0; i--) {
+          const t = this.hudTargets[i];
+          const inDot = Math.hypot(mx - t.x, my - t.y) < 24;
+          if (inDot && t.focus) {
+            hit = t;
+            break;
+          }
+        }
+      }
+      if (hit) {
+        this.setFocus(hit.focus, true);
+      }
+    });
+
+    window.addEventListener('resize', () => this.onResize());
+  }
+
+  onResize() {
+    if (!this.visible) return;
+    const w = innerWidth, h = innerHeight;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.hudCanvas.width = w * dpr;
+    this.hudCanvas.height = h * dpr;
+
+    // Update screen resolution for all Line2 materials
+    for (const m of this.lineMaterials) {
+      if (m && m.resolution) m.resolution.set(w, h);
+    }
+  }
+
+  toggle(on = !this.visible) {
+    this.visible = on;
+    this.container.classList.toggle('hidden', !on);
+    this.legend.classList.toggle('hidden', !on);
+
+    if (on) {
+      this.onResize();
+      this.zoomToTarget(true);
+    } else {
+      // release the map's full-screen drawing buffer while it is closed
+      this.renderer.setSize(1, 1, false);
+    }
+  }
+
+  getKingMapObject(S = this.lastState) {
+    if (!S || !S.others) return null;
+    return S.others.find((o) => o.isKingUfo || o.isUfoKing) || null;
+  }
+
+  resolveFocusKey(focusName, S = this.lastState) {
+    if (focusName === 'king') {
+      if (S?.vessel?.isUfoKing) return 'vessel';
+      const kingObj = this.getKingMapObject(S);
+      if (kingObj) return 'obj:' + kingObj.id;
+      return 'vessel';
+    }
+    return focusName;
+  }
+
+  cycleFocus() {
+    const S = this.lastState;
+    const hasKing = !!(S?.vessel?.isUfoKing || this.getKingMapObject(S));
+    const list = ['vessel', 'sun', 'mercury', 'venus', 'earth', 'iss', 'moon', ...NON_EARTH_BODIES.filter((b) => b !== 'mercury' && b !== 'venus'), 'oort', ...(hasKing ? ['king'] : [])];
+    const idx = (list.indexOf(this.focus) + 1) % list.length;
+    this.setFocus(list[idx]);
+  }
+
+  setFocus(name, fromUserClick = false) {
+    this.focus = name;
+    if (this.focusBar) {
+      this.focusBar.querySelectorAll('.map-fbtn').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.focus === name);
+      });
+    }
+    const resolved = this.resolveFocusKey(name);
+    if (resolved && resolved.startsWith('obj:')) {
+      this.selectedObjectId = resolved.slice(4);
+    } else if (resolved === 'vessel' && fromUserClick && this.lastState && this.lastState.vessel && this.lastState.vessel.deletable) {
+      this.selectedObjectId = 'vessel';
+    } else {
+      this.selectedObjectId = null;
+    }
+    this.updateObjectPopup(this.lastState);
+    this.zoomToTarget(false);
+  }
+
+  zoomToTarget(instant = false) {
+    const S = this.lastState;
+    const resolvedFocus = this.resolveFocusKey(this.focus, S);
+    const targetPos = this.getTargetWorldPos(resolvedFocus);
+    if (!targetPos) return;
+
+    let dist = 1800;
+    if (resolvedFocus === 'sun') dist = 780000;
+    else if (resolvedFocus === 'oort') dist = 2400000;
+    else if (resolvedFocus === 'earth') dist = 14000;
+    else if (resolvedFocus === 'moon') dist = 2600;
+    else if (resolvedFocus === 'iss') dist = 900;
+    else if (BODIES[resolvedFocus]) {
+      const B = BODIES[resolvedFocus];
+      dist = Math.max(B.R * SCALE * 5.5, B.soi * SCALE * 1.25);
+    } else if (resolvedFocus && resolvedFocus.startsWith('obj:')) {
+      const objId = resolvedFocus.slice(4);
+      const found = S && S.others ? S.others.find((o) => o.id === objId) : null;
+      const rObj = found ? Math.hypot(found.x || 0, found.y || 0) : 0;
+      dist = found?.isRoyalDomainMarker || rObj > SUN_SOI ? 180000 : 2200;
+    } else if (resolvedFocus === 'vessel') {
+      const r = S && S.vessel ? Math.hypot(S.vessel.x, S.vessel.y) : R_E;
+      dist = r > SUN_SOI ? 180000 : r > 2.5e6 ? 14000 : 2200;
+    }
+
+    let parentName = 'sun';
+    if (resolvedFocus === 'vessel') {
+      parentName = S && S.ref ? S.ref : 'earth';
+    } else if (resolvedFocus && resolvedFocus.startsWith('obj:')) {
+      const objId = resolvedFocus.slice(4);
+      const found = S && S.others ? S.others.find((o) => o.id === objId) : null;
+      parentName = found && found.ref ? found.ref : 'earth';
+    } else if (BODIES[resolvedFocus] && BODIES[resolvedFocus].parent) {
+      parentName = BODIES[resolvedFocus].parent;
+    }
+    const bodyCenter = (resolvedFocus === 'sun' || resolvedFocus === 'oort') ? new THREE.Vector3(0, 0, 0) : this.getTargetWorldPos(parentName);
+    const isCraft = resolvedFocus === 'vessel' || resolvedFocus === 'iss' || (resolvedFocus && resolvedFocus.startsWith('obj:'));
+    // Position camera toward the sunlit / parent-facing side of the planet
+    const viewDir = isCraft
+      ? targetPos.clone().sub(bodyCenter)
+      : bodyCenter.clone().sub(targetPos);
+
+    if (viewDir.lengthSq() < 100) {
+      viewDir.set(0.15, 0.72, 0.68).normalize();
+    } else {
+      viewDir.normalize();
+    }
+
+    const camOffset = viewDir.clone().multiplyScalar(dist);
+    camOffset.y += dist * ((resolvedFocus === 'sun' || resolvedFocus === 'oort') ? 0.62 : 0.42);
+    camOffset.x += dist * 0.2;
+
+    this.controls.target.copy(targetPos);
+    this.camera.position.copy(targetPos).add(camOffset);
+    this.controls.update();
+  }
+
+  getTargetWorldPos(focusName) {
+    const S = this.lastState;
+    focusName = this.resolveFocusKey(focusName, S);
+    const t = S ? S.t : 0;
+    if (focusName === 'sun' || focusName === 'oort') return new THREE.Vector3(0, 0, 0);
+    if (BODIES[focusName]) {
+      const hp = helioPos(focusName, t);
+      const v = to3D(hp.x, hp.y, hp.z);
+      if (focusName === 'ceres') v.y += CERES_MAP_Y;
+      return v;
+    }
+    const ep = helioPos('earth', t);
+    if (focusName && focusName.startsWith('obj:') && S && S.others) {
+      const objId = focusName.slice(4);
+      const found = S.others.find((o) => o.id === objId);
+      if (found) {
+        if (found.isLiveAlien && S.vessel) {
+          const v = to3D(S.vessel.x + ep.x, S.vessel.y + ep.y, S.vessel.z || 0);
+          if (S.ref === 'ceres') v.y += CERES_MAP_Y;
+          v.x += (found.relX || 0) * SCALE;
+          v.y += (found.relZ || 0) * SCALE;
+          v.z -= (found.relY || 0) * SCALE;
+          return v;
+        }
+        const v = to3D(found.x + ep.x, found.y + ep.y, found.z || 0);
+        if (found.ref === 'ceres') v.y += CERES_MAP_Y;
+        return v;
+      }
+    }
+    if (focusName === 'iss' && S && S.iss) {
+      return to3D(S.iss.x + ep.x, S.iss.y + ep.y, S.iss.z || 0);
+    }
+    if (focusName === 'vessel' && S && S.vessel) {
+      const v = to3D(S.vessel.x + ep.x, S.vessel.y + ep.y, S.vessel.z || 0);
+      if (S.ref === 'ceres') v.y += CERES_MAP_Y;
+      return v;
+    }
+    return to3D(ep.x, ep.y, ep.z);
+  }
+
+  draw(S) {
+    this.lastState = S;
+    if (!this.visible) return;
+
+    const t = S.t;
+    const ep = helioPos('earth', t);
+    const earthV3 = to3D(ep.x, ep.y, ep.z);
+    const mp = helioPos('moon', t);
+    const moonV3 = to3D(mp.x, mp.y, mp.z);
+
+    // Sun rotation & central light at (0, 0, 0)
+    this.sunMesh.rotation.y = bodyAngle('sun', t);
+    this.sunLight.position.set(0, 0, 0);
+    if (this.asteroidBeltGroup) {
+      this.asteroidBeltGroup.rotation.y = -t * 1.15e-5;
+    }
+    if (this.kuiperBeltGroup) {
+      this.kuiperBeltGroup.rotation.y = -t * 2.2e-6;
+    }
+    if (this.oortCloudGroup) {
+      this.oortCloudGroup.rotation.y = -t * 8.0e-7;
+      this.oortCloudGroup.rotation.x = Math.sin(t * 3.0e-7) * 0.04;
+    }
+
+    // Earth position (around Sun) & rotation
+    this.earthGroup.position.copy(earthV3);
+    if (this.earthAtmo.material.uniforms) {
+      this.earthAtmo.material.uniforms.uSunDir.value.copy(earthV3).negate().normalize();
+    }
+
+    if (S.padAngle !== undefined) {
+      const pa = S.padAngle;
+      this.earthMesh.rotation.order = 'YXZ';
+      this.earthMesh.rotation.y = -pa;
+      this.earthMesh.rotation.x = -(FLORIDA_LAT_DEG * Math.PI) / 180;
+      const px = Math.sin(pa) * R_E, py = Math.cos(pa) * R_E;
+      to3D(ep.x + px, ep.y + py, 0, this.padMarker.position);
+      this.padMarker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), to3D(px, py, 0).normalize());
+    }
+
+    // Moon position (around Earth) & rotation
+    this.moonGroup.position.copy(moonV3);
+    this.moonMesh.rotation.y = moonAngle(t);
+    if (this.moonSOI) {
+      this.moonSOI.visible = this.camera.position.distanceTo(moonV3) > MOON_SOI * SCALE * 1.4;
+    }
+
+    // Planets (around Sun) + Planetary Moons (around Mars, Jupiter, Saturn, Uranus, Neptune)
+    const planetV3s = {};
+    for (const name of NON_EARTH_BODIES) {
+      const hp = helioPos(name, t);
+      const pv3 = to3D(hp.x, hp.y, hp.z);
+      if (name === 'ceres') pv3.y += CERES_MAP_Y;
+      planetV3s[name] = pv3;
+      if (this.planetGroups[name]) {
+        this.planetGroups[name].position.copy(pv3);
+        this.planetMeshes[name].rotation.y = bodyAngle(name, t);
+      }
+      if (this.planetSOIs && this.planetSOIs[name]) {
+        const B = BODIES[name];
+        this.planetSOIs[name].visible = this.camera.position.distanceTo(pv3) > B.soi * SCALE * 1.4;
+      }
+    }
+
+    // ISS position (around Earth)
+    let issV3 = null;
+    if (S.iss) {
+      issV3 = to3D(S.iss.x + ep.x, S.iss.y + ep.y, S.iss.z || 0);
+      this.issGroup.position.copy(issV3);
+      this.issGroup.visible = true;
+      this.issGroup.lookAt(earthV3);
+    } else {
+      this.issGroup.visible = false;
+    }
+
+    // Vessel position & orientation
+    const v = S.vessel;
+    const vPos3D = to3D(v.x + ep.x, v.y + ep.y, v.z || 0);
+    if (S.ref === 'ceres') vPos3D.y += CERES_MAP_Y;
+    this.vesselGroup.position.copy(vPos3D);
+    if (this.vesselRocketGroup && this.vesselUfoGroup) {
+      const showUfo = !!v.isUfo;
+      this.vesselRocketGroup.visible = !showUfo;
+      this.vesselUfoGroup.visible = showUfo;
+      if (showUfo) {
+        this.vesselSaucerMat.color.set(v.isUfoKing ? '#facc15' : '#38bdf8');
+        if (this.vesselKingCrown) this.vesselKingCrown.visible = !!v.isUfoKing;
+        const uScale = v.isUfoKing ? 1.45 : 1.0;
+        this.vesselUfoGroup.scale.setScalar(uScale);
+      }
+    }
+
+    // Adaptive scale so the rocket remains easily visible without dwarfing the planet
+    const camDist = this.camera.position.distanceTo(vPos3D);
+    const s = Math.max(0.6, Math.min(camDist * 0.0006, 16));
+    this.vesselGroup.scale.set(s, s, s);
+
+    // Attitude orientation
+    if (S.beta !== undefined) {
+      this.vesselGroup.rotation.set(0, -S.beta, 0);
+    }
+
+    // Separated stages & persistent space objects (3D meshes + orbital rings)
+    const others = S.others || [];
+    if (this.focusBar) {
+      const kingBtn = this.focusBar.querySelector('[data-focus="king"]');
+      if (kingBtn) {
+        const hasAnyKing = !!(v.isUfoKing || others.some((o) => o.isKingUfo || o.isUfoKing));
+        kingBtn.classList.toggle('hidden', !hasAnyKing);
+      }
+    }
+    const tmpV3 = new THREE.Vector3();
+    for (let i = 0; i < others.length; i++) {
+      const o = others[i];
+      const slot = this.ensureOtherSlot(i);
+      const oPos = (o.isLiveAlien && S.vessel)
+        ? new THREE.Vector3(
+            vPos3D.x + (o.relX || 0) * SCALE,
+            vPos3D.y + (o.relZ || 0) * SCALE,
+            vPos3D.z - (o.relY || 0) * SCALE
+          )
+        : to3D(o.x + ep.x, o.y + ep.y, o.z || 0);
+      if (!o.isLiveAlien && o.ref === 'ceres') oPos.y += CERES_MAP_Y;
+      slot.group.position.copy(oPos);
+      const isKingMarker = !!(o.isKingUfo || o.isUfoKing);
+      const maxMarkerScale = isKingMarker ? 22 : 14;
+      const os = Math.max(isKingMarker ? 0.85 : 0.55, Math.min(this.camera.position.distanceTo(oPos) * (isKingMarker ? 0.00072 : 0.00055), maxMarkerScale));
+      slot.group.scale.set(os, os, os);
+      if (o.beta !== undefined) slot.group.rotation.set(0, -o.beta, 0);
+      const resolvedFocus = this.resolveFocusKey(this.focus, S);
+      const isSelected = this.selectedObjectId === o.id || resolvedFocus === 'obj:' + o.id;
+      const isAlien = o.kind === 'alien';
+      const showSaucer = isAlien || !!o.isUfo;
+      slot.bodyMesh.visible = !showSaucer;
+      slot.noseMesh.visible = !showSaucer && o.kind === 'vessel';
+      slot.ufoGroup.visible = showSaucer;
+      if (showSaucer) {
+        slot.saucerMat.color.set(isSelected ? '#ffffff' : (isKingMarker ? '#facc15' : (o.color || '#4ade80')));
+        if (slot.domeMat) slot.domeMat.color.set(isKingMarker ? '#fef08a' : '#a855f7');
+        if (slot.kingCrownGroup) slot.kingCrownGroup.visible = isKingMarker;
+        slot.ufoGroup.scale.setScalar(isKingMarker ? 1.5 : 1.0);
+      } else {
+        slot.bodyMat.color.set(isSelected ? '#ffffff' : (o.color || '#ff7a3a'));
+      }
+      slot.group.visible = true;
+
+      // Closed Keplerian orbit ring for this space object
+      const oEl = o.el;
+      const oRef = o.ref || 'earth';
+      const refB = BODIES[oRef] || BODIES.earth;
+      if (oEl && isFinite(oEl.a) && oEl.a > 0 && oEl.e < 1.0 && oEl.ap > refB.R + 8000) {
+        const hp = helioPos(oRef, S.t);
+        const segs = 240;
+        const pts = [];
+        const sq = Math.sqrt(Math.max(0, 1 - oEl.e * oEl.e));
+        for (let k = 0; k <= segs; k++) {
+          const E = (k / segs) * Math.PI * 2;
+          const cosE = Math.cos(E), sinE = Math.sin(E);
+          const r = oEl.a * (1 - oEl.e * cosE);
+          const nu = Math.atan2(sq * sinE, cosE - oEl.e);
+          const th = (oEl.argPe || 0) + nu;
+          to3D(hp.x + r * Math.sin(th), hp.y + r * Math.cos(th), hp.z || 0, tmpV3);
+          if (oRef === 'ceres') tmpV3.y += CERES_MAP_Y;
+          pts.push(tmpV3.x, tmpV3.y, tmpV3.z);
+        }
+        slot.orbitGeo.setPositions(pts);
+        slot.orbitMat.color.set(isSelected ? '#38bdf8' : (o.color || '#ff7a3a'));
+        slot.orbitMat.linewidth = isSelected ? 3.2 : 2.0;
+        slot.orbitMat.opacity = isSelected ? 0.92 : 0.62;
+        slot.orbitLine.visible = true;
+      } else {
+        slot.orbitLine.visible = false;
+      }
+    }
+    for (let i = others.length; i < this.otherPool.length; i++) {
+      this.otherPool[i].group.visible = false;
+      this.otherPool[i].orbitLine.visible = false;
+    }
+
+    // Update 3D Orbits: Full Closed Keplerian Ellipse + Numerical Predicted Trajectory
+    this.maxOrbitExtent = 1e6;
+    this.updateKeplerOrbit(S, ep);
+    this.updateTrajectory(S, ep);
+
+    // Dynamic Camera Focus Tracking
+    const curTargetPos = this.getTargetWorldPos(this.focus);
+    const deltaTarget = curTargetPos.clone().sub(this.controls.target);
+    this.controls.target.add(deltaTarget);
+    this.camera.position.add(deltaTarget);
+    this.controls.update();
+
+    // Expand camera frustum dynamically so orbits of ANY length are never clipped
+    const camDistTarget = this.camera.position.distanceTo(this.controls.target);
+    const camDistOrigin = this.camera.position.length();
+    const neededFar = Math.max(1e9, camDistTarget * 50, camDistOrigin * 20, (this.maxOrbitExtent || 0) * 4);
+    const neededNear = Math.max(2, Math.min(2000, camDistTarget * 1e-4));
+    if (Math.abs(this.camera.far - neededFar) > neededFar * 0.05 || Math.abs(this.camera.near - neededNear) > neededNear * 0.05) {
+      this.camera.near = neededNear;
+      this.camera.far = neededFar;
+      this.camera.updateProjectionMatrix();
+    }
+    if (this.starfield) {
+      this.starfield.position.copy(this.camera.position);
+      this.starfield.scale.setScalar(Math.max(1, camDistTarget / 1e5));
+    }
+    if (this.camLight) {
+      this.camLight.position.copy(this.camera.position);
+    }
+
+    // Render 3D Scene
+    this.renderer.render(this.scene, this.camera);
+
+    // Render 2D Screen-space HUD & Overlays
+    this.renderHUD(S, vPos3D, earthV3, moonV3, issV3, planetV3s, ep);
+  }
+
+  updateKeplerOrbit(S, ep) {
+    const el = S.el;
+    if (!el || !el.pe || !isFinite(el.pe)) {
+      this.keplerLine.visible = false;
+      this.keplerGlowLine.visible = false;
+      return;
+    }
+
+    const refB = BODIES[S.ref] || BODIES.earth;
+    const R = refB.R;
+    // Show orbit when apoapsis is above surface (or on hyperbolic escape)
+    if (el.e < 1.0 && (!isFinite(el.a) || el.ap < R + 5000)) {
+      this.keplerLine.visible = false;
+      this.keplerGlowLine.visible = false;
+      return;
+    }
+
+    const hp = helioPos(S.ref || 'earth', S.t);
+    const count = 360;
+    const pts = [];
+    const v3 = new THREE.Vector3();
+
+    if (el.e < 1.0) {
+      // Sample uniformly in Eccentric Anomaly E so even extreme elongated ellipses (e -> 1) are smooth at apoapsis
+      const sq = Math.sqrt(Math.max(0, 1 - el.e * el.e));
+      for (let i = 0; i <= count; i++) {
+        const E = (i / count) * Math.PI * 2;
+        const cosE = Math.cos(E), sinE = Math.sin(E);
+        const r = el.a * (1 - el.e * cosE);
+        const nu = Math.atan2(sq * sinE, cosE - el.e);
+        const th = el.argPe + nu;
+        const sx = hp.x + r * Math.sin(th);
+        const sy = hp.y + r * Math.cos(th);
+        const sz = hp.z || 0;
+
+        to3D(sx, sy, sz, v3);
+        if (S.ref === 'ceres') v3.y += CERES_MAP_Y;
+        pts.push(v3.x, v3.y, v3.z);
+        const d3 = v3.length();
+        if (d3 > this.maxOrbitExtent) this.maxOrbitExtent = d3;
+      }
+    } else {
+      // Hyperbolic / Parabolic escape orbit (e >= 1): draw full escape branch out to ultra-far distance
+      const e = Math.max(1.0001, el.e);
+      const p = el.pe * (1 + e);
+      const vDist = S.vessel ? Math.hypot(S.vessel.x, S.vessel.y) : R;
+      const maxR = Math.min(SUN_SOI * 3.5, Math.max(SUN_SOI * 1.15, vDist * 1.25));
+      const cosNuMin = Math.max(-1 + 1e-6, Math.min(1, (p / maxR - 1) / e));
+      const nuMax = Math.acos(cosNuMin);
+      const dirSign = (el.h !== undefined && el.h > 0) ? -1 : 1;
+      const nuStart = el.pe < R ? Math.max(-nuMax, el.nu || 0) : -nuMax * 0.35;
+      for (let i = 0; i <= count; i++) {
+        const u = i / count;
+        // Concentrate points near periapsis curve and stretch smoothly to maxR
+        const s = u < 0.5 ? 0.5 * Math.pow(u * 2, 1.5) : 1 - 0.5 * Math.pow((1 - u) * 2, 2.2);
+        const nu = (nuStart + (nuMax - nuStart) * s) * dirSign;
+        const denom = Math.max(1e-6, 1 + e * Math.cos(nu));
+        const r = Math.min(maxR, p / denom);
+        const th = el.argPe + nu;
+        const sx = hp.x + r * Math.sin(th);
+        const sy = hp.y + r * Math.cos(th);
+        const sz = hp.z || 0;
+
+        to3D(sx, sy, sz, v3);
+        if (S.ref === 'ceres') v3.y += CERES_MAP_Y;
+        pts.push(v3.x, v3.y, v3.z);
+        const d3 = v3.length();
+        if (d3 > this.maxOrbitExtent) this.maxOrbitExtent = d3;
+      }
+    }
+
+    this.keplerGeo.setPositions(pts);
+
+    // Color based on reference body
+    const mainColor = S.ref === 'earth' ? 0x38bdf8 : (refB.hex || 0xfbbf24);
+    this.keplerMat.color.setHex(mainColor);
+    this.keplerGlowMat.color.setHex(mainColor);
+
+    // If periapsis is below surface (suborbital on solid body), make line dimmer
+    const isSuborbital = !refB.gasGiant && el.pe < R;
+    this.keplerMat.opacity = isSuborbital ? 0.45 : 0.85;
+    this.keplerGlowMat.opacity = isSuborbital ? 0.15 : 0.35;
+
+    this.keplerLine.visible = true;
+    this.keplerGlowLine.visible = true;
+  }
+
+  updateTrajectory(S, ep) {
+    if (!S.pred || !S.pred.pts || S.pred.pts.length < 2) {
+      this.trajLine.visible = false;
+      this.trajGlowLine.visible = false;
+      this.impactMarker.visible = false;
+      return;
+    }
+
+    const pts = S.pred.pts;
+    const count = Math.min(pts.length, 4000);
+    const pos = [];
+    const col = [];
+    const v3 = new THREE.Vector3();
+
+    const curHelio = {};
+    for (const k of Object.keys(BODIES)) {
+      curHelio[k] = helioPos(k, S.t);
+    }
+
+    for (let i = 0; i < count; i++) {
+      const p = pts[i];
+      let x = p.x + ep.x, y = p.y + ep.y, z = p.z || 0;
+      if (p.ref && p.ref !== 'earth' && p.mx !== undefined && curHelio[p.ref]) {
+        const ch = curHelio[p.ref];
+        x = p.x - p.mx + ch.x;
+        y = p.y - p.my + ch.y;
+        z = (p.z || 0) - (p.mz || 0) + (ch.z || 0);
+      }
+      to3D(x, y, z, v3);
+      if (p.ref === 'ceres' || (!p.ref && S.ref === 'ceres')) v3.y += CERES_MAP_Y;
+      pos.push(v3.x, v3.y, v3.z);
+      const d3 = v3.length();
+      if (d3 > this.maxOrbitExtent) this.maxOrbitExtent = d3;
+
+      if (p.ref === 'mars' || p.ref === 'phobos' || p.ref === 'deimos') {
+        col.push(0.98, 0.45, 0.09);
+      } else if (p.ref === 'venus' || p.ref === 'sun') {
+        col.push(0.98, 0.82, 0.22);
+      } else if (p.ref === 'mercury') {
+        col.push(0.85, 0.88, 0.94);
+      } else if (p.ref === 'moon') {
+        col.push(0.98, 0.75, 0.14);
+      } else {
+        // Electric Blue / Cyan inside Earth SOI
+        col.push(0.22, 0.74, 0.97);
+      }
+    }
+
+    this.trajGeo.setPositions(pos);
+    this.trajGeo.setColors(col);
+
+    this.trajLine.visible = true;
+    this.trajGlowLine.visible = true;
+
+    // Impact marker (depthTest: false ensures it is never occluded)
+    if (S.pred.impact) {
+      const lastP = pts[pts.length - 1];
+      let x = lastP.x + ep.x, y = lastP.y + ep.y, z = lastP.z || 0;
+      const impBody = S.pred.impact.body || 'earth';
+      if (impBody !== 'earth' && lastP.mx !== undefined && curHelio[impBody]) {
+        const ch = curHelio[impBody];
+        x = lastP.x - lastP.mx + ch.x;
+        y = lastP.y - lastP.my + ch.y;
+      }
+      to3D(x, y, z, this.impactMarker.position);
+      if (impBody === 'ceres') this.impactMarker.position.y += CERES_MAP_Y;
+      const center = curHelio[impBody]
+        ? to3D(curHelio[impBody].x, curHelio[impBody].y, curHelio[impBody].z)
+        : to3D(ep.x, ep.y, ep.z);
+      if (impBody === 'ceres') center.y += CERES_MAP_Y;
+      this.impactMarker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), this.impactMarker.position.clone().sub(center).normalize());
+      this.impactMarker.visible = true;
+    } else {
+      this.impactMarker.visible = false;
+    }
+  }
+
+  projectToScreen(vec3, W, H) {
+    const v = vec3.clone().project(this.camera);
+    if (v.z > 1.0) return null; // Behind camera
+    return {
+      x: (v.x * 0.5 + 0.5) * W,
+      y: (-(v.y * 0.5) + 0.5) * H,
+    };
+  }
+
+  renderHUD(S, vPos3D, earthV3, moonV3, issV3, planetV3s = {}, ep = { x: 0, y: 0, z: 0 }) {
+    const cv = this.hudCanvas;
+    const ctx = this.hudCtx;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const W = innerWidth, H = innerHeight;
+
+    if (cv.width !== W * dpr || cv.height !== H * dpr) {
+      cv.width = W * dpr;
+      cv.height = H * dpr;
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    this.hudTargets = [];
+    this.drawnBadges = [];
+
+    const camToOrigin = this.camera.position.length();
+    const camToEarth = this.camera.position.distanceTo(earthV3);
+    const camToVessel = this.camera.position.distanceTo(vPos3D);
+    const focusParent = BODIES[this.focus] ? BODIES[this.focus].parent : null;
+
+    // 1. Draw current spacecraft (Tàu hiện tại) first so its badge always gets priority right at the vessel marker
+    const resolvedHudFocus = this.resolveFocusKey(this.focus, S);
+    const vesselP = this.projectToScreen(vPos3D, W, H);
+    if (vesselP) {
+      const vAltKm = S.vessel.alt ? (S.vessel.alt / 1000).toFixed(1) : null;
+      const sub = vAltKm ? `${vAltKm} km` : null;
+      const vIco = S.vessel?.isUfoKing ? '👑 ' : S.vessel?.isUfo ? '🛸 ' : '🚀 ';
+      const vCol = S.vessel?.isUfoKing ? '#facc15' : '#38bdf8';
+      const br = this.drawBadge(ctx, vesselP.x, vesselP.y, vIco + (S.name || tr('Tàu vũ trụ', 'Spacecraft')), vCol, resolvedHudFocus === 'vessel', sub, true);
+      if (br) {
+        this.hudTargets.push({
+          x: vesselP.x,
+          y: vesselP.y,
+          ...br,
+          focus: 'vessel',
+          objId: 'vessel',
+          deletable: !!(S.vessel && S.vessel.deletable),
+        });
+      }
+    }
+
+    // 2. Sun badge at (0, 0, 0)
+    const sunP = this.projectToScreen(new THREE.Vector3(0, 0, 0), W, H);
+    if (sunP) {
+      const br = this.drawBadge(ctx, sunP.x, sunP.y, `☀️ ${BODIES.sun.label}`, '#fde047', this.focus === 'sun', null, true);
+      if (br) this.hudTargets.push({ x: sunP.x, y: sunP.y, ...br, focus: 'sun' });
+    }
+
+    // 3. Earth badge
+    const earthP = this.projectToScreen(earthV3, W, H);
+    if (earthP) {
+      const br = this.drawBadge(ctx, earthP.x, earthP.y, `🌍 ${BODIES.earth.label}`, '#38bdf8', this.focus === 'earth', null, true);
+      if (br) this.hudTargets.push({ x: earthP.x, y: earthP.y, ...br, focus: 'earth' });
+    }
+
+    // 4. Moon badge (hide when zoomed far out from Earth unless focused)
+    const showEarthMoon = this.focus === 'moon' || this.focus === 'earth' || camToEarth < 160000;
+    if (showEarthMoon) {
+      const moonP = this.projectToScreen(moonV3, W, H);
+      if (moonP) {
+        const moonSub = `${tr('Thân chủ', 'Parent')}: ${BODIES.earth.label}`;
+        const br = this.drawBadge(ctx, moonP.x, moonP.y, `🌕 ${BODIES.moon.label}`, '#f1f5f9', this.focus === 'moon', moonSub, true);
+        if (br) this.hudTargets.push({ x: moonP.x, y: moonP.y, ...br, focus: 'moon' });
+      }
+    }
+
+    // 5. Planets & Moons HUD badges
+    for (const name of NON_EARTH_BODIES) {
+      const B = BODIES[name];
+      const isMoon = B.parent && B.parent !== 'sun';
+      const parentB = isMoon ? BODIES[B.parent] : null;
+      if (isMoon) {
+        const parentV3 = planetV3s[B.parent];
+        const camToParent = parentV3 ? this.camera.position.distanceTo(parentV3) : Infinity;
+        const showMoon = this.focus === name || this.focus === B.parent || focusParent === B.parent || camToParent < (parentB ? parentB.soi * SCALE * 3.2 : 45000);
+        if (!showMoon) continue;
+      }
+      const pv3 = planetV3s[name];
+      if (!pv3) continue;
+      const pp = this.projectToScreen(pv3, W, H);
+      if (pp) {
+        const sub = isMoon && parentB ? `${tr('Thân chủ', 'Parent')}: ${parentB.label}` : null;
+        const br = this.drawBadge(ctx, pp.x, pp.y, `${B.icon} ${B.label}`, B.color, this.focus === name, sub, true);
+        if (br) this.hudTargets.push({ x: pp.x, y: pp.y, ...br, focus: name });
+      }
+    }
+
+    // 6. Asteroid Belt label right above Ceres (hide when extremely zoomed out if overlapping Sun/inner system)
+    if (camToOrigin < 2400000 || this.focus === 'ceres') {
+      const ceresV3 = planetV3s.ceres;
+      const beltAngle = (S.t || 0) * 1.15e-5 + 0.85;
+      const beltR = ((ASTEROID_BELT_INNER + ASTEROID_BELT_OUTER) * 0.5) * SCALE;
+      const beltV3 = ceresV3
+        ? new THREE.Vector3(ceresV3.x, 1250, ceresV3.z)
+        : new THREE.Vector3(Math.sin(beltAngle) * beltR, 1250, Math.cos(beltAngle) * beltR);
+      const beltP = this.projectToScreen(beltV3, W, H);
+      if (beltP) {
+        let by = beltP.y;
+        if (ceresV3) {
+          const cp = this.projectToScreen(ceresV3, W, H);
+          if (cp && by > cp.y - 28) by = cp.y - 28;
+        }
+        this.drawBadge(ctx, beltP.x, by, tr('🪨 Vành đai đá (Tiểu hành tinh)', '🪨 Asteroid Belt'), '#d6d3d1', false, null, true);
+      }
+    }
+
+    // 7. Kuiper Belt label near Haumea / Makemake in the outer Solar System
+    const haumeaV3 = planetV3s.haumea;
+    const kuiperAngle = (S.t || 0) * 1.2e-6 - 1.62;
+    const kuiperR = ((KUIPER_BELT_INNER + KUIPER_BELT_OUTER) * 0.5) * SCALE;
+    const kuiperV3 = haumeaV3
+      ? new THREE.Vector3(haumeaV3.x * 1.02, 2400, haumeaV3.z * 1.02)
+      : new THREE.Vector3(Math.sin(kuiperAngle) * kuiperR, 2400, Math.cos(kuiperAngle) * kuiperR);
+    const kuiperP = this.projectToScreen(kuiperV3, W, H);
+    if (kuiperP) {
+      this.drawBadge(ctx, kuiperP.x, kuiperP.y - 26, tr('🧊 Vành đai Kuiper (Thiên thể băng)', '🧊 Kuiper Belt'), '#7dd3fc', false, null, true);
+    }
+
+    // 8. Oort Cloud label at the outer spherical cometary shell of the Solar System
+    const oortAngle = (S.t || 0) * 8.0e-7 - 2.15;
+    const oortR = ((OORT_CLOUD_INNER + OORT_CLOUD_OUTER) * 0.5) * SCALE;
+    const oortV3 = new THREE.Vector3(Math.sin(oortAngle) * oortR, oortR * 0.18, Math.cos(oortAngle) * oortR);
+    const oortP = this.projectToScreen(oortV3, W, H);
+    if (oortP) {
+      const br = this.drawBadge(ctx, oortP.x, oortP.y, tr('☄️ Đám mây Oort (Vỏ cầu sao chổi)', '☄️ Oort Cloud (Cometary Shell)'), '#c084fc', this.focus === 'oort', null, true);
+      if (br) this.hudTargets.push({ x: oortP.x, y: oortP.y, ...br, focus: 'oort' });
+    }
+
+    // 9. ISS badge (only show when near Earth or focused on Earth/ISS)
+    if (issV3 && (this.focus === 'iss' || this.focus === 'earth' || camToEarth < 65000)) {
+      const issP = this.projectToScreen(issV3, W, H);
+      if (issP) {
+        const br = this.drawBadge(ctx, issP.x, issP.y, '🛰️ ISS', '#34d399', this.focus === 'iss', null, true);
+        if (br) this.hudTargets.push({ x: issP.x, y: issP.y, ...br, focus: 'iss' });
+      }
+    }
+
+    // 10. Draw stage / saved rocket / alien badges:
+    // Group unselected live Aliens near the player into 1 summary badge unless zoomed in very close (< 150 units),
+    // while ALWAYS keeping the single unique King UFO badge clearly visible!
+    const unselectedLiveAliens = [];
+    const patrolShownPerBody = {};
+    for (const o of S.others || []) {
+      const fKey = 'obj:' + o.id;
+      const isKing = !!(o.isKingUfo || o.isUfoKing);
+      const isFocused = resolvedHudFocus === fKey || this.selectedObjectId === o.id;
+
+      if (o.isLiveAlien && !isKing && !isFocused && camToVessel > 150) {
+        unselectedLiveAliens.push(o);
+        continue;
+      }
+
+      if (o.isPatrolAlien && !isKing && !isFocused) {
+        const refName = o.ref || 'earth';
+        const refV3 = refName === 'earth' ? earthV3 : refName === 'moon' ? moonV3 : planetV3s[refName];
+        const camToRef = refV3 ? this.camera.position.distanceTo(refV3) : Infinity;
+        const refB = BODIES[refName] || BODIES.earth;
+        const showPatrol =
+          this.focus === refName ||
+          focusParent === refName ||
+          camToRef < Math.max((refB.soi || 5e6) * SCALE * 2.5, 25000);
+        if (!showPatrol) continue;
+        // When not zoomed right into low orbit around that body, show at most 1 patrol badge per body
+        if (camToRef > 2400 && (patrolShownPerBody[refName] || 0) >= 1) continue;
+        patrolShownPerBody[refName] = (patrolShownPerBody[refName] || 0) + 1;
+      }
+
+      const oV3 = (o.isLiveAlien && S.vessel)
+        ? new THREE.Vector3(
+            vPos3D.x + (o.relX || 0) * SCALE,
+            vPos3D.y + (o.relZ || 0) * SCALE,
+            vPos3D.z - (o.relY || 0) * SCALE
+          )
+        : to3D(o.x + ep.x, o.y + ep.y, o.z || 0);
+      if (!o.isLiveAlien && o.ref === 'ceres') oV3.y += CERES_MAP_Y;
+      const op = this.projectToScreen(oV3, W, H);
+      if (op) {
+        const oAltKm = o.alt !== undefined ? `${fmt(o.alt / 1000, o.alt >= 1e7 ? 0 : 1)} km` : null;
+        const icon = isKing ? '👑' : o.kind === 'alien' ? '👽' : o.isUfo ? '🛸' : o.kind === 'vessel' ? '🚀' : '🛰️';
+        const br = this.drawBadge(ctx, op.x, op.y, `${icon} ${o.name}`, isKing ? '#facc15' : (o.color || '#ff7a3a'), isFocused, oAltKm, true);
+        if (br) {
+          this.hudTargets.push({
+            x: op.x,
+            y: op.y,
+            ...br,
+            focus: fKey,
+            objId: o.id,
+            deletable: !!o.deletable,
+          });
+        }
+      }
+    }
+
+    if (unselectedLiveAliens.length > 0 && vesselP) {
+      const leadAlien = unselectedLiveAliens[0];
+      const count = unselectedLiveAliens.length;
+      const swarmLabel = count === 1
+        ? `👽 ${leadAlien.name}`
+        : tr(`👽 ${count} UFO Alien quanh tàu`, `👽 ${count} Alien UFOs nearby`);
+      const br = this.drawBadge(ctx, vesselP.x, vesselP.y, swarmLabel, '#4ade80', false, null, true);
+      if (br) {
+        this.hudTargets.push({
+          x: vesselP.x,
+          y: vesselP.y,
+          ...br,
+          focus: 'obj:' + leadAlien.id,
+          objId: leadAlien.id,
+          deletable: false,
+        });
+      }
+    }
+
+    // Apoapsis & Periapsis Badges (show once in flight/orbit)
+    const inFlight = S.vessel && (S.vessel.alt > 3000 || S.vessel.speedOrb > 1000);
+    if (inFlight) {
+      for (const m of S.markers || []) {
+        const mPos = to3D(m.x + ep.x, m.y + ep.y, m.z || 0);
+        if (S.ref === 'ceres') mPos.y += CERES_MAP_Y;
+        const mp = this.projectToScreen(mPos, W, H);
+        if (mp) {
+          this.drawBadge(ctx, mp.x, mp.y, m.text, m.color, false);
+        }
+      }
+    }
+
+    // Impact Badge
+    if (S.pred && S.pred.impact && this.impactMarker.visible) {
+      const impP = this.projectToScreen(this.impactMarker.position, W, H);
+      if (impP) {
+        const impLabel = (BODIES[S.pred.impact.body] || BODIES.earth).label;
+        this.drawBadge(ctx, impP.x, impP.y, tr('⚠️ Va chạm (' + impLabel + ')', '⚠️ Impact (' + impLabel + ')'), '#ef4444', false);
+      }
+    }
+
+    // Telemetry Panel & Selected Space Object Popup Update
+    this.updateTelemetryCard(S);
+    this.updateObjectPopup(S);
+  }
+
+  drawBadge(ctx, x, y, text, color, active = false, subtitle = null, avoidOverlap = false) {
+    ctx.save();
+    ctx.font = '700 11.5px "Orbitron", "Tektur", sans-serif';
+
+    const textWidth = ctx.measureText(text).width;
+    const subWidth = subtitle ? ctx.measureText(subtitle).width : 0;
+    const badgeW = Math.max(textWidth, subWidth) + 20;
+    const badgeH = subtitle ? 34 : 22;
+
+    let bx = x + 14;
+    let by = y - badgeH / 2;
+    const baseBy = by;
+
+    const obstacles = this.drawnBadges || this.hudTargets || [];
+    if (avoidOverlap && obstacles.length) {
+      let resolved = false;
+      for (let pass = 0; pass < 16; pass++) {
+        const hit = obstacles.find(
+          (t) =>
+            t.bx !== undefined &&
+            bx < t.bx + t.bw + 4 &&
+            bx + badgeW + 4 > t.bx &&
+            by < t.by + t.bh + 4 &&
+            by + badgeH + 4 > t.by
+        );
+        if (!hit) {
+          resolved = true;
+          break;
+        }
+        by = hit.by + hit.bh + 5;
+      }
+      // Skip non-active badges if the cluster is already full (> 145px vertical stack) or still colliding
+      if (!active && (!resolved || Math.abs(by - baseBy) > 145)) {
+        ctx.restore();
+        return null;
+      }
+    }
+
+    if (this.drawnBadges) {
+      this.drawnBadges.push({ bx, by, bw: badgeW, bh: badgeH });
+    }
+
+    const cy = by + badgeH / 2;
+
+    // Leader line from target point to badge
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = active ? '#ffffff' : color;
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(bx - 3, cy);
+    ctx.stroke();
+
+    // Badge Background Pill
+    ctx.fillStyle = active ? 'rgba(15, 23, 42, 0.92)' : 'rgba(10, 15, 28, 0.82)';
+    ctx.strokeStyle = active ? '#38bdf8' : 'rgba(255, 255, 255, 0.18)';
+    ctx.lineWidth = active ? 1.5 : 1;
+    ctx.shadowColor = active ? color : 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = active ? 12 : 6;
+
+    ctx.beginPath();
+    ctx.roundRect(bx, by, badgeW, badgeH, 6);
+    ctx.fill();
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Text Label
+    ctx.fillStyle = active ? '#ffffff' : color;
+    ctx.fillText(text, bx + 10, by + (subtitle ? 15 : 15));
+
+    if (subtitle) {
+      ctx.font = '700 10px "Orbitron", "Tektur", sans-serif';
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(subtitle, bx + 10, by + 28);
+    }
+
+    ctx.restore();
+    return { bx, by, bw: badgeW, bh: badgeH };
+  }
+
+  updateObjectPopup(S) {
+    if (!this.objPopup) return;
+    if (!S || !this.selectedObjectId) {
+      this.objPopup.classList.add('hidden');
+      return;
+    }
+    let name = '';
+    let meta = '';
+    if (this.selectedObjectId === 'vessel') {
+      if (!S.vessel || !S.vessel.deletable) {
+        this.objPopup.classList.add('hidden');
+        return;
+      }
+      const refB = BODIES[S.ref] || BODIES.earth;
+      const vIco = S.vessel.isUfoKing ? '👑 ' : S.vessel.isUfo ? '🛸 ' : '🚀 ';
+      name = vIco + (S.name || tr('Tàu hiện tại', 'Current Craft'));
+      meta = `${tr('Quanh', 'Orbiting')} ${refB.label} · ${tr('Độ cao', 'Alt')} ${fmt((S.vessel.alt || 0) / 1000, 1)} km · ${fmt(S.vessel.speedOrb || 0, 0)} m/s`;
+    } else {
+      const found = (S.others || []).find((o) => o.id === this.selectedObjectId);
+      if (!found) {
+        this.selectedObjectId = null;
+        this.objPopup.classList.add('hidden');
+        return;
+      }
+      const refB = BODIES[found.ref] || BODIES.earth;
+      const isKing = !!(found.isKingUfo || found.isUfoKing);
+      const icon = isKing ? '👑' : found.kind === 'alien' ? '👽' : found.isUfo ? '🛸' : found.kind === 'vessel' ? '🚀' : '🛰️';
+      name = `${icon} ${found.name}`;
+      meta = `${tr('Vị trí:', 'Location:')} ${refB.label} · ${tr('Độ cao', 'Alt')} ${fmt((found.alt || 0) / 1000, found.alt >= 1e7 ? 0 : 1)} km · ${fmt(found.speedOrb || 0, 0)} m/s`;
+      if (this.btnDeleteObj) this.btnDeleteObj.classList.toggle('hidden', !found.deletable);
+    }
+    if (this.mopName) this.mopName.textContent = name;
+    if (this.mopMeta) this.mopMeta.textContent = meta;
+    this.objPopup.classList.remove('hidden');
+  }
+
+  updateTelemetryCard(S) {
+    if (!this.telemetryBox) return;
+    const P = S.vessel;
+    const el = S.el;
+    const pred = S.pred;
+    const refB = BODIES[S.ref] || BODIES.earth;
+    const focusB = BODIES[this.focus] || null;
+    const targetB = focusB || refB;
+    const isTargetMoon = !!(targetB.parent && targetB.parent !== 'sun');
+    const parentB = targetB.parent ? BODIES[targetB.parent] : null;
+
+    const rows = [];
+    if (this.focus === 'oort') {
+      rows.push({ label: tr('Khu vực', 'Region'), val: tr('☄️ Đám mây Oort', '☄️ Oort Cloud') });
+      rows.push({ label: tr('Cấu trúc', 'Structure'), val: tr('Đĩa Hills & Vỏ cầu sao chổi 3D', 'Hills Torus & 3D Spherical Shell') });
+      rows.push({ label: tr('Rìa trong', 'Inner Edge'), val: fmt(OORT_CLOUD_INNER / 1000, 0) + ' km' });
+      rows.push({ label: tr('Rìa ngoài', 'Outer Edge'), val: fmt(OORT_CLOUD_OUTER / 1000, 0) + ' km' });
+      rows.push({ label: tr('Thành phần', 'Composition'), val: tr('Sao chổi băng H₂O, CO, CH₄, NH₃', 'H₂O, CO, CH₄, NH₃ Icy Comets') });
+      rows.push({ label: tr('Vị trí tàu', 'Craft Location'), val: `${refB.icon} ${refB.label}` });
+    } else if (isTargetMoon && parentB) {
+      rows.push({ label: tr('Mặt trăng', 'Moon'), val: `${targetB.icon} ${targetB.label}` });
+      rows.push({ label: tr('Thân chủ', 'Parent Body'), val: `${parentB.icon} ${parentB.label}` });
+    } else if (targetB.parent === 'sun' && parentB) {
+      rows.push({ label: tr('Hành tinh', 'Planet'), val: `${targetB.icon} ${targetB.label}` });
+      rows.push({ label: tr('Thân chủ', 'Parent Body'), val: `${parentB.icon} ${parentB.label}` });
+    } else {
+      rows.push({ label: tr('Ngôi sao trung tâm', 'Central Star'), val: `${targetB.icon} ${targetB.label}` });
+    }
+
+    if (this.focus === 'oort') {
+      // Oort Cloud summary rows already populated above
+    } else if (focusB && focusB.name !== S.ref) {
+      if (isTargetMoon && parentB) {
+        rows.push({ label: tr('Độ cao QĐ', 'Orbit Altitude'), val: fmt((targetB.a - parentB.R) / 1000, 0) + ' km' });
+        rows.push({ label: tr('Vận tốc QĐ', 'Orbital Speed'), val: fmt(targetB.a * targetB.n, 0) + ' m/s' });
+      }
+      rows.push({ label: tr('Bán kính', 'Radius'), val: fmt(targetB.R / 1000, 0) + ' km' });
+      rows.push({ label: tr('Trọng lực (g)', 'Surface Gravity'), val: targetB.g.toFixed(2) + ' m/s²' });
+      rows.push({ label: tr('Vị trí tàu', 'Craft Location'), val: `${refB.icon} ${refB.label}` });
+    } else {
+      rows.push({ label: tr('Độ cao', 'Altitude'), val: P.alt !== undefined ? fmt(P.alt / 1000, 1) + ' km' : '—' });
+      rows.push({ label: tr('Vận tốc QĐ', 'Orbital Speed'), val: P.speedOrb !== undefined ? fmt(P.speedOrb, 0) + ' m/s' : '—' });
+
+      if (el) {
+        if (el.e < 1) {
+          const R = refB.R;
+          rows.push({ label: tr('Viễn điểm (Ap)', 'Apoapsis (Ap)'), val: fmt((el.ap - R) / 1000, 0) + ' km' });
+          rows.push({ label: tr('Cận điểm (Pe)', 'Periapsis (Pe)'), val: fmt((el.pe - R) / 1000, 0) + ' km' });
+          rows.push({ label: tr('Độ dẹt (e)', 'Eccentricity (e)'), val: el.e.toFixed(4) });
+          if (el.period && isFinite(el.period)) {
+            const min = Math.floor(el.period / 60);
+            rows.push({ label: tr('Chu kỳ', 'Period'), val: min >= 60 ? (min / 60).toFixed(1) + tr(' giờ', ' hr') : min + tr(' phút', ' min') });
+          }
+        } else {
+          rows.push({ label: tr('Quỹ đạo', 'Trajectory'), val: tr('Thoát ly (Hyperbolic)', 'Escape (Hyperbolic)') });
+          rows.push({ label: tr('Độ dẹt (e)', 'Eccentricity (e)'), val: el.e.toFixed(3) });
+        }
+      }
+    }
+
+    if (pred && pred.bodyCA && S.ref === 'earth') {
+      for (const name of ['moon', ...NON_EARTH_BODIES]) {
+        const ca = pred.bodyCA[name];
+        const B = BODIES[name];
+        if (ca && B && ca.d < B.soi * 3) {
+          rows.push({ label: tr('Tiếp cận ', 'Closest ') + B.label, val: fmt((ca.d - B.R) / 1000, 0) + ' km' });
+        }
+      }
+    }
+
+    if (pred && pred.targetCA && pred.targetCA.d < 1e7 && S.iss) {
+      rows.push({ label: tr('Tiếp cận ISS', 'ISS Approach'), val: fmt(pred.targetCA.d / 1000, 1) + ' km' });
+    }
+
+    const resolvedFocus = this.resolveFocusKey(this.focus, S);
+    const isKingDomainFocus =
+      resolvedFocus === 'obj:alien_king_boss' ||
+      (resolvedFocus && resolvedFocus.startsWith('obj:') && !!(S.others || []).find((o) => 'obj:' + o.id === resolvedFocus && o.isKingUfo));
+
+    let focusDisplay = this.focus;
+    if (resolvedFocus === 'vessel') focusDisplay = S.name || tr('Tàu vũ trụ', 'Spacecraft');
+    else if (resolvedFocus === 'iss') focusDisplay = 'ISS';
+    else if (resolvedFocus === 'oort') focusDisplay = tr('☄️ Đám mây Oort', '☄️ Oort Cloud');
+    else if (BODIES[resolvedFocus]) {
+      const fB = BODIES[resolvedFocus];
+      const pB = fB.parent && fB.parent !== 'sun' ? BODIES[fB.parent] : null;
+      focusDisplay = pB ? `${fB.label} (${pB.label})` : fB.label;
+    }
+    if (resolvedFocus && resolvedFocus.startsWith('obj:')) {
+      const fObj = (S.others || []).find((o) => 'obj:' + o.id === resolvedFocus);
+      if (fObj) focusDisplay = fObj.name;
+    }
+    rows.push({ label: tr('Tâm quan sát', 'Camera Focus'), val: focusDisplay });
+
+    let html = '';
+    for (const r of rows) {
+      html += `<div class="tel-row"><span>${r.label}</span><b>${r.val}</b></div>`;
+    }
+    this.telemetryBox.innerHTML = html;
+
+    if (this.btnMapTeleport) {
+      const isPlane = !!S.vessel?.isPlane;
+      if (isKingDomainFocus && !isPlane) {
+        this.btnMapTeleport.textContent = S.vessel?.isUfoKing
+          ? tr('⚡ Dịch chuyển tới 👑 Alien Vua (1 Tỷ km)', '⚡ Teleport to 👑 Alien King (1B km)')
+          : tr('⚡ Dịch chuyển tới 👑 UFO Vua (1 Tỷ km)', '⚡ Teleport to 👑 King UFO (1B km)');
+        this.btnMapTeleport.classList.remove('hidden');
+      } else if (resolvedFocus === 'iss' && !isPlane) {
+        this.btnMapTeleport.textContent = tr('⚡ Dịch chuyển tàu tới Trạm ISS', '⚡ Teleport Craft to ISS');
+        this.btnMapTeleport.classList.remove('hidden');
+      } else if (resolvedFocus === 'oort' && !isPlane) {
+        this.btnMapTeleport.textContent = tr('⚡ Dịch chuyển tàu tới ☄️ Đám mây Oort', '⚡ Teleport Craft to ☄️ Oort Cloud');
+        this.btnMapTeleport.classList.remove('hidden');
+      } else if (BODIES[resolvedFocus] && (!isPlane || (resolvedFocus !== 'sun' && (BODIES[resolvedFocus].atm || 0) > 0 && (BODIES[resolvedFocus].rho0 || 0) > 0))) {
+        const fB = BODIES[resolvedFocus];
+        this.btnMapTeleport.textContent = `⚡ ${tr('Dịch chuyển tàu tới', 'Teleport Craft to')} ${fB.icon} ${fB.label}`;
+        this.btnMapTeleport.classList.remove('hidden');
+      } else {
+        this.btnMapTeleport.classList.add('hidden');
+      }
+    }
+
+    // Render list of persistent/active non-alien space objects in the telemetry card
+    if (this.objListBox) {
+      const spaceObjs = (S.others || []).filter((o) => o.kind !== 'alien');
+      const sig = `${getLang()}|` + spaceObjs.map((o) => `${o.id}:${o.name}:${Math.round((o.alt || 0) / 5000)}:${this.selectedObjectId === o.id ? 1 : 0}`).join('|');
+      if (this._objListSig !== sig) {
+        this._objListSig = sig;
+        if (!spaceObjs.length) {
+          this.objListBox.innerHTML = '';
+          this.objListBox.classList.add('hidden');
+        } else {
+          this.objListBox.classList.remove('hidden');
+          let listHtml = `<div class="mol-title">${tr('VẬT THỂ TRONG VŨ TRỤ', 'SPACE OBJECTS')} (${spaceObjs.length})</div>`;
+          for (const o of spaceObjs) {
+            const sel = this.selectedObjectId === o.id || resolvedFocus === 'obj:' + o.id;
+            const isKing = !!(o.isKingUfo || o.isUfoKing);
+            const icon = isKing ? '👑' : o.isUfo ? '🛸' : o.kind === 'vessel' ? '🚀' : '🛰️';
+            const altStr = o.alt !== undefined ? `${fmt(o.alt / 1000, 0)} km` : '';
+            listHtml += `<div class="map-obj-item ${sel ? 'active' : ''}" data-obj-id="${o.id}">
+              <span class="moi-name">${icon} ${o.name}</span>
+              <span class="moi-alt">${altStr}</span>
+            </div>`;
+          }
+          this.objListBox.innerHTML = listHtml;
+        }
+      }
+    }
+  }
+}
